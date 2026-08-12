@@ -43,11 +43,30 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 instrument_node() {
-  local unit="$1" cwd="$2"
+  local unit="$1" cwd="$2" node_exe="$3"
   local bootstrap="$cwd/oneagent-otel-bootstrap.js"
+  # Derive npm's path from the SAME node binary this process is actually
+  # running, rather than trusting `npm` to be on PATH. This matters
+  # specifically because sudo does not inherit the invoking user's PATH
+  # by default — a bare `npm` here would fail on any nvm-managed Node
+  # install (npm lives in the same versioned bin/ dir as node, which is
+  # only on the shell's PATH, never root's). Fall back to bare `npm`
+  # only if this specific lookup comes up empty, as a last resort.
+  local node_dir npm_bin
+  node_dir="$(dirname "$node_exe")"
+  if [[ -x "$node_dir/npm" ]]; then
+    npm_bin="$node_dir/npm"
+  else
+    npm_bin="npm"
+    echo "    warning: could not find npm alongside $node_exe — falling back to \$PATH, which may fail under sudo"
+  fi
 
-  echo "    -> installing OpenTelemetry packages (npm)"
-  (cd "$cwd" && npm install --save \
+  echo "    -> installing OpenTelemetry packages ($npm_bin)"
+  # npm's own script is typically `#!/usr/bin/env node` internally — even
+  # with npm's absolute path resolved above, it still needs `node`
+  # findable via PATH to actually run. Prepend node's directory rather
+  # than relying on whatever PATH sudo happened to inherit.
+  (cd "$cwd" && PATH="$node_dir:$PATH" "$npm_bin" install --save \
     @opentelemetry/api \
     @opentelemetry/sdk-node \
     @opentelemetry/auto-instrumentations-node \
@@ -162,9 +181,9 @@ for unit in $(systemctl list-units --type=service --state=running --no-legend --
       fi
 
       if [[ "$APPLY" == true ]]; then
-        instrument_node "$unit" "$cwd"
+        instrument_node "$unit" "$cwd" "$exe_path"
       else
-        echo "    would run: npm install (4 OTel packages) in $cwd"
+        echo "    would run: npm install (4 OTel packages) in $cwd, using npm from $(dirname "$exe_path")"
         echo "    would write: $cwd/oneagent-otel-bootstrap.js"
         echo "    would create: /etc/systemd/system/$unit.d/$DROPIN_MARKER.conf (NODE_OPTIONS=--require=.../oneagent-otel-bootstrap.js)"
         echo "    would run: systemctl daemon-reload && systemctl restart $unit"
