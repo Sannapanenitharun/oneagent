@@ -137,10 +137,17 @@ for unit in $(systemctl list-units --type=service --state=running --no-legend --
   fi
   # cmdline is NUL-separated; convert to space-separated for matching/display.
   cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-  comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+  # Resolve the actual executable via /proc/<pid>/exe rather than trusting
+  # /proc/<pid>/comm — comm reflects the CURRENT thread name, which many
+  # Node.js apps rename at runtime (worker_threads, APM/monitoring
+  # libraries like dd-trace, native addons via prctl) even though the
+  # process is genuinely running node. exe is a symlink to the actual
+  # binary on disk and can't be renamed this way.
+  exe_path="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  exe_name="$(basename "$exe_path" 2>/dev/null || true)"
 
   # --- Node.js detection ---
-  if [[ "$comm" == "node" ]]; then
+  if [[ "$exe_name" == "node" ]]; then
     cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
     if [[ -n "$cwd" && -f "$cwd/package.json" ]]; then
       FOUND_ANY=true
@@ -167,7 +174,14 @@ for unit in $(systemctl list-units --type=service --state=running --no-legend --
   fi
 
   # --- Python (uvicorn/gunicorn/flask) detection ---
-  if [[ "$comm" == python* ]] && [[ "$cmdline" == *uvicorn* || "$cmdline" == *gunicorn* || "$cmdline" == *flask* ]]; then
+  # NOTE: unlike the Node.js check above, this still matches against
+  # cmdline text (*uvicorn*, *gunicorn*, *flask*), which COULD be
+  # rewritten by libraries like setproctitle (common in gunicorn/uvicorn
+  # workers) the same way comm was for Node — this hasn't been confirmed
+  # as an actual problem on a real host the way the comm issue was, but
+  # if Python detection ever silently misses a real service, this
+  # cmdline-matching assumption is the first thing to check.
+  if [[ "$exe_name" == python* ]] && [[ "$cmdline" == *uvicorn* || "$cmdline" == *gunicorn* || "$cmdline" == *flask* ]]; then
     FOUND_ANY=true
     echo "[Python web app] $unit"
     echo "    pid=$pid"
