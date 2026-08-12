@@ -94,7 +94,13 @@ EXTRACTED_DIR="$WORKDIR/oneagent-agent_linux_${ARCH}"
 
 # --- 5. system user ---
 echo "==> creating system user (if absent)"
-id -u oneagent-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin oneagent-agent
+id -u oneagent-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm oneagent-agent
+# Idempotent: also fixes hosts that ran an older version of this script
+# before 'adm' group membership was added — without it, the log tailer
+# can't read most system logs (auth.log, syslog, etc. are typically
+# root:adm 640) and silently collects nothing, which looks like "it's
+# just not finding new lines" rather than the permission issue it is.
+usermod -aG adm oneagent-agent
 
 # --- 6. install binary, config, systemd unit ---
 echo "==> installing binary"

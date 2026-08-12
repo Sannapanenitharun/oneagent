@@ -29,7 +29,10 @@ echo "==> installing binary"
 install -m 0755 /tmp/oneagent-agent /usr/local/bin/oneagent-agent
 
 echo "==> creating system user (if absent)"
-id -u oneagent-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin oneagent-agent
+id -u oneagent-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm oneagent-agent
+# See get.sh for why this is unconditional (idempotent) rather than only
+# on first creation.
+usermod -aG adm oneagent-agent
 
 echo "==> installing config"
 mkdir -p /etc/oneagent-agent
