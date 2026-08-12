@@ -1,0 +1,21 @@
+[Unit]
+Description=OneAgent Telemetry Collector Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/oneagent-agent -config /etc/oneagent-agent/agent.yaml
+Restart=on-failure
+RestartSec=5s
+# Hardening: the agent only needs to read /proc, tail configured log paths,
+# and open one listening port — it does not need broad filesystem or
+# network privileges beyond that.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/proc
+ReadWritePaths=/var/log/oneagent-agent
+User=oneagent-agent
+
+[Install]
+WantedBy=multi-user.target

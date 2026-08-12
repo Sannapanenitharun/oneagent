@@ -1,0 +1,52 @@
+name: release
+
+# Triggers on any version tag push (e.g. `git tag v1.0.0 && git push --tags`).
+# This is what makes the one-line curl installer work: pushing a tag is
+# the entire "hosting" step — everything else (building both
+# architectures, checksumming, publishing, attaching the installer
+# script) happens here automatically.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create a GitHub Release and upload assets
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build binaries for all supported platforms
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64; do
+            GOOS=${target%/*}
+            GOARCH=${target#*/}
+            OUT="dist/oneagent-agent_${GOOS}_${GOARCH}"
+            mkdir -p "$OUT"
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o "$OUT/oneagent-agent" ./cmd/agent
+            cp configs/agent.yaml systemd/oneagent-agent.service "$OUT/"
+            tar -C dist -czf "dist/oneagent-agent_${GOOS}_${GOARCH}.tar.gz" "oneagent-agent_${GOOS}_${GOARCH}"
+            rm -rf "$OUT"
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+            scripts/get.sh
+          generate_release_notes: true

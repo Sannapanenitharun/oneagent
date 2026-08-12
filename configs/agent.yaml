@@ -1,0 +1,48 @@
+agent_id: "host-001"
+interval: 15s
+
+metrics:
+  enabled: true
+  collect: ["cpu", "memory"]
+
+logs:
+  enabled: true
+  paths:
+    - "/var/log/app/*.log"
+
+traces:
+  enabled: true
+  listen_addr: ":4319"   # OTLP/HTTP+JSON endpoint: POST /v1/traces (JSON encoding only, not binary protobuf — see traces.go)
+
+cloud:
+  aws:
+    enabled: false
+    region: "us-east-1"
+    namespace: "AWS/EC2"
+    metric_name: "CPUUtilization"
+    statistic: "Average"
+    dimension_name: "InstanceId"
+    dimension_value: "i-0123456789abcdef0"
+    access_key_id_env: "AWS_ACCESS_KEY_ID"         # name of the env var holding the key — not the key itself
+    secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
+  gcp:
+    enabled: false
+    project_id: "my-gcp-project"
+    metric_type: "compute.googleapis.com/instance/cpu/utilization"
+    service_account_key_path: "/etc/oneagent-agent/gcp-sa.json"
+  azure:
+    enabled: false
+    tenant_id: "00000000-0000-0000-0000-000000000000"
+    client_id: "00000000-0000-0000-0000-000000000000"
+    subscription_id: "00000000-0000-0000-0000-000000000000"
+    resource_id: "/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/virtualMachines/vm1"
+    metric_name: "Percentage CPU"
+    client_secret_env: "AZURE_CLIENT_SECRET"        # name of the env var — not the secret itself
+
+exporter:
+  type: "stdout"   # switch to "file" (set path) or "http" (set endpoint) for real deployments
+  # path: "/var/log/oneagent-agent/export.jsonl"
+  # endpoint: "https://ingest.oneagent.ai/v1/envelopes"
+  # batch_size: 100          # envelopes per POST before a size-triggered flush (http exporter only)
+  # flush_interval: 5s       # max time a partial batch waits before flushing
+  # max_retries: 3           # retries on 5xx/network error; 4xx responses are never retried

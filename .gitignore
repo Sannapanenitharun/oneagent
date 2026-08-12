@@ -1,0 +1,4 @@
+/dist/
+*.tar.gz
+oneagent-agent
+oneagent-agent-linux-*
