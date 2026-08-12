@@ -76,6 +76,10 @@ func TestOTLPHTTPExporter_MetricsShapeAndEndpoint(t *testing.T) {
 	if rm.Resource.Attributes[0].Value.StringValue == nil || *rm.Resource.Attributes[0].Value.StringValue != "host-001" {
 		t.Errorf("resource service.name not set to agent ID: %+v", rm.Resource.Attributes)
 	}
+	if len(rm.Resource.Attributes) < 2 || rm.Resource.Attributes[1].Key != "host.name" ||
+		rm.Resource.Attributes[1].Value.StringValue == nil || *rm.Resource.Attributes[1].Value.StringValue != "host-001" {
+		t.Errorf("resource host.name not set — SigNoz's Infrastructure/Hosts page needs this or it falls back to reverse-DNS: %+v", rm.Resource.Attributes)
+	}
 	metrics := rm.ScopeMetrics[0].Metrics
 	if len(metrics) != 1 || metrics[0].Name != "host.cpu.used_pct" {
 		t.Fatalf("unexpected metrics: %+v", metrics)

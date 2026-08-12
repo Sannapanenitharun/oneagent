@@ -254,7 +254,17 @@ func (o *otlpHTTPExporter) resource() otlpResource {
 	if name == "" {
 		name = "oneagent-agent"
 	}
-	return otlpResource{Attributes: []otlpKeyValue{stringAttr("service.name", name)}}
+	// host.name is what SigNoz's Infrastructure/Hosts page actually keys
+	// on — without it, SigNoz falls back to reverse-DNS-resolving the
+	// sending connection's IP, which produces the raw cloud-provider
+	// hostname (e.g. "ip-172-31-33-81.ec2.internal") instead of
+	// something meaningful. Setting both service.name and host.name to
+	// the configured agent_id gives one consistent, controllable label
+	// across every SigNoz view.
+	return otlpResource{Attributes: []otlpKeyValue{
+		stringAttr("service.name", name),
+		stringAttr("host.name", name),
+	}}
 }
 
 func envelopeAttrs(e collector.Envelope) []otlpKeyValue {
