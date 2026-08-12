@@ -29,7 +29,7 @@ type Envelope struct {
 	Source    string            `json:"source"` // e.g. "host.cpu", "app.log", "otlp.span"
 	Timestamp time.Time         `json:"timestamp"`
 	Labels    map[string]string `json:"labels,omitempty"`
-	Value     float64           `json:"value,omitempty"`   // used by metrics
+	Value     float64           `json:"value"`             // used by metrics, trace duration, api_call latency — deliberately NOT omitempty: a genuine 0.0 reading (e.g. 0% CPU) must be distinguishable from "no value was collected" in the emitted JSON. Dropping it on zero silently corrupted real data — see the fix rationale below.
 	Message   string            `json:"message,omitempty"` // used by logs
 	Payload   map[string]any    `json:"payload,omitempty"` // used by traces / structured extras
 }

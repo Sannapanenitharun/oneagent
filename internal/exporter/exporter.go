@@ -36,6 +36,8 @@ func New(cfg config.ExporterConfig) (Exporter, error) {
 		return newFileExporter(cfg.Path)
 	case "http":
 		return newHTTPExporter(cfg)
+	case "otlp_http":
+		return newOTLPHTTPExporter(cfg)
 	default:
 		return nil, fmt.Errorf("unknown exporter type %q", cfg.Type)
 	}

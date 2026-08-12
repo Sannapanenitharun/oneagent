@@ -106,10 +106,20 @@ type AzureCloudConfig struct {
 }
 
 type ExporterConfig struct {
-	// "stdout" for local dev, "file" to append JSONL, "http" to push to a collector backend
+	// "stdout" for local dev, "file" to append JSONL, "http" to push our
+	// own JSON envelope format, "otlp_http" to push real OTLP (metrics/
+	// traces/logs) to an OTLP-native backend like SigNoz
 	Type     string `yaml:"type"`
 	Path     string `yaml:"path"`
 	Endpoint string `yaml:"endpoint"`
+
+	// Headers are sent on every request from the http/otlp_http
+	// exporters — e.g. an ingestion API key (SigNoz Cloud: "signoz-ingestion-key").
+	// SECURITY: same rule as cloud provider credentials — put the actual
+	// key in an environment variable and reference it via headers_env
+	// below, not directly in this YAML file.
+	Headers    map[string]string `yaml:"headers"`
+	HeadersEnv map[string]string `yaml:"headers_env"` // header name -> env var name holding its value
 
 	// HTTP exporter tuning — all optional, sensible defaults applied in
 	// the exporter package if left zero.

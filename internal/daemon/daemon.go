@@ -23,7 +23,7 @@ type Daemon struct {
 }
 
 func New(cfg *config.Config) (*Daemon, error) {
-	exp, err := exporter.New(cfg.Exporter)
+	exp, err := exporter.New(resolveExporterHeaders(cfg.Exporter))
 	if err != nil {
 		return nil, fmt.Errorf("initializing exporter: %w", err)
 	}
@@ -66,7 +66,25 @@ func New(cfg *config.Config) (*Daemon, error) {
 	return &Daemon{cfg: cfg, collectors: collectors, exp: exp}, nil
 }
 
-// buildCloudCollectors wires up the enabled cloud provider adapters,
+// resolveExporterHeaders merges headers_env (env var references) into
+// Headers before the exporter is constructed — same secrets-stay-out-of-
+// YAML pattern as buildCloudCollectors below. Doesn't mutate the caller's
+// config struct.
+func resolveExporterHeaders(cfg config.ExporterConfig) config.ExporterConfig {
+	if len(cfg.HeadersEnv) == 0 {
+		return cfg
+	}
+	merged := make(map[string]string, len(cfg.Headers)+len(cfg.HeadersEnv))
+	for k, v := range cfg.Headers {
+		merged[k] = v
+	}
+	for headerName, envVar := range cfg.HeadersEnv {
+		merged[headerName] = os.Getenv(envVar)
+	}
+	cfg.Headers = merged
+	return cfg
+}
+
 // resolving secrets from the environment variables named in config (see
 // the SECURITY note on config.CloudConfig — the YAML file itself never
 // holds a credential value, only the name of where to find one).

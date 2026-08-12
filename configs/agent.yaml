@@ -52,9 +52,11 @@ cloud:
     client_secret_env: "AZURE_CLIENT_SECRET"        # name of the env var — not the secret itself
 
 exporter:
-  type: "stdout"   # switch to "file" (set path) or "http" (set endpoint) for real deployments
-  # path: "/var/log/oneagent-agent/export.jsonl"
-  # endpoint: "https://ingest.oneagent.ai/v1/envelopes"
-  # batch_size: 100          # envelopes per POST before a size-triggered flush (http exporter only)
+  type: "stdout"   # "stdout" | "file" | "http" (our own JSON format) | "otlp_http" (real OTLP — use this for SigNoz or any OTLP-native backend)
+  # path: "/var/log/oneagent-agent/export.jsonl"                    # file exporter
+  # endpoint: "http://169.58.93.233:4318"                           # otlp_http: base URL of the OTLP receiver — no trailing /v1/... path, that's added automatically per signal type
+  # headers_env:                                                    # otlp_http/http: header name -> env var holding its value (never put the key directly in this file)
+  #   signoz-ingestion-key: "SIGNOZ_INGESTION_KEY"
+  # batch_size: 100          # envelopes per POST before a size-triggered flush
   # flush_interval: 5s       # max time a partial batch waits before flushing
   # max_retries: 3           # retries on 5xx/network error; 4xx responses are never retried
