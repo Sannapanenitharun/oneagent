@@ -106,6 +106,11 @@ usermod -aG adm oneagent-agent
 echo "==> installing binary"
 install -m 0755 "$EXTRACTED_DIR/oneagent-agent" /usr/local/bin/oneagent-agent
 
+echo "==> installing auto-instrument helper"
+install -m 0755 "$EXTRACTED_DIR/auto-instrument.sh" /usr/local/bin/oneagent-auto-instrument
+echo "    run it any time with: sudo oneagent-auto-instrument        (dry run)"
+echo "                          sudo oneagent-auto-instrument --apply (actually instruments + restarts detected services)"
+
 echo "==> installing config"
 mkdir -p /etc/oneagent-agent
 if [[ ! -f /etc/oneagent-agent/agent.yaml ]]; then

@@ -28,6 +28,9 @@ CGO_ENABLED=0 go build -o /tmp/oneagent-agent ./cmd/agent
 echo "==> installing binary"
 install -m 0755 /tmp/oneagent-agent /usr/local/bin/oneagent-agent
 
+echo "==> installing auto-instrument helper"
+install -m 0755 scripts/auto-instrument.sh /usr/local/bin/oneagent-auto-instrument
+
 echo "==> creating system user (if absent)"
 id -u oneagent-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --groups adm oneagent-agent
 # See get.sh for why this is unconditional (idempotent) rather than only

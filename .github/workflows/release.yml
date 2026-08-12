@@ -32,7 +32,7 @@ jobs:
             OUT="dist/oneagent-agent_${GOOS}_${GOARCH}"
             mkdir -p "$OUT"
             CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o "$OUT/oneagent-agent" ./cmd/agent
-            cp configs/agent.yaml systemd/oneagent-agent.service "$OUT/"
+            cp configs/agent.yaml systemd/oneagent-agent.service scripts/auto-instrument.sh "$OUT/"
             tar -C dist -czf "dist/oneagent-agent_${GOOS}_${GOARCH}.tar.gz" "oneagent-agent_${GOOS}_${GOARCH}"
             rm -rf "$OUT"
           done
