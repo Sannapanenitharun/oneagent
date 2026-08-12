@@ -91,8 +91,20 @@ sdk.start();
 // on every request — without this handler, spans generated just before
 // a systemd restart/stop (which sends SIGTERM) would be silently lost,
 // since the process would exit before the next scheduled flush.
+//
+// IMPORTANT: sdk.shutdown() is bounded with a hard timeout below. In
+// real testing, an unbounded shutdown call was observed to hang a
+// production service's restart for 60-90 seconds (systemd's default
+// stop timeout) — likely the exporter retrying a slow/unreachable
+// flush with no internal timeout. A graceful restart should never
+// take longer than a couple of seconds; if the flush hasn't finished
+// by then, exit anyway rather than block the service coming back up.
 process.on('SIGTERM', () => {
-  sdk.shutdown().finally(() => process.exit(0));
+  const forceExit = setTimeout(() => process.exit(0), 3000);
+  sdk.shutdown().finally(() => {
+    clearTimeout(forceExit);
+    process.exit(0);
+  });
 });
 JSEOF
 
