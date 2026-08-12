@@ -35,6 +35,20 @@ func New(cfg *config.Config) (*Daemon, error) {
 	if cfg.Logs.Enabled {
 		collectors = append(collectors, collector.NewLogTailCollector(cfg.AgentID, cfg.Logs.Paths))
 	}
+	if cfg.AccessLogs.Enabled {
+		format := collector.FormatCombined
+		if cfg.AccessLogs.Format == "json" {
+			format = collector.FormatJSON
+		}
+		fields := collector.JSONFieldMap{
+			Method:     cfg.AccessLogs.JSONFields.Method,
+			Path:       cfg.AccessLogs.JSONFields.Path,
+			Status:     cfg.AccessLogs.JSONFields.Status,
+			DurationMs: cfg.AccessLogs.JSONFields.DurationMs,
+			RemoteAddr: cfg.AccessLogs.JSONFields.RemoteAddr,
+		}
+		collectors = append(collectors, collector.NewAccessLogCollector(cfg.AgentID, cfg.AccessLogs.Paths, format, fields))
+	}
 	if cfg.Traces.Enabled {
 		collectors = append(collectors, collector.NewOTLPTraceReceiverCollector(cfg.AgentID, cfg.Traces.ListenAddr))
 	}
@@ -46,7 +60,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 	collectors = append(collectors, cloudCollectors...)
 
 	if len(collectors) == 0 {
-		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, traces.enabled, cloud.{aws,gcp,azure}.enabled")
+		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, access_logs.enabled, traces.enabled, cloud.{aws,gcp,azure}.enabled")
 	}
 
 	return &Daemon{cfg: cfg, collectors: collectors, exp: exp}, nil

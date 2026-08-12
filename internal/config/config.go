@@ -12,13 +12,14 @@ import (
 
 // Config is the root configuration for the agent daemon.
 type Config struct {
-	AgentID  string         `yaml:"agent_id"`
-	Interval time.Duration  `yaml:"interval"`
-	Metrics  MetricsConfig  `yaml:"metrics"`
-	Logs     LogsConfig     `yaml:"logs"`
-	Traces   TracesConfig   `yaml:"traces"`
-	Cloud    CloudConfig    `yaml:"cloud"`
-	Exporter ExporterConfig `yaml:"exporter"`
+	AgentID    string          `yaml:"agent_id"`
+	Interval   time.Duration   `yaml:"interval"`
+	Metrics    MetricsConfig   `yaml:"metrics"`
+	Logs       LogsConfig      `yaml:"logs"`
+	AccessLogs AccessLogConfig `yaml:"access_logs"`
+	Traces     TracesConfig    `yaml:"traces"`
+	Cloud      CloudConfig     `yaml:"cloud"`
+	Exporter   ExporterConfig  `yaml:"exporter"`
 }
 
 type MetricsConfig struct {
@@ -31,6 +32,28 @@ type LogsConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// Paths to tail, e.g. /var/log/app/*.log
 	Paths []string `yaml:"paths"`
+}
+
+// AccessLogConfig configures parsing of incoming HTTP requests from an
+// access log (nginx, Apache, or an app's own structured request log) —
+// this is what answers "get API calls into this host" without requiring
+// any code change in the monitored app itself.
+type AccessLogConfig struct {
+	Enabled bool     `yaml:"enabled"`
+	Paths   []string `yaml:"paths"`
+	Format  string   `yaml:"format"` // "combined" (nginx/Apache, default) or "json"
+
+	// JSONFields is only used when format: json — lets the parser match
+	// whatever field names the app's structured logger actually emits.
+	// Any field left blank falls back to a sensible default (see
+	// collector.JSONFieldMap.withDefaults).
+	JSONFields struct {
+		Method     string `yaml:"method"`
+		Path       string `yaml:"path"`
+		Status     string `yaml:"status"`
+		DurationMs string `yaml:"duration_ms"`
+		RemoteAddr string `yaml:"remote_addr"`
+	} `yaml:"json_fields"`
 }
 
 type TracesConfig struct {

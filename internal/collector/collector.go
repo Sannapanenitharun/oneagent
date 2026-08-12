@@ -14,9 +14,10 @@ import (
 type Kind string
 
 const (
-	KindMetric Kind = "metric"
-	KindLog    Kind = "log"
-	KindTrace  Kind = "trace"
+	KindMetric  Kind = "metric"
+	KindLog     Kind = "log"
+	KindTrace   Kind = "trace"
+	KindAPICall Kind = "api_call" // a parsed HTTP request from an access log — structured (method/path/status/duration), unlike a raw KindLog line
 )
 
 // Envelope is the single normalized shape for every signal the agent emits.

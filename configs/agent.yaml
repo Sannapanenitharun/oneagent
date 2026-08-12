@@ -10,6 +10,18 @@ logs:
   paths:
     - "/var/log/app/*.log"
 
+access_logs:
+  enabled: false
+  paths:
+    - "/var/log/nginx/access.log"
+  format: "combined"   # or "json" for a structured request log
+  # json_fields:                    # only used when format: json — override if your app uses different field names
+  #   method: "method"
+  #   path: "path"
+  #   status: "status"
+  #   duration_ms: "duration_ms"
+  #   remote_addr: "remote_addr"
+
 traces:
   enabled: true
   listen_addr: ":4319"   # OTLP/HTTP+JSON endpoint: POST /v1/traces (JSON encoding only, not binary protobuf — see traces.go)
