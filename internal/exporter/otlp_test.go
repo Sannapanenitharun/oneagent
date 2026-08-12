@@ -142,6 +142,99 @@ func TestOTLPHTTPExporter_TracesShapeAndEndpoint(t *testing.T) {
 	}
 }
 
+func TestOTLPHTTPExporter_TracesPreserveOriginServiceName(t *testing.T) {
+	// Regression test for a real bug found on a live host: spans received
+	// from an externally instrumented app (e.g. a Node.js backend called
+	// "certi-backend") were being re-exported with service.name
+	// overwritten to the AGENT's own identity, making it impossible to
+	// tell which app actually produced a given trace in the backend.
+	var got otlpTracesRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		decodeGzipJSON(t, r, &got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exp, err := newOTLPHTTPExporter(config.ExporterConfig{
+		Endpoint: server.URL, BatchSize: 3, FlushInterval: time.Hour, MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("newOTLPHTTPExporter: %v", err)
+	}
+	defer exp.Close()
+
+	ts := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+
+	// Two spans from a real instrumented app (carries its own
+	// service.name label, as our trace receiver attaches from the
+	// incoming OTLP resource attributes) and one from OneAgent's own
+	// host-level activity (no service.name label at all).
+	if err := exp.Export(collector.Envelope{
+		Kind: collector.KindTrace, AgentID: "host-001", Timestamp: ts, Value: 10,
+		Labels: map[string]string{"trace_id": "t1", "span_id": "s1", "name": "route1", "service.name": "certi-backend.service"},
+	}); err != nil {
+		t.Fatalf("Export 1: %v", err)
+	}
+	if err := exp.Export(collector.Envelope{
+		Kind: collector.KindTrace, AgentID: "host-001", Timestamp: ts, Value: 20,
+		Labels: map[string]string{"trace_id": "t1", "span_id": "s2", "name": "route2", "service.name": "certi-backend.service"},
+	}); err != nil {
+		t.Fatalf("Export 2: %v", err)
+	}
+	if err := exp.Export(collector.Envelope{
+		Kind: collector.KindTrace, AgentID: "host-001", Timestamp: ts, Value: 5,
+		Labels: map[string]string{"trace_id": "t2", "span_id": "s3", "name": "agentOwnSpan"},
+	}); err != nil {
+		t.Fatalf("Export 3: %v", err)
+	}
+
+	if len(got.ResourceSpans) != 2 {
+		t.Fatalf("expected 2 resourceSpans groups (certi-backend.service + host-001 fallback), got %d: %+v", len(got.ResourceSpans), got.ResourceSpans)
+	}
+
+	foundCerti, foundHost := false, false
+	for _, rs := range got.ResourceSpans {
+		var serviceName string
+		var hostName string
+		for _, a := range rs.Resource.Attributes {
+			if a.Key == "service.name" && a.Value.StringValue != nil {
+				serviceName = *a.Value.StringValue
+			}
+			if a.Key == "host.name" && a.Value.StringValue != nil {
+				hostName = *a.Value.StringValue
+			}
+		}
+		// host.name must ALWAYS be the agent's own identity, regardless
+		// of which group this is — it identifies the physical machine,
+		// not the originating app.
+		if hostName != "host-001" {
+			t.Errorf("host.name = %q, want host-001 (should never vary per-service)", hostName)
+		}
+
+		switch serviceName {
+		case "certi-backend.service":
+			foundCerti = true
+			if len(rs.ScopeSpans[0].Spans) != 2 {
+				t.Errorf("certi-backend.service group: expected 2 spans, got %d", len(rs.ScopeSpans[0].Spans))
+			}
+		case "host-001":
+			foundHost = true
+			if len(rs.ScopeSpans[0].Spans) != 1 {
+				t.Errorf("host-001 fallback group: expected 1 span, got %d", len(rs.ScopeSpans[0].Spans))
+			}
+		default:
+			t.Errorf("unexpected service.name group: %q", serviceName)
+		}
+	}
+	if !foundCerti {
+		t.Error("no resourceSpans group found with service.name=certi-backend.service — the origin app's identity was lost")
+	}
+	if !foundHost {
+		t.Error("no resourceSpans group found with the agent's own fallback identity")
+	}
+}
+
 func TestOTLPHTTPExporter_LogsShapeAndEndpoint_PlainLog(t *testing.T) {
 	var hitPath string
 	var got otlpLogsRequest

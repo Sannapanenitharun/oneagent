@@ -249,21 +249,40 @@ func boolCount(b bool) int {
 	return 0
 }
 
-func (o *otlpHTTPExporter) resource() otlpResource {
+func (o *otlpHTTPExporter) hostName() string {
 	name := o.agentIDLabel
 	if name == "" {
 		name = "oneagent-agent"
 	}
-	// host.name is what SigNoz's Infrastructure/Hosts page actually keys
-	// on — without it, SigNoz falls back to reverse-DNS-resolving the
-	// sending connection's IP, which produces the raw cloud-provider
-	// hostname (e.g. "ip-172-31-33-81.ec2.internal") instead of
-	// something meaningful. Setting both service.name and host.name to
-	// the configured agent_id gives one consistent, controllable label
-	// across every SigNoz view.
+	return name
+}
+
+// serviceNameFor returns the service.name to report for one envelope.
+// Envelopes received from an externally instrumented app (via our OTLP
+// trace receiver) carry their own real service.name as a label — e.g. a
+// span from "certi-backend" arrives already tagged with that identity.
+// That must be preserved rather than overwritten with the agent's own
+// identity when re-exporting, or every distinct app on a host collapses
+// into one indistinguishable stream in the backend (this was a real bug,
+// caught from a live host: production spans from an app called
+// certi-backend were showing up in SigNoz labeled service.name=host-001,
+// the agent's own ID, instead of the app that actually produced them).
+// Envelopes OneAgent generates itself (host metrics, tailed logs) carry
+// no such label, so those correctly fall back to the agent's identity.
+func (o *otlpHTTPExporter) serviceNameFor(e collector.Envelope) string {
+	if v, ok := e.Labels["service.name"]; ok && v != "" {
+		return v
+	}
+	return o.hostName()
+}
+
+func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
+	// host.name always identifies the physical machine this agent runs
+	// on, regardless of which service produced a given signal — unlike
+	// service.name, it should never vary per-envelope.
 	return otlpResource{Attributes: []otlpKeyValue{
-		stringAttr("service.name", name),
-		stringAttr("host.name", name),
+		stringAttr("service.name", serviceName),
+		stringAttr("host.name", o.hostName()),
 	}}
 }
 
@@ -288,30 +307,51 @@ func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 		})
 	}
 	req := otlpMetricsRequest{ResourceMetrics: []otlpResourceMetrics{{
-		Resource:     o.resource(),
+		Resource:     o.resourceFor(o.hostName()),
 		ScopeMetrics: []otlpScopeMetrics{{Scope: otlpScope{Name: "oneagent-agent"}, Metrics: points}},
 	}}}
 	return o.postJSON("/v1/metrics", req, len(envs))
 }
 
 func (o *otlpHTTPExporter) sendTraces(envs []collector.Envelope) error {
-	spans := make([]otlpSpan, 0, len(envs))
+	// Group spans by their real origin service before building the OTLP
+	// request — each distinct service gets its own resourceSpans entry
+	// with the correct service.name, rather than one shared resource
+	// block that would silently attribute every app's spans to the
+	// agent itself. See serviceNameFor's comment for why this matters.
+	order := make([]string, 0, 4)
+	groups := make(map[string][]collector.Envelope, 4)
 	for _, e := range envs {
-		startNano := e.Timestamp.UnixNano()
-		endNano := startNano + int64(e.Value*1e6) // Value is duration in ms
-		spans = append(spans, otlpSpan{
-			TraceID:           e.Labels["trace_id"],
-			SpanID:            e.Labels["span_id"],
-			Name:              e.Labels["name"],
-			StartTimeUnixNano: strconv.FormatInt(startNano, 10),
-			EndTimeUnixNano:   strconv.FormatInt(endNano, 10),
-			Attributes:        envelopeAttrs(e),
+		sn := o.serviceNameFor(e)
+		if _, seen := groups[sn]; !seen {
+			order = append(order, sn)
+		}
+		groups[sn] = append(groups[sn], e)
+	}
+
+	resourceSpansList := make([]otlpResourceSpans, 0, len(order))
+	for _, sn := range order {
+		group := groups[sn]
+		spans := make([]otlpSpan, 0, len(group))
+		for _, e := range group {
+			startNano := e.Timestamp.UnixNano()
+			endNano := startNano + int64(e.Value*1e6) // Value is duration in ms
+			spans = append(spans, otlpSpan{
+				TraceID:           e.Labels["trace_id"],
+				SpanID:            e.Labels["span_id"],
+				Name:              e.Labels["name"],
+				StartTimeUnixNano: strconv.FormatInt(startNano, 10),
+				EndTimeUnixNano:   strconv.FormatInt(endNano, 10),
+				Attributes:        envelopeAttrs(e),
+			})
+		}
+		resourceSpansList = append(resourceSpansList, otlpResourceSpans{
+			Resource:   o.resourceFor(sn),
+			ScopeSpans: []otlpScopeSpans{{Scope: otlpScope{Name: "oneagent-agent"}, Spans: spans}},
 		})
 	}
-	req := otlpTracesRequest{ResourceSpans: []otlpResourceSpans{{
-		Resource:   o.resource(),
-		ScopeSpans: []otlpScopeSpans{{Scope: otlpScope{Name: "oneagent-agent"}, Spans: spans}},
-	}}}
+
+	req := otlpTracesRequest{ResourceSpans: resourceSpansList}
 	return o.postJSON("/v1/traces", req, len(envs))
 }
 
@@ -333,7 +373,7 @@ func (o *otlpHTTPExporter) sendLogs(envs []collector.Envelope) error {
 		})
 	}
 	req := otlpLogsRequest{ResourceLogs: []otlpResourceLogs{{
-		Resource:  o.resource(),
+		Resource:  o.resourceFor(o.hostName()),
 		ScopeLogs: []otlpScopeLogs{{Scope: otlpScope{Name: "oneagent-agent"}, LogRecords: records}},
 	}}}
 	return o.postJSON("/v1/logs", req, len(envs))
