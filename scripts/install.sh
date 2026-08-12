@@ -47,8 +47,12 @@ echo "==> installing systemd unit"
 install -m 0644 systemd/oneagent-agent.service /etc/systemd/system/oneagent-agent.service
 systemctl daemon-reload
 
-echo "==> enabling and starting service"
-systemctl enable --now oneagent-agent
+echo "==> enabling and (re)starting service"
+systemctl enable oneagent-agent
+# See get.sh for why this is a separate explicit restart rather than
+# 'enable --now' — that command no-ops on an already-running service,
+# which would leave a stale binary running after a rebuild-and-reinstall.
+systemctl restart oneagent-agent
 
 echo "==> done. check status with: systemctl status oneagent-agent"
 echo "    tail output with:        journalctl -u oneagent-agent -f"

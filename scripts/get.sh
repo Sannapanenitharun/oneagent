@@ -116,9 +116,13 @@ echo "==> installing systemd unit"
 install -m 0644 "$EXTRACTED_DIR/oneagent-agent.service" /etc/systemd/system/oneagent-agent.service
 systemctl daemon-reload
 
-# --- 7. enable + start ---
-echo "==> enabling and starting service"
-systemctl enable --now oneagent-agent
+# --- 7. enable + (re)start ---
+echo "==> enabling and (re)starting service"
+systemctl enable oneagent-agent
+# 'enable --now' would silently no-op if the service is already running,
+# leaving the OLD binary in memory even though we just wrote a new one to
+# disk — explicitly restart so an update actually takes effect.
+systemctl restart oneagent-agent
 
 echo "==> done. check status with: systemctl status oneagent-agent"
 echo "    tail output with:        journalctl -u oneagent-agent -f"
