@@ -149,6 +149,82 @@ func TestReadLoadAverage_RealProcLoadavg(t *testing.T) {
 	}
 }
 
+func TestReadNetworkErrorsAndDrops_RealProcNetDev(t *testing.T) {
+	samples, err := readNetworkErrorsAndDrops()
+	if err != nil {
+		t.Fatalf("readNetworkErrorsAndDrops: %v", err)
+	}
+	if len(samples) == 0 {
+		t.Fatal("no interfaces found")
+	}
+	foundLo := map[string]bool{}
+	for _, s := range samples {
+		if s.errors < 0 || s.dropped < 0 {
+			t.Errorf("negative errors/dropped for %s/%s: errors=%v dropped=%v", s.device, s.direction, s.errors, s.dropped)
+		}
+		if s.device == "lo" {
+			foundLo[s.direction] = true
+		}
+	}
+	if !foundLo["transmit"] || !foundLo["receive"] {
+		t.Errorf("expected both directions for loopback, got: %+v", foundLo)
+	}
+}
+
+func TestReadNetworkConnectionStates_RealProcNetTCP(t *testing.T) {
+	states, err := readNetworkConnectionStates()
+	if err != nil {
+		t.Fatalf("readNetworkConnectionStates: %v", err)
+	}
+	// Every value must be non-negative and every key must be a real,
+	// recognized TCP state name — catches a parsing bug that would
+	// otherwise silently produce garbage state labels.
+	validStates := map[string]bool{}
+	for _, name := range tcpStateNames {
+		validStates[name] = true
+	}
+	for state, count := range states {
+		if !validStates[state] {
+			t.Errorf("unrecognized TCP state name in result: %q", state)
+		}
+		if count < 0 {
+			t.Errorf("negative connection count for state %q: %v", state, count)
+		}
+	}
+}
+
+func TestReadDiskIOStates_RealProcDiskstats(t *testing.T) {
+	samples, err := readDiskIOStates()
+	if err != nil {
+		t.Fatalf("readDiskIOStates: %v", err)
+	}
+	if len(samples) == 0 {
+		t.Fatal("no real disk devices found — expected at least one non-virtual block device")
+	}
+	for _, s := range samples {
+		if isVirtualDisk(s.device) {
+			t.Errorf("virtual device %q leaked through the exclude filter", s.device)
+		}
+		if s.readBytes < 0 || s.writeBytes < 0 || s.readOps < 0 || s.writeOps < 0 ||
+			s.readTimeSec < 0 || s.writeTimeSec < 0 || s.pendingOps < 0 {
+			t.Errorf("negative value in disk sample for %s: %+v", s.device, s)
+		}
+	}
+}
+
+func TestIsVirtualDisk(t *testing.T) {
+	cases := map[string]bool{
+		"loop0": true, "loop12": true, "ram0": true, "zram0": true,
+		"dm-0": true, "sr0": true,
+		"vda": false, "sda": false, "nvme0n1": false, "xvda": false,
+	}
+	for device, want := range cases {
+		if got := isVirtualDisk(device); got != want {
+			t.Errorf("isVirtualDisk(%q) = %v, want %v", device, got, want)
+		}
+	}
+}
+
 func TestInfraHostMetricsCollector_EndToEnd(t *testing.T) {
 	coll := NewInfraHostMetricsCollector("test-agent", 200*time.Millisecond)
 	out := make(chan Envelope, 200)
@@ -160,9 +236,10 @@ func TestInfraHostMetricsCollector_EndToEnd(t *testing.T) {
 	}
 	defer coll.Stop()
 
-	var cpuStates, memStates, netSamples, fsSamples, loadSamples int
+	var cpuStates, memStates, netSamples, fsSamples, loadSamples, netErrSamples, netConnSamples, diskSamples int
 	timeout := time.After(2 * time.Second)
-	for cpuStates < 8 || memStates < 4 || netSamples < 1 || fsSamples < 1 || loadSamples < 1 {
+	for cpuStates < 8 || memStates < 4 || netSamples < 1 || fsSamples < 1 || loadSamples < 1 ||
+		netErrSamples < 1 || netConnSamples < 1 || diskSamples < 1 {
 		select {
 		case env := <-out:
 			if env.Kind != KindMetric {
@@ -187,6 +264,22 @@ func TestInfraHostMetricsCollector_EndToEnd(t *testing.T) {
 				if env.Labels["device"] == "" || env.Labels["direction"] == "" {
 					t.Errorf("system.network.io missing device/direction label: %+v", env.Labels)
 				}
+			case env.Source == "system.network.errors" || env.Source == "system.network.dropped":
+				netErrSamples++
+				if env.Labels["device"] == "" || env.Labels["direction"] == "" {
+					t.Errorf("%s missing device/direction label: %+v", env.Source, env.Labels)
+				}
+			case env.Source == "system.network.connections":
+				netConnSamples++
+				if env.Labels["protocol"] != "tcp" || env.Labels["state"] == "" {
+					t.Errorf("system.network.connections missing protocol/state label: %+v", env.Labels)
+				}
+			case env.Source == "system.disk.io" || env.Source == "system.disk.operations" ||
+				env.Source == "system.disk.operation_time" || env.Source == "system.disk.pending_operations":
+				diskSamples++
+				if env.Labels["device"] == "" {
+					t.Errorf("%s missing device label: %+v", env.Source, env.Labels)
+				}
 			case env.Source == "system.filesystem.usage":
 				fsSamples++
 				if env.Labels["mountpoint"] == "" || env.Labels["state"] == "" {
@@ -198,8 +291,8 @@ func TestInfraHostMetricsCollector_EndToEnd(t *testing.T) {
 				t.Errorf("unexpected envelope source: %s", env.Source)
 			}
 		case <-timeout:
-			t.Fatalf("timed out — got cpu=%d mem=%d net=%d fs=%d load=%d (want >=8, >=4, >=1, >=1, >=1)",
-				cpuStates, memStates, netSamples, fsSamples, loadSamples)
+			t.Fatalf("timed out — got cpu=%d mem=%d net=%d fs=%d load=%d netErr=%d netConn=%d disk=%d (all need >=1, cpu>=8, mem>=4)",
+				cpuStates, memStates, netSamples, fsSamples, loadSamples, netErrSamples, netConnSamples, diskSamples)
 		}
 	}
 }

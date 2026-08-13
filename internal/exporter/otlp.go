@@ -343,10 +343,16 @@ func envelopeAttrs(e collector.Envelope) []otlpKeyValue {
 func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 	points := make([]otlpMetric, 0, len(envs))
 	for _, e := range envs {
-		if e.Source == "system.cpu.time" || e.Source == "system.network.io" {
-			// Both are OTel-defined monotonic cumulative counters — CPU
-			// time in seconds since boot, network bytes since boot.
-			// Same Sum treatment applies to both.
+		switch e.Source {
+		case "system.cpu.time", "system.network.io", "system.network.errors", "system.network.dropped",
+			"system.disk.io", "system.disk.operations", "system.disk.operation_time":
+			// All of these are OTel-defined monotonic cumulative counters
+			// (seconds/bytes/count since boot) — same Sum treatment
+			// applies to all. system.disk.pending_operations and
+			// system.network.connections are deliberately NOT in this
+			// list — both are point-in-time gauges (a queue depth and a
+			// connection count can go down as well as up), not
+			// cumulative counters.
 			startNano := ""
 			if bootUnix, ok := e.Labels["_boot_time_unix"]; ok {
 				if secs, err := strconv.ParseInt(bootUnix, 10, 64); err == nil {

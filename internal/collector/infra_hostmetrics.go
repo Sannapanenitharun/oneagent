@@ -121,6 +121,50 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 		}
 	}
 
+	if errs, err := readNetworkErrorsAndDrops(); err == nil {
+		for _, s := range errs {
+			labels := map[string]string{"device": s.device, "direction": s.direction}
+			if bootTimeUnix != "" {
+				labels["_boot_time_unix"] = bootTimeUnix
+			}
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.network.errors", Timestamp: now, Value: s.errors, Labels: labels}
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.network.dropped", Timestamp: now, Value: s.dropped, Labels: mapCopy(labels)}
+		}
+	}
+
+	if conns, err := readNetworkConnectionStates(); err == nil {
+		for state, count := range conns {
+			out <- Envelope{
+				Kind:      KindMetric,
+				AgentID:   h.agentID,
+				Source:    "system.network.connections",
+				Timestamp: now,
+				Value:     count,
+				Labels:    map[string]string{"protocol": "tcp", "state": state},
+			}
+		}
+	}
+
+	if disks, err := readDiskIOStates(); err == nil {
+		for _, d := range disks {
+			readLabels := map[string]string{"device": d.device, "direction": "read"}
+			writeLabels := map[string]string{"device": d.device, "direction": "write"}
+			if bootTimeUnix != "" {
+				readLabels["_boot_time_unix"] = bootTimeUnix
+				writeLabels["_boot_time_unix"] = bootTimeUnix
+			}
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.io", Timestamp: now, Value: d.readBytes, Labels: readLabels}
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.io", Timestamp: now, Value: d.writeBytes, Labels: writeLabels}
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operations", Timestamp: now, Value: d.readOps, Labels: mapCopy(readLabels)}
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operations", Timestamp: now, Value: d.writeOps, Labels: mapCopy(writeLabels)}
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operation_time", Timestamp: now, Value: d.readTimeSec, Labels: mapCopy(readLabels)}
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operation_time", Timestamp: now, Value: d.writeTimeSec, Labels: mapCopy(writeLabels)}
+			// pending_operations is a point-in-time queue depth, not
+			// cumulative — no direction split, no boot-time label needed.
+			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.pending_operations", Timestamp: now, Value: d.pendingOps, Labels: map[string]string{"device": d.device}}
+		}
+	}
+
 	if mounts, err := readFilesystemUsageStates(); err == nil {
 		for _, m := range mounts {
 			out <- Envelope{
@@ -288,6 +332,190 @@ func readLoadAverage() (map[string]float64, error) {
 		result[window] = v
 	}
 	return result, nil
+}
+
+// mapCopy returns a shallow copy of a label map — needed because Go maps
+// are reference types, and several envelopes below reuse the "same"
+// label set with one key changed; without copying, mutating one
+// envelope's labels would retroactively corrupt another's.
+func mapCopy(m map[string]string) map[string]string {
+	c := make(map[string]string, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
+}
+
+// networkErrDropSample is one (interface, direction) cumulative error or
+// drop count.
+type networkErrDropSample struct {
+	device    string
+	direction string
+	errors    float64
+	dropped   float64
+}
+
+// readNetworkErrorsAndDrops parses /proc/net/dev's errs/drop columns —
+// same file and per-interface layout as readNetworkIOStates, just
+// different column offsets. Kept as a separate function rather than
+// merged into readNetworkIOStates to keep each function's return type
+// simple and single-purpose.
+func readNetworkErrorsAndDrops() ([]networkErrDropSample, error) {
+	f, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var samples []networkErrDropSample
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if lineNum <= 2 {
+			continue
+		}
+		line := scanner.Text()
+		colonIdx := strings.Index(line, ":")
+		if colonIdx < 0 {
+			continue
+		}
+		device := strings.TrimSpace(line[:colonIdx])
+		fields := strings.Fields(line[colonIdx+1:])
+		if len(fields) < 16 {
+			continue
+		}
+		rxErrs, _ := strconv.ParseFloat(fields[2], 64)
+		rxDrop, _ := strconv.ParseFloat(fields[3], 64)
+		txErrs, _ := strconv.ParseFloat(fields[10], 64)
+		txDrop, _ := strconv.ParseFloat(fields[11], 64)
+		samples = append(samples,
+			networkErrDropSample{device: device, direction: "receive", errors: rxErrs, dropped: rxDrop},
+			networkErrDropSample{device: device, direction: "transmit", errors: txErrs, dropped: txDrop},
+		)
+	}
+	return samples, nil
+}
+
+// tcpStateNames maps /proc/net/tcp's hex "st" field to the standard
+// Linux TCP state names (include/net/tcp_states.h), matching what OTel's
+// system.network.connections metric expects as its "state" attribute.
+var tcpStateNames = map[string]string{
+	"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
+	"04": "FIN_WAIT1", "05": "FIN_WAIT2", "06": "TIME_WAIT",
+	"07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK",
+	"0A": "LISTEN", "0B": "CLOSING",
+}
+
+// readNetworkConnectionStates parses /proc/net/tcp and /proc/net/tcp6,
+// returning a count of connections per TCP state. This is a point-in-time
+// Gauge, not cumulative — connection counts go up and down constantly.
+func readNetworkConnectionStates() (map[string]float64, error) {
+	counts := make(map[string]float64, len(tcpStateNames))
+	found := false
+	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		f, err := os.Open(path)
+		if err != nil {
+			continue // tcp6 may not exist on IPv4-only hosts — not fatal
+		}
+		found = true
+		scanner := bufio.NewScanner(f)
+		lineNum := 0
+		for scanner.Scan() {
+			lineNum++
+			if lineNum == 1 {
+				continue // header line
+			}
+			fields := strings.Fields(scanner.Text())
+			if len(fields) < 4 {
+				continue
+			}
+			if name, ok := tcpStateNames[fields[3]]; ok {
+				counts[name]++
+			}
+		}
+		f.Close()
+	}
+	if !found {
+		return nil, os.ErrNotExist
+	}
+	return counts, nil
+}
+
+// diskIOSample aggregates one block device's stats from /proc/diskstats.
+type diskIOSample struct {
+	device                    string
+	readBytes, writeBytes     float64 // cumulative since boot
+	readOps, writeOps         float64 // cumulative since boot
+	readTimeSec, writeTimeSec float64 // cumulative since boot
+	pendingOps                float64 // point-in-time queue depth
+}
+
+// virtualDiskPrefixes excludes loop devices, ram disks, zram (swap
+// compression), and device-mapper internals — none of these represent
+// real physical/block storage worth reporting on. Unlike the filesystem
+// allowlist above, this is an EXCLUDE list, because real disk device
+// naming varies too much across platforms/cloud providers (sda, vda,
+// nvme0n1, xvda, hda...) to enumerate as an allowlist.
+var virtualDiskPrefixes = []string{"loop", "ram", "zram", "dm-", "sr", "fd"}
+
+func isVirtualDisk(device string) bool {
+	for _, p := range virtualDiskPrefixes {
+		if strings.HasPrefix(device, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// readDiskIOStates parses /proc/diskstats. Field layout (1-indexed, this
+// function uses 0-indexed slice positions after splitting):
+// major minor device reads_completed reads_merged sectors_read
+// time_reading writes_completed writes_merged sectors_written
+// time_writing ios_in_progress time_ios weighted_time_ios [...discards]
+// Sector size is always 512 bytes regardless of the device's actual
+// block size — this is a longstanding Linux kernel convention, not
+// something read from the device itself.
+func readDiskIOStates() ([]diskIOSample, error) {
+	f, err := os.Open("/proc/diskstats")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	const sectorBytes = 512.0
+	var samples []diskIOSample
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 14 {
+			continue
+		}
+		device := fields[2]
+		if isVirtualDisk(device) {
+			continue
+		}
+
+		readsCompleted, _ := strconv.ParseFloat(fields[3], 64)
+		sectorsRead, _ := strconv.ParseFloat(fields[5], 64)
+		timeReadingMs, _ := strconv.ParseFloat(fields[6], 64)
+		writesCompleted, _ := strconv.ParseFloat(fields[7], 64)
+		sectorsWritten, _ := strconv.ParseFloat(fields[9], 64)
+		timeWritingMs, _ := strconv.ParseFloat(fields[10], 64)
+		iosInProgress, _ := strconv.ParseFloat(fields[11], 64)
+
+		samples = append(samples, diskIOSample{
+			device:       device,
+			readBytes:    sectorsRead * sectorBytes,
+			writeBytes:   sectorsWritten * sectorBytes,
+			readOps:      readsCompleted,
+			writeOps:     writesCompleted,
+			readTimeSec:  timeReadingMs / 1000.0,
+			writeTimeSec: timeWritingMs / 1000.0,
+			pendingOps:   iosInProgress,
+		})
+	}
+	return samples, nil
 }
 
 // readBootTimeUnix reads the "btime" line from /proc/stat — seconds
