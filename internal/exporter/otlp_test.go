@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -232,6 +233,80 @@ func TestOTLPHTTPExporter_TracesPreserveOriginServiceName(t *testing.T) {
 	}
 	if !foundHost {
 		t.Error("no resourceSpans group found with the agent's own fallback identity")
+	}
+}
+
+func TestOTLPHTTPExporter_SystemCPUTimeUsesSumType(t *testing.T) {
+	// Regression/requirement test: SigNoz's Infrastructure Monitoring page
+	// specifically requires system.cpu.time as a Sum (cumulative counter)
+	// metric, not a Gauge — confirmed against SigNoz's own docs. This
+	// verifies the actual JSON shape sent matches that requirement.
+	var got otlpMetricsRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		decodeGzipJSON(t, r, &got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exp, err := newOTLPHTTPExporter(config.ExporterConfig{
+		Endpoint: server.URL, BatchSize: 1, FlushInterval: time.Hour, MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("newOTLPHTTPExporter: %v", err)
+	}
+	defer exp.Close()
+
+	ts := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	if err := exp.Export(collector.Envelope{
+		Kind: collector.KindMetric, AgentID: "host-001", Source: "system.cpu.time",
+		Timestamp: ts, Value: 1234.5,
+		Labels: map[string]string{"state": "idle", "cpu": "cpu-total", "_boot_time_unix": "1786619611"},
+	}); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	metric := got.ResourceMetrics[0].ScopeMetrics[0].Metrics[0]
+	if metric.Name != "system.cpu.time" {
+		t.Errorf("metric name = %q, want system.cpu.time", metric.Name)
+	}
+	if metric.Gauge != nil {
+		t.Error("system.cpu.time was sent as Gauge — must be Sum")
+	}
+	if metric.Sum == nil {
+		t.Fatal("system.cpu.time has no Sum field — SigNoz's Infrastructure page requires this metric as a Sum")
+	}
+	if !metric.Sum.IsMonotonic {
+		t.Error("Sum.IsMonotonic = false, want true (cumulative counters only increase)")
+	}
+	if metric.Sum.AggregationTemporality != 2 {
+		t.Errorf("Sum.AggregationTemporality = %d, want 2 (CUMULATIVE)", metric.Sum.AggregationTemporality)
+	}
+	dp := metric.Sum.DataPoints[0]
+	if dp.AsDouble != 1234.5 {
+		t.Errorf("value = %v, want 1234.5", dp.AsDouble)
+	}
+	wantStartNano := "1786619611000000000"
+	if dp.StartTimeUnixNano != wantStartNano {
+		t.Errorf("startTimeUnixNano = %q, want %q (boot time converted to nanoseconds)", dp.StartTimeUnixNano, wantStartNano)
+	}
+
+	// The internal _boot_time_unix label must NOT leak into the actual
+	// OTLP attributes sent — it's bookkeeping for building this exact
+	// Sum shape, not a real CPU-state attribute.
+	for _, a := range dp.Attributes {
+		if strings.HasPrefix(a.Key, "_") {
+			t.Errorf("internal label %q leaked into OTLP attributes: %+v", a.Key, dp.Attributes)
+		}
+	}
+	foundState := false
+	for _, a := range dp.Attributes {
+		if a.Key == "state" && a.Value.StringValue != nil && *a.Value.StringValue == "idle" {
+			foundState = true
+		}
+	}
+	if !foundState {
+		t.Errorf("expected state=idle attribute, got: %+v", dp.Attributes)
 	}
 }
 

@@ -31,6 +31,13 @@ func New(cfg *config.Config) (*Daemon, error) {
 	var collectors []collector.Collector
 	if cfg.Metrics.Enabled {
 		collectors = append(collectors, collector.NewHostMetricsCollector(cfg.AgentID, cfg.Interval, cfg.Metrics.Collect))
+		// Additive, not a replacement — emits the standard OTel
+		// hostmetrics names (system.cpu.time, system.memory.usage)
+		// alongside our own host.cpu.used_pct/host.memory.used_pct.
+		// Required specifically for SigNoz's Infrastructure Monitoring
+		// > Hosts page to recognize this host at all (confirmed against
+		// SigNoz's own docs — see infra_hostmetrics.go).
+		collectors = append(collectors, collector.NewInfraHostMetricsCollector(cfg.AgentID, cfg.Interval))
 	}
 	if cfg.Logs.Enabled {
 		collectors = append(collectors, collector.NewLogTailCollector(cfg.AgentID, cfg.Logs.Paths))

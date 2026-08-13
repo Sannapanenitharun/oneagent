@@ -7,7 +7,9 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,16 +69,29 @@ type otlpScopeMetrics struct {
 	Metrics []otlpMetric `json:"metrics"`
 }
 type otlpMetric struct {
-	Name  string    `json:"name"`
-	Gauge otlpGauge `json:"gauge"`
+	Name  string     `json:"name"`
+	Gauge *otlpGauge `json:"gauge,omitempty"`
+	Sum   *otlpSum   `json:"sum,omitempty"`
 }
 type otlpGauge struct {
 	DataPoints []otlpNumberDataPoint `json:"dataPoints"`
 }
+
+// otlpSum is required for system.cpu.time specifically — OTel defines it
+// as a monotonic cumulative counter (seconds spent in each CPU state
+// since boot), not a point-in-time value, and SigNoz's Infrastructure
+// page specifically checks for this metric in Sum form. Sending it as a
+// Gauge would be structurally wrong, not just a labeling difference.
+type otlpSum struct {
+	DataPoints             []otlpNumberDataPoint `json:"dataPoints"`
+	AggregationTemporality int                   `json:"aggregationTemporality"` // 2 = AGGREGATION_TEMPORALITY_CUMULATIVE, per OTLP proto
+	IsMonotonic            bool                  `json:"isMonotonic"`
+}
 type otlpNumberDataPoint struct {
-	TimeUnixNano string         `json:"timeUnixNano"`
-	AsDouble     float64        `json:"asDouble"`
-	Attributes   []otlpKeyValue `json:"attributes,omitempty"`
+	StartTimeUnixNano string         `json:"startTimeUnixNano,omitempty"` // required for Sum points — omitted for Gauge points
+	TimeUnixNano      string         `json:"timeUnixNano"`
+	AsDouble          float64        `json:"asDouble"`
+	Attributes        []otlpKeyValue `json:"attributes,omitempty"`
 }
 
 // --- traces ---
@@ -142,6 +157,9 @@ type otlpHTTPExporter struct {
 	logsBuf    []collector.Envelope
 	stopCh     chan struct{}
 	flushWg    sync.WaitGroup
+
+	hostIDOnce sync.Once
+	hostIDVal  string
 }
 
 func newOTLPHTTPExporter(cfg config.ExporterConfig) (*otlpHTTPExporter, error) {
@@ -280,15 +298,43 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	// host.name always identifies the physical machine this agent runs
 	// on, regardless of which service produced a given signal — unlike
 	// service.name, it should never vary per-envelope.
-	return otlpResource{Attributes: []otlpKeyValue{
+	attrs := []otlpKeyValue{
 		stringAttr("service.name", serviceName),
 		stringAttr("host.name", o.hostName()),
-	}}
+	}
+	// host.id is recommended (not required) by SigNoz's Infrastructure
+	// Monitoring as a fallback identifier when hostnames collide (cloned
+	// VMs, ephemeral instances reusing a name) — included when available,
+	// omitted rather than faked when it isn't.
+	if id := o.hostID(); id != "" {
+		attrs = append(attrs, stringAttr("host.id", id))
+	}
+	return otlpResource{Attributes: attrs}
+}
+
+// hostID reads /etc/machine-id once and caches it — a stable, unique
+// identifier for this specific machine (distinct from host.name, which
+// is just a label and could theoretically collide). Returns "" (and the
+// attribute is simply omitted) if unavailable rather than fabricating a
+// value — a missing host.id degrades gracefully since it's recommended,
+// not required.
+func (o *otlpHTTPExporter) hostID() string {
+	o.hostIDOnce.Do(func() {
+		b, err := os.ReadFile("/etc/machine-id")
+		if err != nil {
+			return
+		}
+		o.hostIDVal = strings.TrimSpace(string(b))
+	})
+	return o.hostIDVal
 }
 
 func envelopeAttrs(e collector.Envelope) []otlpKeyValue {
 	attrs := make([]otlpKeyValue, 0, len(e.Labels))
 	for k, v := range e.Labels {
+		if strings.HasPrefix(k, "_") {
+			continue // internal-use label (e.g. _boot_time_unix) — not a real OTLP attribute, consumed elsewhere
+		}
 		attrs = append(attrs, stringAttr(k, v))
 	}
 	return attrs
@@ -297,9 +343,37 @@ func envelopeAttrs(e collector.Envelope) []otlpKeyValue {
 func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 	points := make([]otlpMetric, 0, len(envs))
 	for _, e := range envs {
+		if e.Source == "system.cpu.time" {
+			// OTel defines this metric as a monotonic cumulative counter
+			// (seconds in this CPU state since boot), not a
+			// point-in-time value — sending it as a Gauge would be
+			// structurally wrong and SigNoz's Infrastructure page
+			// specifically expects Sum here.
+			startNano := ""
+			if bootUnix, ok := e.Labels["_boot_time_unix"]; ok {
+				if secs, err := strconv.ParseInt(bootUnix, 10, 64); err == nil {
+					startNano = strconv.FormatInt(secs*1e9, 10)
+				}
+			}
+			points = append(points, otlpMetric{
+				Name: e.Source,
+				Sum: &otlpSum{
+					AggregationTemporality: 2, // CUMULATIVE
+					IsMonotonic:            true,
+					DataPoints: []otlpNumberDataPoint{{
+						StartTimeUnixNano: startNano,
+						TimeUnixNano:      strconv.FormatInt(e.Timestamp.UnixNano(), 10),
+						AsDouble:          e.Value,
+						Attributes:        envelopeAttrs(e),
+					}},
+				},
+			})
+			continue
+		}
+
 		points = append(points, otlpMetric{
 			Name: e.Source,
-			Gauge: otlpGauge{DataPoints: []otlpNumberDataPoint{{
+			Gauge: &otlpGauge{DataPoints: []otlpNumberDataPoint{{
 				TimeUnixNano: strconv.FormatInt(e.Timestamp.UnixNano(), 10),
 				AsDouble:     e.Value,
 				Attributes:   envelopeAttrs(e),
