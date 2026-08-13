@@ -343,12 +343,10 @@ func envelopeAttrs(e collector.Envelope) []otlpKeyValue {
 func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 	points := make([]otlpMetric, 0, len(envs))
 	for _, e := range envs {
-		if e.Source == "system.cpu.time" {
-			// OTel defines this metric as a monotonic cumulative counter
-			// (seconds in this CPU state since boot), not a
-			// point-in-time value — sending it as a Gauge would be
-			// structurally wrong and SigNoz's Infrastructure page
-			// specifically expects Sum here.
+		if e.Source == "system.cpu.time" || e.Source == "system.network.io" {
+			// Both are OTel-defined monotonic cumulative counters — CPU
+			// time in seconds since boot, network bytes since boot.
+			// Same Sum treatment applies to both.
 			startNano := ""
 			if bootUnix, ok := e.Labels["_boot_time_unix"]; ok {
 				if secs, err := strconv.ParseInt(bootUnix, 10, 64); err == nil {

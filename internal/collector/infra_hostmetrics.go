@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -102,6 +103,191 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 			}
 		}
 	}
+
+	if ifaces, err := readNetworkIOStates(); err == nil {
+		for _, s := range ifaces {
+			labels := map[string]string{"device": s.device, "direction": s.direction}
+			if bootTimeUnix != "" {
+				labels["_boot_time_unix"] = bootTimeUnix
+			}
+			out <- Envelope{
+				Kind:      KindMetric,
+				AgentID:   h.agentID,
+				Source:    "system.network.io",
+				Timestamp: now,
+				Value:     s.bytes,
+				Labels:    labels,
+			}
+		}
+	}
+
+	if mounts, err := readFilesystemUsageStates(); err == nil {
+		for _, m := range mounts {
+			out <- Envelope{
+				Kind:      KindMetric,
+				AgentID:   h.agentID,
+				Source:    "system.filesystem.usage",
+				Timestamp: now,
+				Value:     m.bytes,
+				Labels: map[string]string{
+					"state":      m.state,
+					"mountpoint": m.mountpoint,
+					"device":     m.device,
+					"type":       m.fstype,
+				},
+			}
+		}
+	}
+
+	if load, err := readLoadAverage(); err == nil {
+		for window, val := range load {
+			out <- Envelope{
+				Kind:      KindMetric,
+				AgentID:   h.agentID,
+				Source:    "system.cpu.load_average." + window,
+				Timestamp: now,
+				Value:     val,
+			}
+		}
+	}
+}
+
+// networkIOSample is one (interface, direction) cumulative byte counter.
+type networkIOSample struct {
+	device    string
+	direction string // "transmit" or "receive"
+	bytes     float64
+}
+
+// readNetworkIOStates parses /proc/net/dev, returning CUMULATIVE bytes
+// transmitted/received per interface since boot — same Sum/cumulative
+// model as CPU time, for the same reason: these counters only ever
+// increase.
+//
+// /proc/net/dev's column layout after the interface name is 8 receive
+// fields followed by 8 transmit fields; bytes is the first field in each
+// group (index 0 and index 8).
+func readNetworkIOStates() ([]networkIOSample, error) {
+	f, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var samples []networkIOSample
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if lineNum <= 2 {
+			continue // two header lines
+		}
+		line := scanner.Text()
+		colonIdx := strings.Index(line, ":")
+		if colonIdx < 0 {
+			continue
+		}
+		device := strings.TrimSpace(line[:colonIdx])
+		fields := strings.Fields(line[colonIdx+1:])
+		if len(fields) < 16 {
+			continue
+		}
+		rxBytes, errR := strconv.ParseFloat(fields[0], 64)
+		txBytes, errT := strconv.ParseFloat(fields[8], 64)
+		if errR == nil {
+			samples = append(samples, networkIOSample{device: device, direction: "receive", bytes: rxBytes})
+		}
+		if errT == nil {
+			samples = append(samples, networkIOSample{device: device, direction: "transmit", bytes: txBytes})
+		}
+	}
+	return samples, nil
+}
+
+// filesystemUsageSample is one (mountpoint, state) byte value.
+type filesystemUsageSample struct {
+	mountpoint string
+	device     string
+	fstype     string
+	state      string // "used" or "free"
+	bytes      float64
+}
+
+// realFilesystemTypes is an allowlist of filesystem types we consider
+// "real" storage worth reporting on — deliberately excludes virtual/
+// pseudo filesystems (proc, sysfs, tmpfs, cgroup, overlay, network/FUSE
+// mounts, etc.) that would otherwise produce noisy, meaningless disk
+// usage entries. This is an allowlist rather than an exclude-list
+// because the set of virtual filesystem types is large and grows over
+// time; a real disk's fstype is one of a small, stable set.
+var realFilesystemTypes = map[string]bool{
+	"ext2": true, "ext3": true, "ext4": true,
+	"xfs": true, "btrfs": true, "zfs": true,
+	"vfat": true, "ntfs": true, "exfat": true, "apfs": true,
+}
+
+// readFilesystemUsageStates parses /proc/mounts for real filesystems and
+// calls statfs(2) on each mountpoint to get used/free bytes.
+func readFilesystemUsageStates() ([]filesystemUsageSample, error) {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var samples []filesystemUsageSample
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		device, mountpoint, fstype := fields[0], fields[1], fields[2]
+		if !realFilesystemTypes[fstype] {
+			continue
+		}
+
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(mountpoint, &stat); err != nil {
+			continue // transient mounts, permission issues — skip rather than fail the whole sample
+		}
+		blockSize := float64(stat.Bsize)
+		total := float64(stat.Blocks) * blockSize
+		free := float64(stat.Bavail) * blockSize
+		used := total - float64(stat.Bfree)*blockSize
+		if used < 0 {
+			used = 0
+		}
+
+		samples = append(samples,
+			filesystemUsageSample{mountpoint: mountpoint, device: device, fstype: fstype, state: "used", bytes: used},
+			filesystemUsageSample{mountpoint: mountpoint, device: device, fstype: fstype, state: "free", bytes: free},
+		)
+	}
+	return samples, nil
+}
+
+// readLoadAverage parses /proc/loadavg's first three fields — 1/5/15
+// minute load averages — a simple, non-cumulative Gauge, unlike
+// everything else read from /proc/stat in this file.
+func readLoadAverage() (map[string]float64, error) {
+	b, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(string(b))
+	if len(fields) < 3 {
+		return nil, os.ErrInvalid
+	}
+	result := make(map[string]float64, 3)
+	for i, window := range []string{"1m", "5m", "15m"} {
+		v, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil {
+			continue
+		}
+		result[window] = v
+	}
+	return result, nil
 }
 
 // readBootTimeUnix reads the "btime" line from /proc/stat — seconds
