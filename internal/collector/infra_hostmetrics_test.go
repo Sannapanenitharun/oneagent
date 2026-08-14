@@ -97,6 +97,28 @@ func TestReadNetworkIOStates_RealProcNetDev(t *testing.T) {
 	}
 }
 
+func TestReadNetworkPacketStates_RealProcNetDev(t *testing.T) {
+	samples, err := readNetworkPacketStates()
+	if err != nil {
+		t.Fatalf("readNetworkPacketStates: %v", err)
+	}
+	if len(samples) == 0 {
+		t.Fatal("no interfaces found")
+	}
+	foundLo := map[string]bool{}
+	for _, s := range samples {
+		if s.packets < 0 {
+			t.Errorf("negative packets for %s/%s: %v", s.device, s.direction, s.packets)
+		}
+		if s.device == "lo" {
+			foundLo[s.direction] = true
+		}
+	}
+	if !foundLo["transmit"] || !foundLo["receive"] {
+		t.Errorf("expected both directions for loopback, got: %+v", foundLo)
+	}
+}
+
 func TestReadFilesystemUsageStates_RealProcMounts(t *testing.T) {
 	samples, err := readFilesystemUsageStates()
 	if err != nil {
@@ -263,6 +285,11 @@ func TestInfraHostMetricsCollector_EndToEnd(t *testing.T) {
 				netSamples++
 				if env.Labels["device"] == "" || env.Labels["direction"] == "" {
 					t.Errorf("system.network.io missing device/direction label: %+v", env.Labels)
+				}
+			case env.Source == "system.network.packets":
+				netSamples++
+				if env.Labels["device"] == "" || env.Labels["direction"] == "" {
+					t.Errorf("system.network.packets missing device/direction label: %+v", env.Labels)
 				}
 			case env.Source == "system.network.errors" || env.Source == "system.network.dropped":
 				netErrSamples++

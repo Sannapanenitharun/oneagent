@@ -121,6 +121,23 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 		}
 	}
 
+	if pkts, err := readNetworkPacketStates(); err == nil {
+		for _, s := range pkts {
+			labels := map[string]string{"device": s.device, "direction": s.direction}
+			if bootTimeUnix != "" {
+				labels["_boot_time_unix"] = bootTimeUnix
+			}
+			out <- Envelope{
+				Kind:      KindMetric,
+				AgentID:   h.agentID,
+				Source:    "system.network.packets",
+				Timestamp: now,
+				Value:     s.packets,
+				Labels:    labels,
+			}
+		}
+	}
+
 	if errs, err := readNetworkErrorsAndDrops(); err == nil {
 		for _, s := range errs {
 			labels := map[string]string{"device": s.device, "direction": s.direction}
@@ -194,6 +211,53 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 			}
 		}
 	}
+}
+
+// networkPacketSample is one (interface, direction) cumulative packet
+// counter — same file, same per-interface layout as networkIOSample,
+// just the packets column (index 1 for receive, index 9 for transmit)
+// instead of bytes (index 0/8).
+type networkPacketSample struct {
+	device    string
+	direction string
+	packets   float64
+}
+
+func readNetworkPacketStates() ([]networkPacketSample, error) {
+	f, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var samples []networkPacketSample
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if lineNum <= 2 {
+			continue
+		}
+		line := scanner.Text()
+		colonIdx := strings.Index(line, ":")
+		if colonIdx < 0 {
+			continue
+		}
+		device := strings.TrimSpace(line[:colonIdx])
+		fields := strings.Fields(line[colonIdx+1:])
+		if len(fields) < 16 {
+			continue
+		}
+		rxPackets, errR := strconv.ParseFloat(fields[1], 64)
+		txPackets, errT := strconv.ParseFloat(fields[9], 64)
+		if errR == nil {
+			samples = append(samples, networkPacketSample{device: device, direction: "receive", packets: rxPackets})
+		}
+		if errT == nil {
+			samples = append(samples, networkPacketSample{device: device, direction: "transmit", packets: txPackets})
+		}
+	}
+	return samples, nil
 }
 
 // networkIOSample is one (interface, direction) cumulative byte counter.

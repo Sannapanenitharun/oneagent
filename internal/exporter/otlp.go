@@ -344,7 +344,7 @@ func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 	points := make([]otlpMetric, 0, len(envs))
 	for _, e := range envs {
 		switch e.Source {
-		case "system.cpu.time", "system.network.io", "system.network.errors", "system.network.dropped",
+		case "system.cpu.time", "system.network.io", "system.network.packets", "system.network.errors", "system.network.dropped",
 			"system.disk.io", "system.disk.operations", "system.disk.operation_time":
 			// All of these are OTel-defined monotonic cumulative counters
 			// (seconds/bytes/count since boot) — same Sum treatment
