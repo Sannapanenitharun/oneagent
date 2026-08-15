@@ -26,12 +26,22 @@ jobs:
       - name: Build binaries for all supported platforms
         run: |
           mkdir -p dist
+          # Stamp the tag being released, exactly as scripts/install.sh does for
+          # a source build. Without this every published binary reports
+          # "version=dev" from --version, from the startup log and from the
+          # telemetry.distro.version resource attribute — so a released agent
+          # is indistinguishable from a developer's local build in the one place
+          # you look to find out what a host is running.
+          VERSION="${GITHUB_REF_NAME}"
+          echo "building ${VERSION}"
           for target in linux/amd64 linux/arm64; do
             GOOS=${target%/*}
             GOARCH=${target#*/}
             OUT="dist/agent-i_${GOOS}_${GOARCH}"
             mkdir -p "$OUT"
-            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o "$OUT/agent-i" ./cmd/agent
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build \
+              -ldflags "-X github.com/agent-i/agent/internal/version.Version=${VERSION}" \
+              -o "$OUT/agent-i" ./cmd/agent
             cp configs/agent.yaml systemd/agent-i.service scripts/auto-instrument.sh "$OUT/"
             tar -C dist -czf "dist/agent-i_${GOOS}_${GOARCH}.tar.gz" "agent-i_${GOOS}_${GOARCH}"
             rm -rf "$OUT"

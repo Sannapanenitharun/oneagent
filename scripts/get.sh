@@ -21,11 +21,17 @@
 # development) versus this one (binary install, for real deployments).
 set -euo pipefail
 
-REPO="${AGENT_I_REPO:-Sannapanenitharun/agent-i}"
+# The repository is still named 'oneagent' even though the agent is not; the
+# rename went as far as every identifier in the code and stopped at the GitHub
+# repo itself. This has to match the repo that actually serves the releases,
+# not the one the project is named after — pointing it at 'agent-i' made every
+# download 404 with a message about the version being wrong. GitHub redirects
+# renamed repos, so this keeps working if the repo is renamed later.
+REPO="${AGENT_I_REPO:-Sannapanenitharun/oneagent}"
 VERSION="${AGENT_I_VERSION:-latest}"
 
-if [[ "$REPO" == "Sannapanenitharun/agent-i" ]]; then
-  echo "==> using default repo Sannapanenitharun/agent-i (override with AGENT_I_REPO=owner/repo)" >&2
+if [[ -z "${AGENT_I_REPO:-}" ]]; then
+  echo "==> using default repo ${REPO} (override with AGENT_I_REPO=owner/repo)" >&2
 fi
 
 if [[ $EUID -ne 0 ]]; then
