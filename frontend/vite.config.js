@@ -16,6 +16,12 @@ const OTLP = process.env.AGENT_I_OTLP_URL || "http://127.0.0.1:4319";
 
 export default defineConfig({
   plugins: [react()],
+  // Lets a connection error name the address that actually failed. Without it
+  // the UI can only say "the agent", which is useless when the upstream is a
+  // forwarded port and the question is whether the tunnel is up.
+  define: {
+    __AGENT_TARGET__: JSON.stringify(AGENT),
+  },
   server: {
     port: 5173,
     proxy: {

@@ -900,8 +900,10 @@ export default function ObservabilityDashboard() {
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-[11px] font-mono">
             <span className="w-2 h-2 rounded-full" style={{ background: connected ? "var(--good)" : "var(--crit)" }} />
-            <span style={{ color: connected ? "var(--ink-3)" : "var(--crit)" }}>
-              {loading ? "connecting…" : connected ? "live" : `agent unreachable — ${error}`}
+            {/* title carries the diagnosis — which layer failed and what to
+                check — without spending header width on it. */}
+            <span style={{ color: connected ? "var(--ink-3)" : "var(--crit)" }} title={error?.detail || ""}>
+              {loading ? "connecting…" : connected ? "live" : error.message}
             </span>
           </div>
           <button onClick={() => setPaused(!paused)}
@@ -911,6 +913,31 @@ export default function ObservabilityDashboard() {
           <ThemeSwitch theme={theme} setTheme={setTheme} />
         </div>
       </div>
+
+      {/* The diagnosis, not just the symptom. A connection failure here is
+          almost never the agent — it is a stopped process or a closed tunnel
+          one layer in front of it, and saying which saves the round trip of
+          going to look at a healthy agent. */}
+      {error && (
+        <div
+          className="flex items-start gap-2 px-5 py-2.5 text-[11px] font-mono border-b"
+          style={{
+            background: "color-mix(in srgb, var(--crit) 8%, var(--surface))",
+            borderColor: "color-mix(in srgb, var(--crit) 25%, transparent)",
+            color: "var(--ink-2)",
+          }}
+          role="status"
+        >
+          <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" style={{ color: "var(--crit)" }} />
+          <span>
+            <span style={{ color: "var(--crit)" }}>{error.message}</span>
+            {error.detail && <span className="text-[var(--ink-3)]"> — {error.detail}</span>}
+            {snapshot && (
+              <span className="text-[var(--ink-4)]"> Showing the last successful poll.</span>
+            )}
+          </span>
+        </div>
+      )}
 
       <div className="flex flex-1 min-h-0">
         <Sidebar view={view} setView={setView} snap={snapshot} />
