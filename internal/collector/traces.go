@@ -357,6 +357,14 @@ func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *tracepb.Spa
 		"span_id":  hex.EncodeToString(sp.SpanId),
 		"name":     sp.Name,
 	}
+	// The parent link is what makes a set of spans a trace rather than a bag
+	// of timings: without it nothing downstream can build a waterfall, work
+	// out which service called which, or find the root. It was being parsed
+	// off the wire and then dropped, so every trace we re-exported arrived
+	// flat. Empty on a root span, which is the correct absence.
+	if len(sp.ParentSpanId) > 0 {
+		labels["parent_span_id"] = hex.EncodeToString(sp.ParentSpanId)
+	}
 	if serviceName != "" {
 		labels["service.name"] = serviceName
 	}
@@ -419,6 +427,10 @@ func spanToEnvelopeJSON(agentID, serviceName, scopeName string, sp otlpSpan) Env
 		"trace_id": normalizeHexID(sp.TraceID),
 		"span_id":  normalizeHexID(sp.SpanID),
 		"name":     sp.Name,
+	}
+	// See the protobuf path above for why the parent link matters.
+	if sp.ParentSpanID != "" {
+		labels["parent_span_id"] = normalizeHexID(sp.ParentSpanID)
 	}
 	if serviceName != "" {
 		labels["service.name"] = serviceName

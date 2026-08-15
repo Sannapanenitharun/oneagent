@@ -110,8 +110,11 @@ type otlpScopeSpans struct {
 	Spans []otlpSpan `json:"spans"`
 }
 type otlpSpan struct {
-	TraceID           string         `json:"traceId"`
-	SpanID            string         `json:"spanId"`
+	TraceID string `json:"traceId"`
+	SpanID  string `json:"spanId"`
+	// omitempty matters: OTLP identifies the root span by the ABSENCE of this
+	// field, so emitting an empty string would make every span look parented.
+	ParentSpanID      string         `json:"parentSpanId,omitempty"`
 	Name              string         `json:"name"`
 	StartTimeUnixNano string         `json:"startTimeUnixNano"`
 	EndTimeUnixNano   string         `json:"endTimeUnixNano"`
@@ -475,8 +478,12 @@ func (o *otlpHTTPExporter) sendTraces(envs []collector.Envelope) error {
 			startNano := e.Timestamp.UnixNano()
 			endNano := startNano + int64(e.Value*1e6) // Value is duration in ms
 			spans = append(spans, otlpSpan{
-				TraceID:           e.Labels["trace_id"],
-				SpanID:            e.Labels["span_id"],
+				TraceID: e.Labels["trace_id"],
+				SpanID:  e.Labels["span_id"],
+				// Set as a first-class OTLP field, not just an attribute: this
+				// is what lets a backend reconstruct the call tree. Omitted on
+				// a root span, which is how OTLP marks the root.
+				ParentSpanID:      e.Labels["parent_span_id"],
 				Name:              e.Labels["name"],
 				StartTimeUnixNano: strconv.FormatInt(startNano, 10),
 				EndTimeUnixNano:   strconv.FormatInt(endNano, 10),

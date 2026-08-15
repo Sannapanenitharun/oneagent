@@ -1,0 +1,6 @@
+node_modules/
+dist/
+
+# Snapshot payloads captured from a live agent for local debugging. Real host
+# data (mount points, hostnames, log lines) — not something to commit.
+.snapshot-sample.json

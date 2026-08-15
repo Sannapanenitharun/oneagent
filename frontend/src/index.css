@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Fonts are resolved from the local system rather than fetched from a CDN.
+   This UI is an operations tool that has to work on a host with no outbound
+   internet, and a webfont import there fails silently into a fallback that
+   breaks the monospace alignment the tables and waterfalls depend on. */
+:root {
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: #0b0e14;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Scrollbars, so the dense log and span lists don't get a bright native bar
+   punched through the dark surface. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a3040 transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #2a3040; border-radius: 4px; }
+*::-webkit-scrollbar-thumb:hover { background: #3a4154; }

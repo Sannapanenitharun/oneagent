@@ -1,0 +1,452 @@
+// Adapters: Agent-I's /api/snapshot -> the shapes the dashboard views render.
+//
+// The agent ships a deliberately dumb payload — raw series, raw log lines,
+// raw spans — and every derived number is computed here. That split is on
+// purpose: the agent stays a collector, and changing how a percentile or a
+// health threshold is defined does not require redeploying to every host.
+//
+// Where the backend genuinely cannot answer something, these return empty
+// rather than inventing a plausible value. A dashboard that fabricates is
+// worse than one that admits a gap.
+
+// ---------------------------------------------------------------------------
+// series helpers
+// ---------------------------------------------------------------------------
+
+export function pick(snap, name) {
+  return (snap?.series || []).filter((s) => s.name === name);
+}
+
+// A cumulative counter only ever climbs, so plotting it raw says nothing.
+// Differentiating recovers the per-second rate it was actually measuring. A
+// negative delta means the counter reset (process restart, interface reset),
+// so that interval is dropped rather than drawn as a huge negative spike.
+export function toRate(points) {
+  const out = [];
+  for (let i = 1; i < points.length; i++) {
+    const dt = (points[i].t - points[i - 1].t) / 1000;
+    if (dt <= 0) continue;
+    const dv = points[i].v - points[i - 1].v;
+    if (dv < 0) continue;
+    out.push({ t: points[i].t, v: dv / dt });
+  }
+  return out;
+}
+
+export const prepare = (s) => (s.cumulative ? toRate(s.points) : s.points);
+export const latest = (pts) => (pts.length ? pts[pts.length - 1].v : 0);
+
+const clock = (t) =>
+  new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+// Recharts wants [{time, value}]; the agent speaks [{t, v}].
+export const toChart = (points) =>
+  points.map((p) => ({ time: clock(p.t), value: Math.round(p.v * 100) / 100 }));
+
+// Sums series that differ only by a label we don't care about (per-device
+// network or disk counters), aligned on timestamp. A host with six interfaces
+// should read as one throughput line, not six that each mean nothing alone.
+export function sumBy(snap, name, label) {
+  const groups = {};
+  for (const s of pick(snap, name)) {
+    const key = s.labels?.[label] ?? "—";
+    groups[key] = groups[key] || {};
+    for (const p of prepare(s)) groups[key][p.t] = (groups[key][p.t] || 0) + p.v;
+  }
+  return Object.entries(groups).map(([key, byT]) => ({
+    key,
+    points: Object.keys(byT)
+      .map(Number)
+      .sort((a, b) => a - b)
+      .map((t) => ({ t, v: byT[t] })),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// percentiles
+// ---------------------------------------------------------------------------
+
+// Nearest-rank, matching how the agent's own span stats compute percentiles,
+// so a number derived here agrees with the same number derived server-side.
+function percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+  return sorted[idx];
+}
+
+const isError = (s) => s.status === "2" || s.status === "ERROR";
+
+// ---------------------------------------------------------------------------
+// services (derived from spans)
+// ---------------------------------------------------------------------------
+
+// The agent does not maintain a service registry; services are whatever has
+// sent spans recently. Derived rather than configured, which means the list is
+// always accurate and never needs maintaining.
+export function deriveServices(snap) {
+  const spans = snap?.spans || [];
+  if (!spans.length) return [];
+
+  const windowSec = Math.max(1, (snap.retain_sec || 900));
+  const byService = new Map();
+
+  for (const sp of spans) {
+    const id = sp.service || "unknown";
+    if (!byService.has(id)) byService.set(id, { durs: [], errors: 0, count: 0 });
+    const e = byService.get(id);
+    e.count++;
+    e.durs.push(sp.dur_ms);
+    if (isError(sp)) e.errors++;
+  }
+
+  return [...byService.entries()]
+    .map(([id, e]) => {
+      const sorted = e.durs.slice().sort((a, b) => a - b);
+      const p50 = Math.round(percentile(sorted, 0.5));
+      const p99 = Math.round(percentile(sorted, 0.99));
+      const err = e.count ? (e.errors / e.count) * 100 : 0;
+      return {
+        id,
+        label: id,
+        p50,
+        p99,
+        count: e.count,
+        // Normalised over the retention window, which is what "requests per
+        // second over the last N minutes" means. Kept to 3 decimals so a low
+        // rate reads as 0.004 rather than rounding away to a flat 0 and
+        // looking like no traffic at all.
+        rps: Math.round((e.count / windowSec) * 1000) / 1000,
+        err: Math.round(err * 100) / 100,
+        // Thresholds live here, not in the agent: "degraded" is a product
+        // judgement, and baking it into the collector would mean a redeploy
+        // to change an opinion.
+        status: err > 1 || p99 > 300 ? "degraded" : "healthy",
+      };
+    })
+    .sort((a, b) => b.rps - a.rps);
+}
+
+// ---------------------------------------------------------------------------
+// traces
+// ---------------------------------------------------------------------------
+
+// Rebuilds each trace's call tree from parent_id. Depth drives both the
+// waterfall indent and the flame graph's vertical stacking; without the parent
+// link every span would collapse to depth 0 and the two views would be
+// indistinguishable from a flat list.
+export function deriveTraces(snap) {
+  const spans = snap?.spans || [];
+  if (!spans.length) return [];
+
+  const byTrace = new Map();
+  for (const sp of spans) {
+    const id = sp.trace_id || "(none)";
+    if (!byTrace.has(id)) byTrace.set(id, []);
+    byTrace.get(id).push(sp);
+  }
+
+  const traces = [];
+  for (const [id, list] of byTrace) {
+    const byId = new Map(list.map((s) => [s.span_id, s]));
+
+    // Walk to the root, with a visited set so a malformed trace containing a
+    // parent cycle cannot hang the render.
+    const depthOf = (sp) => {
+      let d = 0;
+      let seen = new Set([sp.span_id]);
+      let cur = sp;
+      while (cur.parent_id && byId.has(cur.parent_id) && !seen.has(cur.parent_id)) {
+        seen.add(cur.parent_id);
+        cur = byId.get(cur.parent_id);
+        d++;
+      }
+      return d;
+    };
+
+    const t0 = Math.min(...list.map((s) => s.t));
+    const end = Math.max(...list.map((s) => s.t + s.dur_ms));
+    // A span whose parent is missing from this window is treated as a root:
+    // the store keeps a bounded number of spans, so a long trace can be
+    // partially evicted, and refusing to render the remainder is worse than
+    // rendering it slightly shallower.
+    const roots = list.filter((s) => !s.parent_id || !byId.has(s.parent_id));
+    const root = roots.length
+      ? roots.reduce((a, b) => (a.t <= b.t ? a : b))
+      : list.reduce((a, b) => (a.t <= b.t ? a : b));
+
+    traces.push({
+      id,
+      root: root.service || "unknown",
+      op: root.name || "—",
+      duration: Math.max(1, Math.round(end - t0)),
+      status: list.some(isError) ? "error" : "ok",
+      startedAt: t0,
+      spans: list
+        .slice()
+        .sort((a, b) => a.t - b.t)
+        .map((s) => ({
+          svc: s.service || "unknown",
+          op: s.name || "—",
+          start: Math.max(0, Math.round(s.t - t0)),
+          dur: Math.round(s.dur_ms),
+          depth: depthOf(s),
+          error: isError(s),
+        })),
+    });
+  }
+  return traces.sort((a, b) => b.startedAt - a.startedAt);
+}
+
+// Caller -> callee edges, read straight off the parent links. This is exactly
+// how Grafana Tempo derives its service graph, and it means the topology is
+// observed rather than declared: it cannot drift from reality.
+export function deriveEdges(snap) {
+  const spans = snap?.spans || [];
+  const byId = new Map(spans.map((s) => [s.span_id, s]));
+  const seen = new Set();
+  const edges = [];
+  for (const sp of spans) {
+    if (!sp.parent_id) continue;
+    const parent = byId.get(sp.parent_id);
+    if (!parent) continue;
+    const from = parent.service || "unknown";
+    const to = sp.service || "unknown";
+    if (from === to) continue; // an internal call, not a service dependency
+    const key = `${from}->${to}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push([from, to]);
+  }
+  return edges;
+}
+
+// Lays out a derived graph in dependency order: roots on the left, each node
+// one column right of its deepest caller. Positions cannot be hardcoded when
+// the topology itself is discovered at runtime.
+export function layoutTopology(services, edges, width = 460, height = 190) {
+  if (!services.length) return {};
+  const incoming = new Map(services.map((s) => [s.id, 0]));
+  for (const [, to] of edges) incoming.set(to, (incoming.get(to) || 0) + 1);
+
+  const col = new Map();
+  const roots = services.filter((s) => !incoming.get(s.id));
+  const queue = (roots.length ? roots : [services[0]]).map((s) => s.id);
+  queue.forEach((id) => col.set(id, 0));
+
+  for (let guard = 0; queue.length && guard < 500; guard++) {
+    const cur = queue.shift();
+    for (const [from, to] of edges) {
+      if (from !== cur) continue;
+      const next = (col.get(cur) || 0) + 1;
+      if ((col.get(to) ?? -1) < next) {
+        col.set(to, next);
+        queue.push(to);
+      }
+    }
+  }
+  for (const s of services) if (!col.has(s.id)) col.set(s.id, 0);
+
+  const maxCol = Math.max(...col.values(), 0);
+  const rows = new Map();
+  const pos = {};
+  for (const s of services) {
+    const c = col.get(s.id);
+    const r = rows.get(c) || 0;
+    rows.set(c, r + 1);
+    pos[s.id] = { col: c, row: r };
+  }
+  const out = {};
+  for (const s of services) {
+    const { col: c, row: r } = pos[s.id];
+    const count = rows.get(c);
+    out[s.id] = {
+      x: 50 + (maxCol ? (c / maxCol) * (width - 110) : 0),
+      y: (height / (count + 1)) * (r + 1),
+    };
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// logs
+// ---------------------------------------------------------------------------
+
+// The agent tails files and forwards lines verbatim — it does not parse
+// severity, and inventing a parser server-side would impose one log format on
+// every deployment. Classifying here keeps that policy in the UI where it can
+// be changed without touching a single host.
+const LEVEL_RE = /\b(FATAL|CRITICAL|ERROR|ERR|WARN(?:ING)?|INFO|DEBUG|TRACE)\b/i;
+
+export function deriveLogs(snap) {
+  return (snap?.logs || [])
+    .slice()
+    .reverse()
+    .map((l) => {
+      const m = LEVEL_RE.exec(l.message || "");
+      let lvl = "INFO";
+      if (m) {
+        const tok = m[1].toUpperCase();
+        if (tok === "FATAL" || tok === "CRITICAL" || tok === "ERR") lvl = "ERROR";
+        else if (tok === "WARNING") lvl = "WARN";
+        else if (["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].includes(tok)) lvl = tok;
+      }
+      return {
+        t: new Date(l.t).toLocaleTimeString([], { hour12: false }),
+        lvl,
+        // Source is the file the line was tailed from; its basename is the
+        // most useful short identifier available.
+        svc: (l.source || "").split(/[\\/]/).pop() || "log",
+        msg: l.message || "",
+        // Trace/log correlation needs the app to emit trace_id into its log
+        // line AND the agent to parse it. Neither exists yet, so this stays
+        // null and the UI hides the jump-to-trace affordance rather than
+        // offering one that goes nowhere.
+        traceId: null,
+      };
+    });
+}
+
+// ---------------------------------------------------------------------------
+// infrastructure (this agent's own host)
+// ---------------------------------------------------------------------------
+
+export function deriveInfra(snap) {
+  if (!snap?.series?.length) return [];
+
+  // CPU busy % = 1 - idle share of total cpu-seconds per second.
+  const cpuSeries = pick(snap, "system.cpu.time").map((s) => ({
+    state: s.labels?.state,
+    points: prepare(s),
+  }));
+  let cpu = NaN;
+  if (cpuSeries.length) {
+    const total = cpuSeries.reduce((a, s) => a + latest(s.points), 0);
+    const idle = latest(cpuSeries.find((s) => s.state === "idle")?.points || []);
+    if (total > 0) cpu = Math.round((1 - idle / total) * 100);
+  }
+  if (Number.isNaN(cpu)) {
+    cpu = Math.round(latest(pick(snap, "host.cpu.used_pct")[0]?.points || []));
+  }
+
+  const mem = pick(snap, "system.memory.usage");
+  let memPct = NaN;
+  if (mem.length) {
+    const total = mem.reduce((a, s) => a + latest(s.points), 0);
+    const used = latest(mem.find((s) => s.labels?.state === "used")?.points || []);
+    if (total > 0) memPct = Math.round((used / total) * 100);
+  }
+  if (Number.isNaN(memPct)) {
+    memPct = Math.round(latest(pick(snap, "host.memory.used_pct")[0]?.points || []));
+  }
+
+  // Worst mountpoint, since a host is in trouble when any filesystem fills,
+  // not when their average does.
+  const mounts = {};
+  for (const s of pick(snap, "system.filesystem.usage")) {
+    const mp = s.labels?.mountpoint || "?";
+    mounts[mp] = mounts[mp] || {};
+    mounts[mp][s.labels?.state || "?"] = latest(s.points);
+  }
+  let disk = 0;
+  const perMount = [];
+  for (const [mp, v] of Object.entries(mounts)) {
+    const tot = (v.used || 0) + (v.free || 0);
+    if (tot <= 0) continue;
+    const pct = Math.round((v.used / tot) * 100);
+    perMount.push({ mount: mp, pct });
+    if (pct > disk) disk = pct;
+  }
+
+  const load1 = latest(pick(snap, "system.cpu.load_average.1m")[0]?.points || []);
+
+  return [
+    {
+      host: snap.agent_id || "unknown",
+      role: `agent-i ${snap.version || ""}`.trim(),
+      cpu: Number.isFinite(cpu) ? cpu : 0,
+      mem: Number.isFinite(memPct) ? memPct : 0,
+      disk,
+      load1: Math.round(load1 * 100) / 100,
+      mounts: perMount.sort((a, b) => b.pct - a.pct),
+      status: cpu > 85 || memPct > 90 || disk > 90 ? "degraded" : "healthy",
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// overview charts
+// ---------------------------------------------------------------------------
+
+// Buckets spans into per-minute counts. Derived from the spans actually
+// retained, so it reflects what was sampled and forwarded, not the exact
+// totals — the agent's trace stats are the exact source when enabled.
+export function deriveTraffic(snap, bucketMs = 60000) {
+  const spans = snap?.spans || [];
+  if (!spans.length) return { rps: [], latency: [], errors: [] };
+
+  const buckets = new Map();
+  for (const sp of spans) {
+    const b = Math.floor(sp.t / bucketMs) * bucketMs;
+    if (!buckets.has(b)) buckets.set(b, { count: 0, errors: 0, durs: [] });
+    const e = buckets.get(b);
+    e.count++;
+    e.durs.push(sp.dur_ms);
+    if (isError(sp)) e.errors++;
+  }
+
+  const keys = [...buckets.keys()].sort((a, b) => a - b);
+  return {
+    rps: keys.map((k) => ({
+      time: clock(k),
+      value: Math.round((buckets.get(k).count / (bucketMs / 1000)) * 100) / 100,
+    })),
+    latency: keys.map((k) => ({
+      time: clock(k),
+      value: Math.round(percentile(buckets.get(k).durs.slice().sort((a, b) => a - b), 0.99)),
+    })),
+    errors: keys.map((k) => ({ time: clock(k), value: buckets.get(k).errors })),
+  };
+}
+
+// Every series the agent is producing, for the raw explorer.
+export function deriveAllSeries(snap) {
+  return (snap?.series || []).map((s) => ({
+    name: s.name,
+    cumulative: s.cumulative,
+    labels: s.labels
+      ? Object.keys(s.labels)
+          .sort()
+          .map((k) => `${k}=${s.labels[k]}`)
+          .join(" ")
+      : "",
+    latest: latest(prepare(s)),
+    points: s.points.length,
+  }));
+}
+
+// Formats a rate without lying about precision: a busy service reads as a
+// round number, a trickle still reads as a nonzero value rather than "0".
+export function fmtRps(v) {
+  if (v >= 100) return Math.round(v).toString();
+  if (v >= 1) return v.toFixed(1);
+  if (v > 0) return v.toFixed(3);
+  return "0";
+}
+
+export function globalStats(snap) {
+  const services = deriveServices(snap);
+  const totalRps = services.reduce((a, s) => a + s.rps, 0);
+  const p99 = services.length ? Math.max(...services.map((s) => s.p99)) : NaN;
+  const counts = snap?.counts || {};
+  const uptimeSec = snap ? Math.max(1, (snap.now - snap.started_at) / 1000) : 1;
+  const envelopes = Object.values(counts).reduce((a, b) => a + b, 0);
+  return {
+    services,
+    totalRps: Math.round(totalRps * 1000) / 1000,
+    p99,
+    envelopes,
+    envelopesPerSec: Math.round((envelopes / uptimeSec) * 10) / 10,
+    counts,
+    seriesDropped: snap?.series_dropped || 0,
+  };
+}

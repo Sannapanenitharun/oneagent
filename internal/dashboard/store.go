@@ -57,15 +57,18 @@ type LogLine struct {
 	Labels  map[string]string `json:"labels,omitempty"`
 }
 
-// Span is one received trace span.
+// Span is one received trace span. ParentID is what lets a consumer rebuild
+// the call tree — depth for a waterfall, stacking for a flame graph, and the
+// caller→callee edges of a service map. Empty on a root span.
 type Span struct {
-	T       int64   `json:"t"`
-	TraceID string  `json:"trace_id"`
-	SpanID  string  `json:"span_id"`
-	Service string  `json:"service"`
-	Name    string  `json:"name"`
-	DurMs   float64 `json:"dur_ms"`
-	Status  string  `json:"status,omitempty"`
+	T        int64   `json:"t"`
+	TraceID  string  `json:"trace_id"`
+	SpanID   string  `json:"span_id"`
+	ParentID string  `json:"parent_id,omitempty"`
+	Service  string  `json:"service"`
+	Name     string  `json:"name"`
+	DurMs    float64 `json:"dur_ms"`
+	Status   string  `json:"status,omitempty"`
 }
 
 // Snapshot is the whole view, as served to the browser.
@@ -151,13 +154,14 @@ func (s *Store) Record(e collector.Envelope) {
 		}, maxLogs)
 	case collector.KindTrace:
 		s.spans = appendCapped(s.spans, Span{
-			T:       e.Timestamp.UnixMilli(),
-			TraceID: e.Labels["trace_id"],
-			SpanID:  e.Labels["span_id"],
-			Service: e.Labels["service.name"],
-			Name:    e.Labels["name"],
-			DurMs:   e.Value,
-			Status:  e.Labels["status.code"],
+			T:        e.Timestamp.UnixMilli(),
+			TraceID:  e.Labels["trace_id"],
+			SpanID:   e.Labels["span_id"],
+			ParentID: e.Labels["parent_span_id"],
+			Service:  e.Labels["service.name"],
+			Name:     e.Labels["name"],
+			DurMs:    e.Value,
+			Status:   e.Labels["status.code"],
 		}, maxSpans)
 	case collector.KindAPICall:
 		// An access-log request is a metric-shaped thing here: its latency
