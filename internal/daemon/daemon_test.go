@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oneagent/agent/internal/config"
+	"github.com/agent-i/agent/internal/config"
 )
 
 func baseConfig() *config.Config {

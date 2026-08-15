@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
+	"github.com/agent-i/agent/internal/collector"
 )
 
 // Config controls aggregation. Zero values are replaced with defaults by New.

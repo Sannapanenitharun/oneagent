@@ -47,7 +47,7 @@ const registryMaxAge = 7 * 24 * time.Hour
 // skipped lines once; refusing to boot costs all telemetry from the host until
 // someone notices. That applies to an unwritable directory too — an agent
 // binary upgraded in place without re-running the installer will not have
-// /var/lib/oneagent-agent yet, and ProtectSystem=strict will block creating
+// /var/lib/agent-i yet, and ProtectSystem=strict will block creating
 // it. In that case the registry degrades to in-memory only: offsets stay
 // consistent for the life of the process and simply do not survive a restart.
 func NewOffsetRegistry(path string) (*OffsetRegistry, error) {

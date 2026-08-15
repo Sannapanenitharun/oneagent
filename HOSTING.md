@@ -1,4 +1,4 @@
-# Hosting OneAgent releases (so the one-line installer works)
+# Hosting Agent-I releases (so the one-line installer works)
 
 `scripts/get.sh` is the real `curl | bash` one-liner — it detects the
 host's OS/architecture, downloads a prebuilt binary, verifies its
@@ -24,30 +24,30 @@ automatically attaching `scripts/get.sh` itself as a release asset too.
 Then the real one-liner for anyone to run is:
 
 ```bash
-curl -fsSL https://github.com/Sannapanenitharun/oneagent/releases/latest/download/get.sh \
+curl -fsSL https://github.com/Sannapanenitharun/agent-i/releases/latest/download/get.sh \
   | sudo bash
 ```
 
-(The repo is already baked in as the default in `get.sh`, so no `ONEAGENT_REPO` env var is needed unless you fork it elsewhere.)
+(The repo is already baked in as the default in `get.sh`, so no `AGENT_I_REPO` env var is needed unless you fork it elsewhere.)
 
 ## Option B — Your own hosting (S3, a static file server, etc.)
 
-`get.sh` supports `ONEAGENT_BASE_URL` to bypass the GitHub Releases URL
+`get.sh` supports `AGENT_I_BASE_URL` to bypass the GitHub Releases URL
 pattern entirely — point it at any URL that serves the same three files
 GitHub Releases would:
 
-- `oneagent-agent_linux_amd64.tar.gz`
-- `oneagent-agent_linux_arm64.tar.gz`
+- `agent-i_linux_amd64.tar.gz`
+- `agent-i_linux_arm64.tar.gz`
 - `checksums.txt` (sha256sum output format — `<hash>  <filename>` per line)
 
 Build and publish them yourself:
 
 ```bash
 for arch in amd64 arm64; do
-  mkdir oneagent-agent_linux_$arch
-  GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -o oneagent-agent_linux_$arch/oneagent-agent ./cmd/agent
-  cp configs/agent.yaml systemd/oneagent-agent.service oneagent-agent_linux_$arch/
-  tar -czf oneagent-agent_linux_$arch.tar.gz oneagent-agent_linux_$arch
+  mkdir agent-i_linux_$arch
+  GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -o agent-i_linux_$arch/agent-i ./cmd/agent
+  cp configs/agent.yaml systemd/agent-i.service agent-i_linux_$arch/
+  tar -czf agent-i_linux_$arch.tar.gz agent-i_linux_$arch
 done
 sha256sum *.tar.gz > checksums.txt
 # upload the .tar.gz files + checksums.txt to your host
@@ -57,7 +57,7 @@ Then the one-liner becomes:
 
 ```bash
 curl -fsSL https://your-host.example.com/get.sh \
-  | ONEAGENT_BASE_URL=https://your-host.example.com sudo -E bash
+  | AGENT_I_BASE_URL=https://your-host.example.com sudo -E bash
 ```
 
 ## Verification performed in this session (and what wasn't)
@@ -79,5 +79,5 @@ Not verified (environment limitation, not a script issue):
   this sandbox has no credentials to push to a GitHub repo and no
   network path to fetch from real Releases URLs. The logic mirrors what
   was tested against the local mock server exactly (same script, same
-  URL shape via `ONEAGENT_BASE_URL`), but that's inference, not a
+  URL shape via `AGENT_I_BASE_URL`), but that's inference, not a
   live-tested claim.

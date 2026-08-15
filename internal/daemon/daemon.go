@@ -12,13 +12,13 @@ import (
 	"os"
 	"time"
 
-	"github.com/oneagent/agent/internal/aggregate"
-	"github.com/oneagent/agent/internal/collector"
-	"github.com/oneagent/agent/internal/config"
-	"github.com/oneagent/agent/internal/dashboard"
-	"github.com/oneagent/agent/internal/exporter"
-	"github.com/oneagent/agent/internal/spans"
-	"github.com/oneagent/agent/internal/version"
+	"github.com/agent-i/agent/internal/aggregate"
+	"github.com/agent-i/agent/internal/collector"
+	"github.com/agent-i/agent/internal/config"
+	"github.com/agent-i/agent/internal/dashboard"
+	"github.com/agent-i/agent/internal/exporter"
+	"github.com/agent-i/agent/internal/spans"
+	"github.com/agent-i/agent/internal/version"
 )
 
 type Daemon struct {

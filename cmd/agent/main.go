@@ -1,4 +1,4 @@
-// Command agent is the OneAgent telemetry collector daemon entrypoint.
+// Command agent is the Agent-I telemetry collector daemon entrypoint.
 package main
 
 import (
@@ -10,13 +10,13 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/oneagent/agent/internal/config"
-	"github.com/oneagent/agent/internal/daemon"
-	"github.com/oneagent/agent/internal/version"
+	"github.com/agent-i/agent/internal/config"
+	"github.com/agent-i/agent/internal/daemon"
+	"github.com/agent-i/agent/internal/version"
 )
 
 func main() {
-	configPath := flag.String("config", "/etc/oneagent-agent/agent.yaml", "path to agent config file")
+	configPath := flag.String("config", "/etc/agent-i/agent.yaml", "path to agent config file")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
 
@@ -63,10 +63,10 @@ func main() {
 		}
 	}()
 
-	log.Printf("oneagent-agent starting (version=%s, agent_id=%s, interval=%s)", version.Version, cfg.AgentID, cfg.Interval)
+	log.Printf("agent-i starting (version=%s, agent_id=%s, interval=%s)", version.Version, cfg.AgentID, cfg.Interval)
 	if err := d.Run(ctx); err != nil {
 		log.Fatalf("daemon error: %v", err)
 	}
-	log.Println("oneagent-agent shut down cleanly")
+	log.Println("agent-i shut down cleanly")
 	os.Exit(0)
 }

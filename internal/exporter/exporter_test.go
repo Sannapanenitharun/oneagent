@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
-	"github.com/oneagent/agent/internal/config"
+	"github.com/agent-i/agent/internal/collector"
+	"github.com/agent-i/agent/internal/config"
 )
 
 func decodeGzipBatch(t *testing.T, r *http.Request) []collector.Envelope {

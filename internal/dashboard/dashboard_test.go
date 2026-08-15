@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
+	"github.com/agent-i/agent/internal/collector"
 )
 
 func metric(name string, v float64, ts time.Time, labels map[string]string) collector.Envelope {

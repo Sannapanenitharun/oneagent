@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
+	"github.com/agent-i/agent/internal/collector"
 )
 
 func apiCall(method, path, status string, durationMs float64) collector.Envelope {

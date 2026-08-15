@@ -1,6 +1,6 @@
 // Package exporter takes normalized collector.Envelope values and writes
 // them somewhere. Kept separate from collection so adding a new sink
-// (e.g. push to OneAgent's ingestion bus) never touches collector code.
+// (e.g. push to Agent-I's ingestion bus) never touches collector code.
 package exporter
 
 import (
@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
-	"github.com/oneagent/agent/internal/config"
+	"github.com/agent-i/agent/internal/collector"
+	"github.com/agent-i/agent/internal/config"
 )
 
 // Exporter writes a single envelope to its configured sink.

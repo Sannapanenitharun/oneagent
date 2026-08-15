@@ -10,7 +10,7 @@ package version
 
 // Version is the build's identity, stamped at link time:
 //
-//	go build -ldflags "-X github.com/oneagent/agent/internal/version.Version=$(git describe --tags --always --dirty)"
+//	go build -ldflags "-X github.com/agent-i/agent/internal/version.Version=$(git describe --tags --always --dirty)"
 //
 // The default is deliberately "dev" rather than a plausible-looking
 // number — an unstamped binary should be obviously unstamped, not

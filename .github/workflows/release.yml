@@ -29,11 +29,11 @@ jobs:
           for target in linux/amd64 linux/arm64; do
             GOOS=${target%/*}
             GOARCH=${target#*/}
-            OUT="dist/oneagent-agent_${GOOS}_${GOARCH}"
+            OUT="dist/agent-i_${GOOS}_${GOARCH}"
             mkdir -p "$OUT"
-            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o "$OUT/oneagent-agent" ./cmd/agent
-            cp configs/agent.yaml systemd/oneagent-agent.service scripts/auto-instrument.sh "$OUT/"
-            tar -C dist -czf "dist/oneagent-agent_${GOOS}_${GOARCH}.tar.gz" "oneagent-agent_${GOOS}_${GOARCH}"
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -o "$OUT/agent-i" ./cmd/agent
+            cp configs/agent.yaml systemd/agent-i.service scripts/auto-instrument.sh "$OUT/"
+            tar -C dist -czf "dist/agent-i_${GOOS}_${GOARCH}.tar.gz" "agent-i_${GOOS}_${GOARCH}"
             rm -rf "$OUT"
           done
 

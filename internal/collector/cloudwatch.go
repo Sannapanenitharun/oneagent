@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oneagent/agent/internal/awssig"
+	"github.com/agent-i/agent/internal/awssig"
 )
 
 // CloudWatchCollector polls AWS CloudWatch's GetMetricData API on an

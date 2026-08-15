@@ -19,8 +19,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/oneagent/agent/internal/aggregate"
-	"github.com/oneagent/agent/internal/collector"
+	"github.com/agent-i/agent/internal/aggregate"
+	"github.com/agent-i/agent/internal/collector"
 )
 
 type Config struct {

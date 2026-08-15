@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
-	"github.com/oneagent/agent/internal/exporter"
+	"github.com/agent-i/agent/internal/collector"
+	"github.com/agent-i/agent/internal/exporter"
 )
 
 const (

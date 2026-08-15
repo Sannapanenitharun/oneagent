@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
+	"github.com/agent-i/agent/internal/collector"
 )
 
 // asyncExporter decouples collection from delivery.

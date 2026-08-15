@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# OneAgent auto-instrumentation.
+# Agent-I auto-instrumentation.
 #
 # Detects systemd-managed Node.js and Python web services running on this
 # host, and — only when explicitly told to — installs OpenTelemetry
-# instrumentation into them and points them at OneAgent's trace receiver
+# instrumentation into them and points them at Agent-I's trace receiver
 # (localhost:4319), so their real requests show up as traces without you
 # writing any instrumentation code by hand.
 #
 # SAFETY DESIGN, read before running with --apply:
 #   This script restarts real, possibly production, services that have
-#   nothing to do with OneAgent itself. Restarting a live service always
+#   nothing to do with Agent-I itself. Restarting a live service always
 #   carries some risk (a brief connection drop at minimum; a bad
 #   interaction with in-flight requests at worst). Because of that:
 #     - Default mode is DRY RUN: it detects and prints what it WOULD do,
@@ -34,8 +34,8 @@ if [[ "${1:-}" == "--apply" ]]; then
   APPLY=true
 fi
 
-ONEAGENT_TRACE_ENDPOINT="http://localhost:4319"
-DROPIN_MARKER="oneagent-otel"
+AGENT_I_TRACE_ENDPOINT="http://localhost:4319"
+DROPIN_MARKER="agent-i-otel"
 
 if [[ $EUID -ne 0 ]]; then
   echo "error: must run as root (sudo ./scripts/auto-instrument.sh)" >&2
@@ -44,7 +44,7 @@ fi
 
 instrument_node() {
   local unit="$1" cwd="$2" node_exe="$3"
-  local bootstrap="$cwd/oneagent-otel-bootstrap.js"
+  local bootstrap="$cwd/agent-i-otel-bootstrap.js"
   # Derive npm's path from the SAME node binary this process is actually
   # running, rather than trusting `npm` to be on PATH. This matters
   # specifically because sudo does not inherit the invoking user's PATH
@@ -74,15 +74,15 @@ instrument_node() {
 
   echo "    -> writing $bootstrap"
   cat > "$bootstrap" << JSEOF
-// Written by oneagent auto-instrument.sh — safe to delete to undo.
+// Written by agent-i auto-instrument.sh — safe to delete to undo.
 // Initializes OpenTelemetry auto-instrumentation and sends traces to
-// OneAgent's receiver on this host.
+// Agent-I's receiver on this host.
 const { NodeSDK } = require('@opentelemetry/sdk-node');
 const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
 const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-proto');
 
 const sdk = new NodeSDK({
-  traceExporter: new OTLPTraceExporter({ url: '${ONEAGENT_TRACE_ENDPOINT}/v1/traces' }),
+  traceExporter: new OTLPTraceExporter({ url: '${AGENT_I_TRACE_ENDPOINT}/v1/traces' }),
   instrumentations: [getNodeAutoInstrumentations()],
 });
 sdk.start();
@@ -141,7 +141,7 @@ instrument_python() {
 [Service]
 ExecStart=
 ExecStart=$bin_dir/opentelemetry-instrument $cmdline
-Environment=OTEL_EXPORTER_OTLP_ENDPOINT=$ONEAGENT_TRACE_ENDPOINT
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=$AGENT_I_TRACE_ENDPOINT
 Environment=OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 Environment=OTEL_SERVICE_NAME=$unit
 CONFEOF
@@ -196,8 +196,8 @@ for unit in $(systemctl list-units --type=service --state=running --no-legend --
         instrument_node "$unit" "$cwd" "$exe_path"
       else
         echo "    would run: npm install (4 OTel packages) in $cwd, using npm from $(dirname "$exe_path")"
-        echo "    would write: $cwd/oneagent-otel-bootstrap.js"
-        echo "    would create: /etc/systemd/system/$unit.d/$DROPIN_MARKER.conf (NODE_OPTIONS=--require=.../oneagent-otel-bootstrap.js)"
+        echo "    would write: $cwd/agent-i-otel-bootstrap.js"
+        echo "    would create: /etc/systemd/system/$unit.d/$DROPIN_MARKER.conf (NODE_OPTIONS=--require=.../agent-i-otel-bootstrap.js)"
         echo "    would run: systemctl daemon-reload && systemctl restart $unit"
       fi
       echo ""

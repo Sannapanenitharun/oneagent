@@ -1,4 +1,4 @@
-# Reloading: `systemctl reload oneagent-agent` (or `kill -HUP <pid>`) re-reads
+# Reloading: `systemctl reload agent-i` (or `kill -HUP <pid>`) re-reads
 # this file without restarting. Applied live: logs.paths, access_logs.paths,
 # the whole aggregation block, and traces.sampling / traces.stats. Everything
 # else — agent_id, interval, listen_addr, exporter, which collectors are
@@ -46,7 +46,7 @@ tailing:
   # skipping everything written while the agent was down. Keyed by inode, so
   # it survives rotation. The directory must be writable by the agent user —
   # the installers create it and the systemd unit allows it.
-  registry_path: "/var/lib/oneagent-agent/registry.json"
+  registry_path: "/var/lib/agent-i/registry.json"
 
 # Summarise access log requests into per-interval metrics instead of shipping
 # one record per HTTP request.
@@ -78,7 +78,7 @@ aggregation:
 # Not enabled by config default — an existing deployment that upgrades
 # should not silently start listening on a new port. It is on here, so
 # fresh installs get it; add this block to an existing
-# /etc/oneagent-agent/agent.yaml to switch it on there.
+# /etc/agent-i/agent.yaml to switch it on there.
 dashboard:
   enabled: true
   # Loopback deliberately: this endpoint has no authentication and exposes
@@ -104,8 +104,8 @@ traces:
   max_request_bytes: 4194304   # 4 MiB
   # Optional. Names an env var holding a bearer token clients must present as
   # "Authorization: Bearer <token>". Set this if you ever move listen_addr off
-  # loopback; put the value in /etc/oneagent-agent/env.
-  # auth_token_env: "ONEAGENT_TRACE_TOKEN"
+  # loopback; put the value in /etc/agent-i/env.
+  # auth_token_env: "AGENT_I_TRACE_TOKEN"
 
   # RED metrics (count, errors, latency distribution) computed over 100% of
   # spans. Computed BEFORE sampling, so these counts stay exact no matter how
@@ -149,7 +149,7 @@ cloud:
   #   enabled: false
   #   project_id: "my-gcp-project"
   #   metric_type: "compute.googleapis.com/instance/cpu/utilization"
-  #   service_account_key_path: "/etc/oneagent-agent/gcp-sa.json"
+  #   service_account_key_path: "/etc/agent-i/gcp-sa.json"
   # azure:
   #   enabled: false
   #   tenant_id: "00000000-0000-0000-0000-000000000000"
@@ -161,7 +161,7 @@ cloud:
 
 exporter:
   type: "stdout"   # "stdout" | "file" | "http" (our own JSON format) | "otlp_http" (real OTLP — use this for SigNoz or any OTLP-native backend)
-  # path: "/var/log/oneagent-agent/export.jsonl"                    # file exporter
+  # path: "/var/log/agent-i/export.jsonl"                    # file exporter
   # endpoint: "http://169.58.93.233:4318"                           # otlp_http: base URL of the OTLP receiver — no trailing /v1/... path, that's added automatically per signal type
   # headers_env:                                                    # otlp_http/http: header name -> env var holding its value (never put the key directly in this file)
   #   signoz-ingestion-key: "SIGNOZ_INGESTION_KEY"

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
-	"github.com/oneagent/agent/internal/config"
-	"github.com/oneagent/agent/internal/version"
+	"github.com/agent-i/agent/internal/collector"
+	"github.com/agent-i/agent/internal/config"
+	"github.com/agent-i/agent/internal/version"
 )
 
 func decodeGzipJSON(t *testing.T, r *http.Request, v any) {
@@ -180,8 +180,8 @@ func TestOTLPHTTPExporter_MetricsShapeAndEndpoint(t *testing.T) {
 	if resAttrs["os.type"] != runtime.GOOS {
 		t.Errorf("resource os.type = %q, want %q — SigNoz's OS Type filter reads this", resAttrs["os.type"], runtime.GOOS)
 	}
-	if resAttrs["telemetry.distro.name"] != "oneagent" {
-		t.Errorf("resource telemetry.distro.name = %q, want oneagent", resAttrs["telemetry.distro.name"])
+	if resAttrs["telemetry.distro.name"] != "agent-i" {
+		t.Errorf("resource telemetry.distro.name = %q, want agent-i", resAttrs["telemetry.distro.name"])
 	}
 	if resAttrs["telemetry.distro.version"] != version.Version {
 		t.Errorf("resource telemetry.distro.version = %q, want %q", resAttrs["telemetry.distro.version"], version.Version)
@@ -281,7 +281,7 @@ func TestOTLPHTTPExporter_TracesPreserveOriginServiceName(t *testing.T) {
 
 	// Two spans from a real instrumented app (carries its own
 	// service.name label, as our trace receiver attaches from the
-	// incoming OTLP resource attributes) and one from OneAgent's own
+	// incoming OTLP resource attributes) and one from Agent-I's own
 	// host-level activity (no service.name label at all).
 	if err := exp.Export(collector.Envelope{
 		Kind: collector.KindTrace, AgentID: "host-001", Timestamp: ts, Value: 10,

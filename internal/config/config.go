@@ -290,7 +290,7 @@ func Load(path string) (*Config, error) {
 		cfg.Tailing.MaxLineBytes = 256 * 1024
 	}
 	if cfg.Tailing.RegistryPath == "" {
-		cfg.Tailing.RegistryPath = "/var/lib/oneagent-agent/registry.json"
+		cfg.Tailing.RegistryPath = "/var/lib/agent-i/registry.json"
 	}
 
 	// Dashboard defaults. Enabled is NOT defaulted on: an existing

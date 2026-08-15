@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oneagent/agent/internal/collector"
-	"github.com/oneagent/agent/internal/config"
-	"github.com/oneagent/agent/internal/version"
+	"github.com/agent-i/agent/internal/collector"
+	"github.com/agent-i/agent/internal/config"
+	"github.com/agent-i/agent/internal/version"
 )
 
 // This file exists because SigNoz (and any other OTLP-native backend)
@@ -272,7 +272,7 @@ func boolCount(b bool) int {
 func (o *otlpHTTPExporter) hostName() string {
 	name := o.agentIDLabel
 	if name == "" {
-		name = "oneagent-agent"
+		name = "agent-i"
 	}
 	return name
 }
@@ -287,7 +287,7 @@ func (o *otlpHTTPExporter) hostName() string {
 // caught from a live host: production spans from an app called
 // certi-backend were showing up in SigNoz labeled service.name=host-001,
 // the agent's own ID, instead of the app that actually produced them).
-// Envelopes OneAgent generates itself (host metrics, tailed logs) carry
+// Envelopes Agent-I generates itself (host metrics, tailed logs) carry
 // no such label, so those correctly fall back to the agent's identity.
 func (o *otlpHTTPExporter) serviceNameFor(e collector.Envelope) string {
 	if v, ok := e.Labels["service.name"]; ok && v != "" {
@@ -318,7 +318,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 		// thing doing the collecting, which is exactly what this is, and
 		// so stays correct on every resource regardless of whose signal
 		// it carries.
-		stringAttr("telemetry.distro.name", "oneagent"),
+		stringAttr("telemetry.distro.name", "agent-i"),
 		stringAttr("telemetry.distro.version", version.Version),
 	}
 	// host.id is recommended (not required) by SigNoz's Infrastructure
@@ -446,7 +446,7 @@ func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 
 	req := otlpMetricsRequest{ResourceMetrics: []otlpResourceMetrics{{
 		Resource:     o.resourceFor(o.hostName()),
-		ScopeMetrics: []otlpScopeMetrics{{Scope: otlpScope{Name: "oneagent-agent"}, Metrics: points}},
+		ScopeMetrics: []otlpScopeMetrics{{Scope: otlpScope{Name: "agent-i"}, Metrics: points}},
 	}}}
 	return o.postJSON("/v1/metrics", req, len(envs))
 }
@@ -485,7 +485,7 @@ func (o *otlpHTTPExporter) sendTraces(envs []collector.Envelope) error {
 		}
 		resourceSpansList = append(resourceSpansList, otlpResourceSpans{
 			Resource:   o.resourceFor(sn),
-			ScopeSpans: []otlpScopeSpans{{Scope: otlpScope{Name: "oneagent-agent"}, Spans: spans}},
+			ScopeSpans: []otlpScopeSpans{{Scope: otlpScope{Name: "agent-i"}, Spans: spans}},
 		})
 	}
 
@@ -512,7 +512,7 @@ func (o *otlpHTTPExporter) sendLogs(envs []collector.Envelope) error {
 	}
 	req := otlpLogsRequest{ResourceLogs: []otlpResourceLogs{{
 		Resource:  o.resourceFor(o.hostName()),
-		ScopeLogs: []otlpScopeLogs{{Scope: otlpScope{Name: "oneagent-agent"}, LogRecords: records}},
+		ScopeLogs: []otlpScopeLogs{{Scope: otlpScope{Name: "agent-i"}, LogRecords: records}},
 	}}}
 	return o.postJSON("/v1/logs", req, len(envs))
 }
