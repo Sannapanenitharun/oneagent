@@ -1,12 +1,53 @@
 package collector
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// logCapture redirects the standard logger for the duration of a test. The
+// tailer reports a misconfigured path through the agent's ordinary log output —
+// that IS the user-facing behaviour under test, so asserting on it is the point
+// rather than a shortcut.
+//
+// It owns the buffer and guards both ends: the tail manager writes from its own
+// goroutine while the test reads, so an unguarded bytes.Buffer would race.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *logCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+func captureLog(t *testing.T) *logCapture {
+	t.Helper()
+	c := &logCapture{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(c)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	return c
+}
 
 // These tests cover the four failure modes the old per-file goroutine tailer
 // had, each of which was silent in production: rotation, files appearing after
@@ -267,4 +308,61 @@ func TestTail_TruncatesOverlongLine(t *testing.T) {
 	// The remainder of the over-long line must be discarded, not delivered as
 	// a bogus second line.
 	expectTailLine(t, lines, "next-line")
+}
+
+// A glob matching nothing used to be completely silent, which made a
+// misconfigured logs.paths look identical to a log file that simply had no new
+// lines. The default config ships /var/log/app/*.log — a path most hosts do not
+// have — so this is the first thing a fresh install gets wrong, and it has to
+// say so.
+func TestTail_WarnsOnceWhenGlobMatchesNothing(t *testing.T) {
+	logs := captureLog(t)
+
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "nope", "*.log")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, m := startTestTail(t, ctx, []string{missing}, filepath.Join(dir, "off.json"))
+	defer m.Stop()
+
+	// Long enough for several scans at the 150ms test interval.
+	time.Sleep(500 * time.Millisecond)
+
+	got := logs.String()
+	if !strings.Contains(got, "matches no files") {
+		t.Fatalf("expected a warning that the glob matched nothing, got:\n%s", got)
+	}
+	// Repeating every scan would bury the agent's other output — the point is
+	// to state a standing misconfiguration once, not to nag.
+	if n := strings.Count(got, "matches no files"); n != 1 {
+		t.Errorf("warning repeated %d times, want exactly 1:\n%s", n, got)
+	}
+}
+
+// The confirmation half: after the path is fixed, the agent must say it is now
+// matching, or the operator has no way to tell the fix worked short of waiting
+// for a log line that may never come on a quiet file.
+func TestTail_ReportsWhenAnEmptyGlobStartsMatching(t *testing.T) {
+	logs := captureLog(t)
+
+	dir := t.TempDir()
+	glob := filepath.Join(dir, "*.log")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lines, m := startTestTail(t, ctx, []string{glob}, filepath.Join(dir, "off.json"))
+	defer m.Stop()
+
+	time.Sleep(300 * time.Millisecond)
+	if !strings.Contains(logs.String(), "matches no files") {
+		t.Fatalf("expected the empty-glob warning first, got:\n%s", logs.String())
+	}
+
+	tailWrite(t, filepath.Join(dir, "app.log"), "hello\n")
+	expectTailLine(t, lines, "hello")
+
+	if !strings.Contains(logs.String(), "now matches 1 file(s)") {
+		t.Errorf("expected confirmation that the glob started matching, got:\n%s", logs.String())
+	}
 }

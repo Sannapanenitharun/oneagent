@@ -68,6 +68,11 @@ type tailManager struct {
 	// globsCh delivers a replacement glob set on config reload. Buffered so
 	// the sender never blocks; see UpdateGlobs.
 	globsCh chan []string
+	// emptyGlobs remembers which globs matched nothing, so the warning is
+	// stated once rather than repeated every scan for the life of the process.
+	// Cleared for a glob as soon as it matches, so a file that appears later
+	// warns again if it disappears.
+	emptyGlobs map[string]bool
 }
 
 func newTailManager(opts tailOptions) *tailManager {
@@ -81,11 +86,12 @@ func newTailManager(opts tailOptions) *tailManager {
 		opts.maxLineBytes = 256 * 1024
 	}
 	return &tailManager{
-		opts:    opts,
-		tailers: map[string]*fileTailer{},
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
-		globsCh: make(chan []string, 1),
+		opts:       opts,
+		tailers:    map[string]*fileTailer{},
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+		globsCh:    make(chan []string, 1),
+		emptyGlobs: map[string]bool{},
 	}
 }
 
@@ -161,6 +167,11 @@ func (m *tailManager) run(ctx context.Context) {
 			// first=false: they are read from the beginning rather than from
 			// EOF, which is what someone adding a path expects.
 			m.opts.globs = globs
+			// Forget which globs were empty, so a reload re-reports the state
+			// of the new set. Someone who just edited logs.paths to fix exactly
+			// this needs to see whether the new path matched, not silence left
+			// over from the old one.
+			m.emptyGlobs = map[string]bool{}
 			log.Printf("tail: watching %d glob(s) after config reload", len(globs))
 			m.scan(ctx, false)
 		case <-flushTicker.C:
@@ -190,6 +201,25 @@ func (m *tailManager) scan(ctx context.Context, first bool) {
 		if err != nil {
 			log.Printf("tail: bad glob %q: %v", g, err)
 			continue
+		}
+		if len(found) == 0 {
+			// Say so. A glob matching nothing used to be silent, which made a
+			// misconfigured path indistinguishable from a quiet log file — the
+			// agent looked healthy, logs.enabled was true, and no line ever
+			// arrived with nothing anywhere explaining why. The default config
+			// ships /var/log/app/*.log, a path most hosts do not have, so this
+			// is the first thing a new install gets wrong.
+			if !m.emptyGlobs[g] {
+				log.Printf("tail: WARNING %q matches no files — nothing is being collected from it", g)
+				m.emptyGlobs[g] = true
+			}
+			continue
+		}
+		// Matching again after being empty is worth stating too: it is the
+		// confirmation that a config fix took effect.
+		if m.emptyGlobs[g] {
+			log.Printf("tail: %q now matches %d file(s)", g, len(found))
+			delete(m.emptyGlobs, g)
 		}
 		for _, p := range found {
 			matched[p] = true
