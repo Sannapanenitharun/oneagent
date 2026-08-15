@@ -8,6 +8,7 @@ import {
   Cpu, MemoryStick, Gauge, Clock, Search, Bell, ChevronRight,
   LayoutDashboard, ScrollText, Waypoints, HardDrive,
   Network, PlugZap, Pause, Play, Sun, Moon, Monitor,
+  ChevronUp, ChevronDown, X, Braces,
 } from "lucide-react";
 
 import { useSnapshot } from "./api";
@@ -15,7 +16,7 @@ import { useTheme } from "./useTheme";
 import {
   deriveServices, deriveTraces, deriveEdges, layoutTopology,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
-  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL,
+  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -504,16 +505,149 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
   );
 }
 
+// Log detail. Three tabs, and deliberately not the two more a hosted backend
+// offers: there is no "metrics at this instant" correlation here because
+// nothing links a log line to a metric series, and inventing that link would
+// be worse than not offering it.
+function LogDetail({ log, logs, index, onClose, onMove }) {
+  const [tab, setTab] = useState("overview");
+
+  // Arrow keys move between lines, which is how you actually read a log —
+  // scanning down from the one that caught your eye.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") return onClose();
+      if (e.key === "ArrowDown" || e.key === "j") { e.preventDefault(); onMove(1); }
+      if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); onMove(-1); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, onMove]);
+
+  const fields = log.structured ? flattenFields(log.structured.value) : [];
+  // Neighbours from the same file, which is what makes a line make sense —
+  // logs are read in sequence, not in isolation.
+  const context = logs
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => l.src === log.src)
+    .filter(({ i }) => Math.abs(i - index) <= 6);
+
+  const tabs = [
+    { id: "overview", label: log.structured ? `Fields ${fields.length}` : "Overview" },
+    { id: "raw", label: "Raw" },
+    { id: "context", label: `Context ${context.length}` },
+  ];
+
+  return (
+    <div className="border border-[var(--n4)] rounded-lg bg-[var(--surface)] flex flex-col max-h-[560px]">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-[var(--n4)]">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-[11px] tracking-widest uppercase text-[var(--ink-3)] font-mono">Log detail</span>
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded" style={{ color: lvlColor[log.lvl], border: `1px solid ${lvlColor[log.lvl]}` }}>{log.lvl}</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <button onClick={() => onMove(-1)} title="Previous (↑)"
+            className="px-1.5 py-1 rounded text-[var(--ink-3)] hover:text-[var(--ink)] hover:bg-[var(--n2)]"><ChevronUp size={13} /></button>
+          <button onClick={() => onMove(1)} title="Next (↓)"
+            className="px-1.5 py-1 rounded text-[var(--ink-3)] hover:text-[var(--ink)] hover:bg-[var(--n2)]"><ChevronDown size={13} /></button>
+          <button onClick={onClose} title="Close (Esc)"
+            className="px-1.5 py-1 rounded text-[var(--ink-3)] hover:text-[var(--ink)] hover:bg-[var(--n2)]"><X size={13} /></button>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1 px-3 border-b border-[var(--n4)]">
+        {tabs.map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className="px-3 py-1.5 text-[11px] font-mono -mb-px border-b-2"
+            style={{ color: tab === t.id ? "var(--ink)" : "var(--ink-3)", borderColor: tab === t.id ? "var(--accent)" : "transparent" }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="overflow-y-auto p-4 font-mono text-[11px]">
+        {tab === "overview" && (
+          <div className="flex flex-col gap-3">
+            <FieldRow label="timestamp" value={new Date(log.tms).toISOString()} />
+            <FieldRow label="source" value={log.src} />
+            {log.labels && Object.entries(log.labels).map(([k, v]) => <FieldRow key={k} label={k} value={String(v)} />)}
+            {log.structured?.prefix && <FieldRow label="prefix" value={log.structured.prefix} />}
+
+            {fields.length > 0 ? (
+              <div className="mt-1">
+                <div className="text-[10px] tracking-widest uppercase text-[var(--ink-4)] mb-1.5">body fields</div>
+                <div className="flex flex-col">
+                  {fields.map((f) => <FieldRow key={f.path} label={f.path} value={f.value} dense />)}
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div className="text-[10px] tracking-widest uppercase text-[var(--ink-4)] mb-1.5">body</div>
+                <div className="text-[var(--ink-2)] break-all whitespace-pre-wrap leading-relaxed">{log.msg}</div>
+                <div className="text-[10px] text-[var(--ink-5)] mt-2">
+                  plain text — no JSON object found in this line, so there are no fields to break out
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "raw" && (
+          <pre className="whitespace-pre-wrap break-all text-[var(--ink-2)] leading-relaxed">
+            {log.structured ? JSON.stringify(log.structured.value, null, 2) : log.msg}
+          </pre>
+        )}
+
+        {tab === "context" && (
+          <div className="flex flex-col gap-0.5">
+            {context.map(({ l, i }) => (
+              <div key={i} className="flex gap-2 py-1 px-1.5 rounded"
+                style={{ background: i === index ? "color-mix(in srgb, var(--accent) 12%, transparent)" : "transparent" }}>
+                <span className="text-[var(--ink-5)] flex-shrink-0">{l.t}</span>
+                <span className="text-[var(--ink-2)] break-all">{l.msg}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FieldRow({ label, value, dense = false }) {
+  return (
+    <div className={`flex gap-3 ${dense ? "py-0.5" : ""} items-baseline`}>
+      <span className="text-[var(--ink-4)] flex-shrink-0 w-56 truncate" title={label}>{label}</span>
+      <span className="text-[var(--ink)] break-all min-w-0">{String(value)}</span>
+    </div>
+  );
+}
+
 function LogsView({ logs }) {
   const [filter, setFilter] = useState("ALL");
   const [q, setQ] = useState("");
+  const [selected, setSelected] = useState(null);
 
   const filtered = logs.filter((l) =>
     (filter === "ALL" || l.lvl === filter) &&
     (q === "" || l.msg.toLowerCase().includes(q.toLowerCase()) || l.svc.toLowerCase().includes(q.toLowerCase()))
   );
 
+  // The poll replaces the array every 5s, so an index would silently come to
+  // point at a different line. Identity is the timestamp plus the message —
+  // the agent assigns no log ID — and if that line has aged out, the panel
+  // closes rather than showing a neighbour as though it were your selection.
+  const selectedIdx = selected == null ? -1 : filtered.findIndex((l) => l.tms === selected.tms && l.msg === selected.msg);
+  const current = selectedIdx >= 0 ? filtered[selectedIdx] : null;
+
+  const move = (delta) => {
+    if (selectedIdx < 0) return;
+    const next = filtered[selectedIdx + delta];
+    if (next) setSelected({ tms: next.tms, msg: next.msg });
+  };
+
   return (
+    <div className="flex flex-col gap-3">
     <Panel
       title="Log Explorer"
       right={
@@ -542,17 +676,37 @@ function LogsView({ logs }) {
         severity is classified from the line text — the agent forwards log lines verbatim and does not parse levels
       </div>
       <div className="flex flex-col gap-1 font-mono text-[12px] max-h-[520px] overflow-y-auto">
-        {filtered.map((l, i) => (
-          <div key={i} className="flex gap-3 py-1.5 border-b border-[var(--n1)] last:border-0 items-center">
-            <span className="text-[var(--ink-5)] flex-shrink-0 w-16">{l.t}</span>
-            <span className="w-12 flex-shrink-0 font-semibold" style={{ color: lvlColor[l.lvl] }}>{l.lvl}</span>
-            <span className="text-[var(--accent)] flex-shrink-0 w-32 truncate" title={l.svc}>{l.svc}</span>
-            <span className="text-[var(--ink-2)] truncate flex-1" title={l.msg}>{l.msg}</span>
-          </div>
-        ))}
+        {filtered.map((l, i) => {
+          const isSel = i === selectedIdx;
+          return (
+            <button
+              key={`${l.tms}-${i}`}
+              onClick={() => setSelected(isSel ? null : { tms: l.tms, msg: l.msg })}
+              aria-expanded={isSel}
+              className="flex gap-3 py-1.5 px-1 -mx-1 rounded border-b border-[var(--n1)] last:border-0 items-center text-left hover:bg-[var(--n1)]"
+              style={{ background: isSel ? "color-mix(in srgb, var(--accent) 10%, transparent)" : undefined }}
+            >
+              <span className="text-[var(--ink-5)] flex-shrink-0 w-16">{l.t}</span>
+              <span className="w-12 flex-shrink-0 font-semibold" style={{ color: lvlColor[l.lvl] }}>{l.lvl}</span>
+              <span className="text-[var(--accent)] flex-shrink-0 w-32 truncate" title={l.svc}>{l.svc}</span>
+              <span className="text-[var(--ink-2)] truncate flex-1" title={l.msg}>{l.msg}</span>
+              {/* Only advertised where it leads somewhere: a line with a JSON
+                  body has fields to open, a plain syslog line mostly does not. */}
+              {l.structured && <Braces size={11} className="text-[var(--ink-4)] flex-shrink-0" title="structured body" />}
+            </button>
+          );
+        })}
         {!filtered.length && <EmptyHint>no logs match this filter</EmptyHint>}
       </div>
     </Panel>
+
+    {current && (
+      <LogDetail
+        log={current} logs={filtered} index={selectedIdx}
+        onClose={() => setSelected(null)} onMove={move}
+      />
+    )}
+    </div>
   );
 }
 

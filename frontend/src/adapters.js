@@ -277,6 +277,51 @@ export function layoutTopology(services, edges, width = 460, height = 190) {
 // be changed without touching a single host.
 const LEVEL_RE = /\b(FATAL|CRITICAL|ERROR|ERR|WARN(?:ING)?|INFO|DEBUG|TRACE)\b/i;
 
+// Pulls a JSON object out of a log line, if there is one.
+//
+// Structured loggers write either a bare JSON object per line (MongoDB, most
+// Go and Java loggers) or a plain-text prefix followed by one. Both are worth
+// parsing: a 900-character object rendered as a single string is unreadable,
+// and the fields inside it are the reason the app logged JSON in the first
+// place.
+//
+// Parsed in the browser, not the agent — same rule as severity. The agent
+// forwards lines verbatim and imposes no log format, because deciding that
+// every deployment logs JSON is not a collector's call to make.
+export function parseLogBody(message) {
+  const start = message.indexOf("{");
+  if (start === -1) return null;
+  // Only an object is worth a field tree; a bare array or scalar is not.
+  const candidate = message.slice(start);
+  if (!candidate.endsWith("}")) return null;
+  try {
+    const value = JSON.parse(candidate);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    return { prefix: message.slice(0, start).trim(), value };
+  } catch {
+    // Not JSON, or JSON with trailing text after it. Either way the raw line
+    // is what we have, and guessing at partial structure would invent fields.
+    return null;
+  }
+}
+
+// Flattens a parsed body into dotted paths, the form a field list wants.
+// Depth-limited: a deeply nested object is a sign of an embedded document, and
+// past a few levels a flat list stops being easier to read than the raw JSON,
+// which the Raw tab already shows in full.
+export function flattenFields(value, prefix = "", depth = 0, out = []) {
+  if (depth > 6) return out;
+  for (const [k, v] of Object.entries(value)) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+      flattenFields(v, path, depth + 1, out);
+    } else {
+      out.push({ path, value: Array.isArray(v) ? JSON.stringify(v) : v });
+    }
+  }
+  return out;
+}
+
 export function deriveLogs(snap) {
   return (snap?.logs || [])
     .slice()
@@ -292,11 +337,17 @@ export function deriveLogs(snap) {
       }
       return {
         t: new Date(l.t).toLocaleTimeString([], { hour12: false }),
+        // Kept alongside the display string so the detail view can show a full
+        // timestamp without re-deriving it from a formatted one.
+        tms: l.t,
         lvl,
         // Source is the file the line was tailed from; its basename is the
         // most useful short identifier available.
         svc: (l.source || "").split(/[\\/]/).pop() || "log",
+        src: l.source || "",
+        labels: l.labels || null,
         msg: l.message || "",
+        structured: parseLogBody(l.message || ""),
         // Trace/log correlation needs the app to emit trace_id into its log
         // line AND the agent to parse it. Neither exists yet, so this stays
         // null and the UI hides the jump-to-trace affordance rather than

@@ -14,6 +14,7 @@ import {
   deriveInfra, deriveAllSeries, deriveLogs, deriveTraffic,
   globalStats, toRate, fmtRps,
   alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
+  parseLogBody, flattenFields,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -114,6 +115,52 @@ check("low rate keeps precision", fmtRps(0.004) === "0.004");
 check("mid rate one decimal", fmtRps(4.25) === "4.3");
 check("high rate rounded", fmtRps(842.4) === "842");
 check("zero stays zero", fmtRps(0) === "0");
+
+console.log("log body parsing");
+{
+  // The real shape from a MongoDB log line: whole line is one JSON object with
+  // nested attr/message documents.
+  const mongo = '{"t":{"$date":"2026-08-15T20:07:47.305+00:00"},"s":"I","c":"WTCHKPT","id":22430,' +
+    '"ctx":"Checkpointer","msg":"WiredTiger message","attr":{"message":{"ts_sec":1786824467,' +
+    '"session_name":"WT_SESSION.checkpoint","verbose_level":"DEBUG_1"}}}';
+  const p = parseLogBody(mongo);
+  check("whole-line JSON is parsed", p !== null && p.value.c === "WTCHKPT");
+  check("no prefix when the line is pure JSON", p.prefix === "");
+
+  const fields = flattenFields(p.value);
+  const byPath = Object.fromEntries(fields.map((f) => [f.path, f.value]));
+  check("nested documents flatten to dotted paths", byPath["t.$date"] === "2026-08-15T20:07:47.305+00:00");
+  check("deeply nested values survive", byPath["attr.message.session_name"] === "WT_SESSION.checkpoint");
+  check("scalars keep their type", byPath["id"] === 22430);
+  check("container keys are not emitted as fields", !("attr" in byPath) && !("t" in byPath));
+}
+{
+  // Plain-text prefix then JSON — the other common structured-logger shape.
+  const p = parseLogBody('2026-08-15 12:00:00 INFO {"user":"ubuntu","ok":true}');
+  check("prefix before JSON is separated", p !== null && p.prefix === "2026-08-15 12:00:00 INFO");
+  check("body after a prefix is parsed", p.value.user === "ubuntu");
+}
+{
+  // Everything that must NOT be treated as structured, because guessing at
+  // partial structure would invent fields that were never logged.
+  const syslog = "2026-08-15T21:38:01+00:00 ip-172-31-33-81 CRON[6748]: session closed for user ubuntu";
+  check("plain syslog is not structured", parseLogBody(syslog) === null);
+  check("empty line is safe", parseLogBody("") === null);
+  check("unterminated JSON is rejected", parseLogBody('{"a":1') === null);
+  check("trailing text after JSON is rejected", parseLogBody('{"a":1} and then more') === null);
+  check("a bare array is not a field tree", parseLogBody("[1,2,3]") === null);
+  check("a brace in prose does not parse", parseLogBody("cannot open {file}") === null);
+}
+{
+  // deriveLogs must carry what the detail view needs.
+  const snap = { logs: [{ t: T0, source: "/var/log/mongod.log", message: '{"s":"E","msg":"boom"}', labels: { host: "test-1" } }] };
+  const [l] = deriveLogs(snap);
+  check("full source path retained", l.src === "/var/log/mongod.log");
+  check("basename still shown", l.svc === "mongod.log");
+  check("raw timestamp retained", l.tms === T0);
+  check("labels retained", l.labels.host === "test-1");
+  check("structured body attached", l.structured.value.msg === "boom");
+}
 
 console.log("host metric panels");
 {
