@@ -153,7 +153,16 @@ func TestAccessLogCollector_TailsAndParsesLiveAppendedLines(t *testing.T) {
 	writeLine(t, f, `1.1.1.1 - - [12/Aug/2026:00:00:00 +0000] "GET /before HTTP/1.1" 200 10 "-" "-" 0.001`)
 	f.Close()
 
-	collector := NewAccessLogCollector("test-agent", []string{logPath}, FormatCombined, JSONFieldMap{})
+	reg, err := NewOffsetRegistry(filepath.Join(dir, "registry.json"))
+	if err != nil {
+		t.Fatalf("NewOffsetRegistry: %v", err)
+	}
+	collector := NewAccessLogCollector("test-agent", []string{logPath}, FormatCombined, JSONFieldMap{}, TailingOptions{
+		ScanInterval: time.Second,
+		PollInterval: 100 * time.Millisecond,
+		MaxLineBytes: 64 * 1024,
+		Registry:     reg,
+	})
 	out := make(chan Envelope, 10)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OneAgent — local</title>
+<style>
+  :root {
+    color-scheme: light;
+    --plane:#f4f6f8; --card:#fff; --sunk:#eaeef1;
+    --ink:#12161a; --ink-2:#48515a; --ink-3:#79838d;
+    --rule:#dde2e7; --rule-2:#c5ccd3;
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#8a4fbf;
+    --good:#0ca30c; --warn:#fab219; --crit:#d03b3b;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","Roboto Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+    color-scheme:dark;
+    --plane:#0e1216; --card:#161b21; --sunk:#1d242b;
+    --ink:#eef2f6; --ink-2:#aeb8c2; --ink-3:#7d8792;
+    --rule:#242c34; --rule-2:#333d47;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#9b6ad0;
+  }}
+  :root[data-theme="dark"]{
+    color-scheme:dark;
+    --plane:#0e1216; --card:#161b21; --sunk:#1d242b;
+    --ink:#eef2f6; --ink-2:#aeb8c2; --ink-3:#7d8792;
+    --rule:#242c34; --rule-2:#333d47;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#9b6ad0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--plane);color:var(--ink);font-family:var(--sans);font-size:13.5px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  figure{margin:0}
+  svg{display:block;width:100%;height:auto}
+
+  header.top{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--rule);position:sticky;top:0;z-index:10}
+  .logo{font-family:var(--mono);font-weight:650}
+  .meta{font-family:var(--mono);font-size:11px;color:var(--ink-3);display:flex;gap:14px;flex-wrap:wrap}
+  .meta b{color:var(--ink-2);font-weight:600}
+  .spacer{flex:1}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--good);display:inline-block;margin-right:5px}
+  .dot.stale{background:var(--crit)}
+  button.ghost{background:transparent;border:1px solid var(--rule-2);color:var(--ink-2);border-radius:4px;padding:4px 10px;cursor:pointer;font:inherit;font-size:12px}
+  button.ghost:hover{background:var(--sunk)}
+
+  main{padding:16px;display:flex;flex-direction:column;gap:14px;max-width:1500px;margin:0 auto}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px}
+  .stat{background:var(--card);border:1px solid var(--rule);border-top:3px solid var(--sev,var(--s1));border-radius:5px;padding:10px 13px;display:flex;flex-direction:column;gap:1px}
+  .stat .k{font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3)}
+  .stat .v{font-size:25px;font-weight:650;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.15}
+  .stat .s{font-size:11.5px;color:var(--ink-3);font-variant-numeric:tabular-nums}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
+  .panel{background:var(--card);border:1px solid var(--rule);border-radius:5px;padding:12px 13px 10px;display:flex;flex-direction:column;gap:9px;min-width:0}
+  .panel>header{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .panel h2{margin:0;font-size:13px;font-weight:640}
+  .hint{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+  .legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:11.5px;color:var(--ink-2)}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .sw{width:9px;height:9px;border-radius:2px;flex:none}
+  .legend b{font-family:var(--mono);color:var(--ink);font-weight:620;font-variant-numeric:tabular-nums}
+  .empty{font-size:12px;color:var(--ink-3);padding:14px 0;text-align:center;font-family:var(--mono)}
+  .empty code{background:var(--sunk);padding:1px 5px;border-radius:3px;color:var(--ink-2)}
+
+  .tl{display:flex;flex-direction:column;gap:7px}
+  .tl .r{display:grid;grid-template-columns:1fr auto;gap:2px 10px;align-items:center}
+  .tl .nm{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tl .vv{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nums}
+  .tl .bar{grid-column:1/-1;height:6px;background:var(--sunk);border-radius:3px;overflow:hidden}
+  .tl .bar i{display:block;height:100%;border-radius:3px}
+
+  .logs{font-family:var(--mono);font-size:11.5px;display:flex;flex-direction:column;gap:1px;max-height:280px;overflow-y:auto}
+  .logs .ln{display:grid;grid-template-columns:82px 1fr;gap:10px;padding:2px 0;border-bottom:1px solid var(--rule)}
+  .logs .ts{color:var(--ink-3);font-variant-numeric:tabular-nums}
+  .logs .msg{color:var(--ink-2);white-space:pre-wrap;word-break:break-word}
+  .logs .ln.err .msg{color:var(--crit)}
+  .logs .ln.warn .msg{color:var(--warn)}
+
+  .spans{display:flex;flex-direction:column;gap:9px;max-height:340px;overflow-y:auto}
+  .trace{border:1px solid var(--rule);border-radius:4px;padding:8px 10px;display:flex;flex-direction:column;gap:4px}
+  .trace .th{display:flex;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+  .sp{display:grid;grid-template-columns:minmax(120px,1.4fr) 2fr 62px;gap:9px;align-items:center;font-size:11.5px}
+  .sp .nm{font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-2)}
+  .sp .nm .svc{color:var(--ink-3)}
+  .sp .track{height:14px;background:var(--sunk);border-radius:2px;position:relative}
+  .sp .track i{position:absolute;top:0;height:100%;border-radius:2px}
+  .sp .dur{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums;color:var(--ink-2)}
+  .sp.err .nm{color:var(--crit)}
+
+  table.ser{border-collapse:collapse;width:100%;font-size:12px}
+  table.ser th{text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);padding:6px 8px;border-bottom:1px solid var(--rule-2);position:sticky;top:0;background:var(--card)}
+  table.ser td{padding:5px 8px;border-bottom:1px solid var(--rule);vertical-align:middle}
+  table.ser td.n{font-family:var(--mono);font-size:11.5px}
+  table.ser td.l{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  table.ser td.v{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+  .tw{overflow:auto;max-height:420px;border:1px solid var(--rule);border-radius:4px}
+  .tag{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;padding:1px 5px;border-radius:3px;background:var(--sunk);color:var(--ink-3)}
+  .banner{background:var(--card);border:1px solid var(--warn);border-left:3px solid var(--warn);border-radius:4px;padding:9px 12px;font-size:12.5px;color:var(--ink-2)}
+  :focus-visible{outline:2px solid var(--s1);outline-offset:2px}
+  #tip{position:fixed;pointer-events:none;opacity:0;transform:translate(-50%,-100%);background:var(--ink);color:var(--plane);font-family:var(--mono);font-size:11px;padding:4px 7px;border-radius:3px;white-space:nowrap;z-index:50;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <span class="logo">oneagent</span>
+  <span class="meta">
+    <span id="live"><i class="dot"></i><span id="liveTxt">connecting…</span></span>
+    <span>agent <b id="mAgent">—</b></span>
+    <span>build <b id="mVer">—</b></span>
+    <span>uptime <b id="mUp">—</b></span>
+  </span>
+  <span class="spacer"></span>
+  <span class="meta" id="mCounts"></span>
+  <button class="ghost" id="btnPause">Pause</button>
+</header>
+
+<main>
+  <div id="banner"></div>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="grid">
+    <section class="panel"><header><h2>CPU</h2><span class="hint">system.cpu.time → rate</span></header>
+      <div class="legend" id="cpuLeg"></div><figure><svg id="cpuChart" viewBox="0 0 420 150"></svg></figure>
+      <div class="empty" id="cpuEmpty" hidden>no <code>system.cpu.time</code> yet — needs <code>metrics.enabled: true</code></div>
+    </section>
+
+    <section class="panel"><header><h2>Memory</h2><span class="hint">system.memory.usage</span></header>
+      <div class="legend" id="memLeg"></div><figure><svg id="memChart" viewBox="0 0 420 150"></svg></figure>
+      <div class="empty" id="memEmpty" hidden>no <code>system.memory.usage</code> yet</div>
+    </section>
+
+    <section class="panel"><header><h2>Load average</h2><span class="hint">per core</span></header>
+      <div class="legend" id="loadLeg"></div><figure><svg id="loadChart" viewBox="0 0 420 150"></svg></figure>
+      <div class="empty" id="loadEmpty" hidden>no load average yet</div>
+    </section>
+
+    <section class="panel"><header><h2>Network</h2><span class="hint">system.network.io → bytes/s</span></header>
+      <div class="legend" id="netLeg"></div><figure><svg id="netChart" viewBox="0 0 420 150"></svg></figure>
+      <div class="empty" id="netEmpty" hidden>no <code>system.network.io</code> yet</div>
+    </section>
+
+    <section class="panel"><header><h2>Disk</h2><span class="hint">system.disk.io → bytes/s</span></header>
+      <div class="legend" id="diskLeg"></div><figure><svg id="diskChart" viewBox="0 0 420 150"></svg></figure>
+      <div class="empty" id="diskEmpty" hidden>no <code>system.disk.io</code> yet</div>
+    </section>
+
+    <section class="panel"><header><h2>Filesystem</h2><span class="hint">used % by mountpoint</span></header>
+      <div class="tl" id="fsList"></div>
+      <div class="empty" id="fsEmpty" hidden>no <code>system.filesystem.usage</code> yet</div>
+    </section>
+  </div>
+
+  <section class="panel"><header><h2>Traces</h2><span class="hint" id="spanHint">received spans, newest trace first</span></header>
+    <div class="spans" id="spans"></div>
+    <div class="empty" id="spanEmpty" hidden>no spans received — needs <code>traces.enabled: true</code> and an app sending to the OTLP receiver</div>
+  </section>
+
+  <section class="panel"><header><h2>Logs</h2><span class="hint" id="logHint"></span></header>
+    <div class="logs" id="logs"></div>
+    <div class="empty" id="logEmpty" hidden>no log lines — needs <code>logs.enabled: true</code> and a matching path in <code>logs.paths</code></div>
+  </section>
+
+  <section class="panel"><header><h2>All series</h2><span class="hint" id="serHint"></span></header>
+    <div class="tw"><table class="ser"><thead><tr><th>Metric</th><th>Labels</th><th style="text-align:right">Latest</th><th style="text-align:right">Points</th></tr></thead><tbody id="serBody"></tbody></table></div>
+  </section>
+</main>
+
+<div id="tip"></div>
+
+<script>
+(function(){
+  "use strict";
+  var $=function(id){return document.getElementById(id)};
+  var tip=$("tip"), paused=false, lastOK=0;
+
+  function showTip(e,t){tip.textContent=t;tip.style.opacity="1";tip.style.left=e.clientX+"px";tip.style.top=(e.clientY-8)+"px"}
+  function hideTip(){tip.style.opacity="0"}
+  document.addEventListener("scroll",hideTip,true);
+
+  var PAL=["var(--s1)","var(--s2)","var(--s3)","var(--s4)","var(--warn)","var(--crit)"];
+
+  function svgEl(t,a){var e=document.createElementNS("http://www.w3.org/2000/svg",t);for(var k in a)e.setAttribute(k,a[k]);return e}
+  function clear(e){while(e.firstChild)e.removeChild(e.firstChild)}
+
+  function fmtBytes(v){
+    var a=Math.abs(v);
+    if(a>=1073741824)return (v/1073741824).toFixed(2)+" GiB";
+    if(a>=1048576)return (v/1048576).toFixed(1)+" MiB";
+    if(a>=1024)return (v/1024).toFixed(1)+" KiB";
+    return v.toFixed(0)+" B";
+  }
+  function fmtRate(v){return fmtBytes(v)+"/s"}
+  function fmtPct(v){return v.toFixed(1)+"%"}
+  function fmtNum(v){
+    if(Math.abs(v)>=1000)return v.toFixed(0);
+    if(Math.abs(v)>=1)return v.toFixed(2);
+    return v.toFixed(3);
+  }
+  function fmtDur(ms){
+    var s=Math.floor(ms/1000);
+    var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+    if(d)return d+"d "+h+"h";
+    if(h)return h+"h "+m+"m";
+    if(m)return m+"m "+(s%60)+"s";
+    return s+"s";
+  }
+  function clockOf(t){var d=new Date(t);return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")+":"+String(d.getSeconds()).padStart(2,"0")}
+
+  // A cumulative counter is meaningless plotted raw — it only ever climbs.
+  // Differentiating gives the per-second rate, which is what the counter
+  // was actually measuring. A negative delta means the counter reset
+  // (process restart, interface reset), so that interval is dropped rather
+  // than rendered as a huge negative spike.
+  function toRate(points){
+    var out=[];
+    for(var i=1;i<points.length;i++){
+      var dt=(points[i].t-points[i-1].t)/1000;
+      if(dt<=0)continue;
+      var dv=points[i].v-points[i-1].v;
+      if(dv<0)continue;
+      out.push({t:points[i].t,v:dv/dt});
+    }
+    return out;
+  }
+  function prepare(s){return s.cumulative?toRate(s.points):s.points}
+  function latest(pts){return pts.length?pts[pts.length-1].v:0}
+
+  function pick(snap,name){return snap.series.filter(function(s){return s.name===name})}
+  function sumByLabel(snap,name,label){
+    // Collapses per-device series into one series per label value, aligned
+    // on timestamp — a host with 6 interfaces should read as one throughput
+    // line, not six that each mean nothing on their own.
+    var groups={};
+    pick(snap,name).forEach(function(s){
+      var key=(s.labels&&s.labels[label])||"—";
+      var pts=prepare(s);
+      if(!groups[key])groups[key]={};
+      pts.forEach(function(p){groups[key][p.t]=(groups[key][p.t]||0)+p.v});
+    });
+    return Object.keys(groups).map(function(k){
+      var pts=Object.keys(groups[k]).map(Number).sort(function(a,b){return a-b})
+        .map(function(t){return {t:t,v:groups[k][t]}});
+      return {key:k,points:pts};
+    });
+  }
+
+  function lineChart(svg,series,fmt){
+    clear(svg);
+    var W=420,H=150,pad={l:46,r:6,t:8,b:18};
+    var mx=0,any=false;
+    series.forEach(function(s){s.points.forEach(function(p){if(p.v>mx)mx=p.v;any=true})});
+    if(!any)return false;
+    if(mx<=0)mx=1;
+    var t0=Infinity,t1=-Infinity;
+    series.forEach(function(s){s.points.forEach(function(p){if(p.t<t0)t0=p.t;if(p.t>t1)t1=p.t})});
+    if(t1<=t0)t1=t0+1;
+
+    [0,.5,1].forEach(function(f){
+      var y=pad.t+(1-f)*(H-pad.t-pad.b);
+      svg.appendChild(svgEl("line",{x1:pad.l,y1:y,x2:W-pad.r,y2:y,stroke:f===0?"var(--rule-2)":"var(--rule)","stroke-width":1}));
+      var tx=svgEl("text",{x:2,y:y+3,fill:"var(--ink-3)","font-size":9.5,"font-family":"var(--mono)"});
+      tx.textContent=fmt(mx*f);
+      svg.appendChild(tx);
+    });
+    [0,1].forEach(function(f){
+      var x=pad.l+f*(W-pad.l-pad.r);
+      var tx=svgEl("text",{x:x,y:H-5,fill:"var(--ink-3)","font-size":9.5,"font-family":"var(--mono)","text-anchor":f?"end":"start"});
+      tx.textContent=clockOf(f?t1:t0);
+      svg.appendChild(tx);
+    });
+
+    series.forEach(function(s,i){
+      if(s.points.length<2)return;
+      var d=s.points.map(function(p){
+        var x=pad.l+((p.t-t0)/(t1-t0))*(W-pad.l-pad.r);
+        var y=pad.t+(1-p.v/mx)*(H-pad.t-pad.b);
+        return x.toFixed(1)+","+y.toFixed(1);
+      }).join(" ");
+      svg.appendChild(svgEl("polyline",{points:d,fill:"none",stroke:s.color||PAL[i%PAL.length],"stroke-width":2,"stroke-linejoin":"round","stroke-linecap":"round"}));
+    });
+
+    var hit=svgEl("rect",{x:pad.l,y:pad.t,width:W-pad.l-pad.r,height:H-pad.t-pad.b,fill:"transparent"});
+    hit.addEventListener("mousemove",function(ev){
+      var r=svg.getBoundingClientRect();
+      var frac=(ev.clientX-r.left)/r.width;
+      var tt=t0+frac*(t1-t0);
+      var parts=series.map(function(s){
+        if(!s.points.length)return null;
+        var best=s.points[0];
+        for(var i=1;i<s.points.length;i++)if(Math.abs(s.points[i].t-tt)<Math.abs(best.t-tt))best=s.points[i];
+        return s.name+" "+fmt(best.v);
+      }).filter(Boolean);
+      showTip(ev,clockOf(tt)+" · "+parts.join(" · "));
+    });
+    hit.addEventListener("mouseleave",hideTip);
+    svg.appendChild(hit);
+    return true;
+  }
+
+  function legend(el,series,fmt){
+    clear(el);
+    series.forEach(function(s,i){
+      var sp=document.createElement("span");
+      sp.innerHTML='<i class="sw" style="background:'+(s.color||PAL[i%PAL.length])+'"></i>'+s.name+' <b>'+fmt(latest(s.points))+'</b>';
+      el.appendChild(sp);
+    });
+  }
+  function toggle(chartId,emptyId,ok){
+    $(chartId).parentNode.hidden=!ok;
+    $(emptyId).hidden=ok;
+  }
+
+  function render(snap){
+    $("mAgent").textContent=snap.agent_id||"—";
+    $("mVer").textContent=snap.version||"—";
+    $("mUp").textContent=fmtDur(snap.now-snap.started_at);
+    var cs=Object.keys(snap.counts||{}).sort().map(function(k){
+      return '<span>'+k+' <b>'+snap.counts[k].toLocaleString()+'</b></span>';
+    }).join("");
+    $("mCounts").innerHTML=cs||'<span>no envelopes yet</span>';
+
+    var b=$("banner");
+    b.innerHTML = snap.series_dropped>0
+      ? '<div class="banner">'+snap.series_dropped+' distinct series were refused because the in-memory cap was reached. This view is incomplete — raise <code>dashboard.max_series</code> or narrow what is collected.</div>'
+      : "";
+
+    // ---- CPU: rate of cpu-seconds per second, normalised to % of total
+    var cpu=pick(snap,"system.cpu.time").map(function(s){
+      return {name:(s.labels&&s.labels.state)||"?",points:prepare(s)};
+    });
+    var cpuOK=cpu.length>0;
+    if(cpuOK){
+      var totals={};
+      cpu.forEach(function(s){s.points.forEach(function(p){totals[p.t]=(totals[p.t]||0)+p.v})});
+      cpu.forEach(function(s){
+        s.points=s.points.map(function(p){
+          var tot=totals[p.t]||0;
+          return {t:p.t,v:tot>0?(p.v/tot)*100:0};
+        });
+      });
+      cpu.sort(function(x,y){return latest(y.points)-latest(x.points)});
+      cpuOK=lineChart($("cpuChart"),cpu,fmtPct);
+      legend($("cpuLeg"),cpu,fmtPct);
+    }
+    if(!cpuOK){clear($("cpuLeg"))}
+    toggle("cpuChart","cpuEmpty",cpuOK);
+
+    // ---- Memory (gauge, bytes)
+    var mem=pick(snap,"system.memory.usage").map(function(s){
+      return {name:(s.labels&&s.labels.state)||"?",points:s.points};
+    }).sort(function(x,y){return latest(y.points)-latest(x.points)});
+    var memOK=mem.length>0&&lineChart($("memChart"),mem,fmtBytes);
+    if(memOK)legend($("memLeg"),mem,fmtBytes); else clear($("memLeg"));
+    toggle("memChart","memEmpty",memOK);
+
+    // ---- Load average: three separate metric names, one line each
+    var load=["1m","5m","15m"].map(function(w){
+      var s=pick(snap,"system.cpu.load_average."+w)[0];
+      return s?{name:w,points:s.points}:null;
+    }).filter(Boolean);
+    var loadOK=load.length>0&&lineChart($("loadChart"),load,fmtNum);
+    if(loadOK)legend($("loadLeg"),load,fmtNum); else clear($("loadLeg"));
+    toggle("loadChart","loadEmpty",loadOK);
+
+    // ---- Network / disk: summed across devices, split by direction
+    var net=sumByLabel(snap,"system.network.io","direction").map(function(g){return {name:g.key,points:g.points}});
+    var netOK=net.length>0&&lineChart($("netChart"),net,fmtRate);
+    if(netOK)legend($("netLeg"),net,fmtRate); else clear($("netLeg"));
+    toggle("netChart","netEmpty",netOK);
+
+    var disk=sumByLabel(snap,"system.disk.io","direction").map(function(g){return {name:g.key,points:g.points}});
+    var diskOK=disk.length>0&&lineChart($("diskChart"),disk,fmtRate);
+    if(diskOK)legend($("diskLeg"),disk,fmtRate); else clear($("diskLeg"));
+    toggle("diskChart","diskEmpty",diskOK);
+
+    // ---- Filesystem: used/(used+free) per mountpoint
+    var fsBox=$("fsList");clear(fsBox);
+    var mounts={};
+    pick(snap,"system.filesystem.usage").forEach(function(s){
+      var mp=(s.labels&&s.labels.mountpoint)||"?";
+      var st=(s.labels&&s.labels.state)||"?";
+      if(!mounts[mp])mounts[mp]={};
+      mounts[mp][st]=latest(s.points);
+    });
+    var mkeys=Object.keys(mounts).sort();
+    mkeys.forEach(function(mp){
+      var used=mounts[mp].used||0,free=mounts[mp].free||0,tot=used+free;
+      if(tot<=0)return;
+      var pct=used/tot*100;
+      var col=pct>90?"var(--crit)":pct>70?"var(--warn)":"var(--s1)";
+      var d=document.createElement("div");d.className="r";
+      d.innerHTML='<span class="nm">'+mp+'</span><span class="vv">'+pct.toFixed(1)+'% · '+fmtBytes(used)+' / '+fmtBytes(tot)+'</span>'+
+        '<span class="bar"><i style="width:'+Math.min(100,pct).toFixed(1)+'%;background:'+col+'"></i></span>';
+      fsBox.appendChild(d);
+    });
+    var fsOK=mkeys.length>0;
+    fsBox.hidden=!fsOK;$("fsEmpty").hidden=fsOK;
+
+    // ---- Traces, grouped by trace_id
+    var sbox=$("spans");clear(sbox);
+    var traces={};
+    (snap.spans||[]).forEach(function(sp){
+      var id=sp.trace_id||"(none)";
+      (traces[id]=traces[id]||[]).push(sp);
+    });
+    var tids=Object.keys(traces).sort(function(a,b){
+      return Math.max.apply(null,traces[b].map(function(s){return s.t}))-
+             Math.max.apply(null,traces[a].map(function(s){return s.t}));
+    }).slice(0,12);
+    tids.forEach(function(id){
+      var sps=traces[id].slice().sort(function(a,b){return a.t-b.t});
+      var t0=Math.min.apply(null,sps.map(function(s){return s.t}));
+      var span=Math.max.apply(null,sps.map(function(s){return s.t-t0+s.dur_ms}))||1;
+      var wrap=document.createElement("div");wrap.className="trace";
+      var errs=sps.filter(function(s){return s.status==="2"||s.status==="ERROR"}).length;
+      var head=document.createElement("div");head.className="th";
+      head.innerHTML='<span>'+id.slice(0,24)+(id.length>24?'…':'')+'</span>'+
+        '<span>'+sps.length+' span'+(sps.length===1?'':'s')+(errs?' · <span style="color:var(--crit)">'+errs+' error</span>':'')+' · '+clockOf(t0)+'</span>';
+      wrap.appendChild(head);
+      sps.slice(0,25).forEach(function(s){
+        var isErr=s.status==="2"||s.status==="ERROR";
+        var row=document.createElement("div");row.className="sp"+(isErr?" err":"");
+        var left=((s.t-t0)/span)*100, width=(s.dur_ms/span)*100;
+        row.innerHTML='<span class="nm">'+(s.service?'<span class="svc">'+s.service+'</span> ':'')+(s.name||"—")+'</span>'+
+          '<span class="track"><i style="left:'+left.toFixed(1)+'%;width:'+Math.max(0.8,width).toFixed(1)+'%;background:'+(isErr?"var(--crit)":"var(--s1)")+'"></i></span>'+
+          '<span class="dur">'+s.dur_ms.toFixed(1)+' ms</span>';
+        wrap.appendChild(row);
+      });
+      sbox.appendChild(wrap);
+    });
+    var spOK=tids.length>0;
+    sbox.hidden=!spOK;$("spanEmpty").hidden=spOK;
+    $("spanHint").textContent=spOK?(snap.spans.length+" spans in the last "+Math.round(snap.retain_sec/60)+" min"):"";
+
+    // ---- Logs
+    var lbox=$("logs");clear(lbox);
+    var lines=(snap.logs||[]).slice(-200).reverse();
+    lines.forEach(function(l){
+      var m=(l.message||"");
+      var lvl=/\b(ERROR|FATAL|CRITICAL)\b/i.test(m)?"err":/\b(WARN|WARNING)\b/i.test(m)?"warn":"";
+      var d=document.createElement("div");d.className="ln "+lvl;
+      d.innerHTML='<span class="ts">'+clockOf(l.t)+'</span><span class="msg"></span>';
+      d.querySelector(".msg").textContent=m;
+      lbox.appendChild(d);
+    });
+    var logOK=lines.length>0;
+    lbox.hidden=!logOK;$("logEmpty").hidden=logOK;
+    $("logHint").textContent=logOK?(snap.logs.length+" lines buffered"):"";
+
+    // ---- Series explorer: every series the agent is producing, raw
+    var tb=$("serBody");clear(tb);
+    (snap.series||[]).forEach(function(s){
+      var pts=prepare(s);
+      var tr=document.createElement("tr");
+      var lbl=s.labels?Object.keys(s.labels).sort().map(function(k){return k+"="+s.labels[k]}).join(" "):"";
+      tr.innerHTML='<td class="n">'+s.name+(s.cumulative?' <span class="tag">rate</span>':'')+'</td>'+
+        '<td class="l" title="'+lbl.replace(/"/g,"&quot;")+'">'+(lbl||"—")+'</td>'+
+        '<td class="v">'+fmtNum(latest(pts))+'</td>'+
+        '<td class="v">'+s.points.length+'</td>';
+      tb.appendChild(tr);
+    });
+    $("serHint").textContent=(snap.series||[]).length+" series · "+snap.retain_sec+"s retained";
+
+    // ---- Golden stats
+    var box=$("stats");clear(box);
+    var cpuUsed=100-(function(){
+      var idle=cpu.filter(function(s){return s.name==="idle"})[0];
+      return idle?latest(idle.points):NaN;
+    })();
+    var memUsed=(function(){
+      var tot=0,used=0;
+      mem.forEach(function(s){tot+=latest(s.points);if(s.name==="used")used=latest(s.points)});
+      return tot>0?used/tot*100:NaN;
+    })();
+    var load1=load.length?latest(load[0].points):NaN;
+    var totalEnv=Object.keys(snap.counts||{}).reduce(function(a,k){return a+snap.counts[k]},0);
+    var upSec=Math.max(1,(snap.now-snap.started_at)/1000);
+    [
+      {k:"cpu used",v:isNaN(cpuUsed)?"—":fmtPct(cpuUsed),s:"of all cores",sev:cpuUsed>85?"crit":cpuUsed>65?"warn":"good"},
+      {k:"memory used",v:isNaN(memUsed)?"—":fmtPct(memUsed),s:"of total",sev:memUsed>90?"crit":memUsed>75?"warn":"good"},
+      {k:"load 1m",v:isNaN(load1)?"—":fmtNum(load1),s:"1-minute average",sev:"good"},
+      {k:"envelopes",v:totalEnv.toLocaleString(),s:(totalEnv/upSec).toFixed(1)+"/s since start",sev:"good"}
+    ].forEach(function(c){
+      var d=document.createElement("div");d.className="stat";
+      d.style.setProperty("--sev",{good:"var(--good)",warn:"var(--warn)",crit:"var(--crit)"}[c.sev]||"var(--s1)");
+      d.innerHTML='<span class="k">'+c.k+'</span><span class="v">'+c.v+'</span><span class="s">'+c.s+'</span>';
+      box.appendChild(d);
+    });
+  }
+
+  function poll(){
+    if(paused)return;
+    fetch("/api/snapshot",{cache:"no-store"}).then(function(r){
+      if(!r.ok)throw new Error("HTTP "+r.status);
+      return r.json();
+    }).then(function(snap){
+      lastOK=Date.now();
+      $("live").innerHTML='<i class="dot"></i><span id="liveTxt">live</span>';
+      render(snap);
+    }).catch(function(err){
+      $("live").innerHTML='<i class="dot stale"></i><span id="liveTxt">agent unreachable — '+err.message+'</span>';
+    });
+  }
+
+  $("btnPause").addEventListener("click",function(){
+    paused=!paused;
+    this.textContent=paused?"Resume":"Pause";
+    if(!paused)poll();
+  });
+
+  poll();
+  setInterval(poll,5000);
+})();
+</script>
+</body>
+</html>

@@ -1,4 +1,9 @@
 /dist/
+/bin/
 *.tar.gz
 oneagent-agent
 oneagent-agent-linux-*
+
+# Local development configs (e.g. running the dashboard against a container).
+# The committed default lives at configs/agent.yaml.
+configs/agent.local.yaml

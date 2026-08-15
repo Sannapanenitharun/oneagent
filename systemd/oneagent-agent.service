@@ -8,13 +8,38 @@ Type=simple
 ExecStart=/usr/local/bin/oneagent-agent -config /etc/oneagent-agent/agent.yaml
 Restart=on-failure
 RestartSec=5s
+
+# `systemctl reload oneagent-agent` re-reads agent.yaml in place. Log paths,
+# aggregation and trace sampling/stats take effect immediately; anything else
+# is logged as needing a restart. A config that fails to parse is ignored and
+# the agent keeps running on its current settings.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Secrets are read from the environment, never from agent.yaml (see the
+# SECURITY note on config.CloudConfig). This is the supported place to put
+# them: root-owned, mode 0600, and not part of the config file that gets
+# committed or copied around. The leading '-' means the unit still starts
+# when the file is absent, which is the common case.
+EnvironmentFile=-/etc/oneagent-agent/env
+
+# An unbounded stop turns a routine restart into a multi-minute outage if the
+# backend is unreachable. The agent's own shutdown drain is bounded well
+# inside this, so hitting it means something is genuinely stuck.
+TimeoutStopSec=15
+
 # Hardening: the agent only needs to read /proc, tail configured log paths,
-# and open one listening port — it does not need broad filesystem or
-# network privileges beyond that.
+# persist its read offsets, and open one listening port — it does not need
+# broad filesystem or network privileges beyond that.
 NoNewPrivileges=true
 ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 ReadOnlyPaths=/proc
 ReadWritePaths=/var/log/oneagent-agent
+# The offset registry lives here. Without this the agent cannot record how far
+# it has read, and every restart silently loses whatever was written while it
+# was down.
+ReadWritePaths=/var/lib/oneagent-agent
 User=oneagent-agent
 
 [Install]

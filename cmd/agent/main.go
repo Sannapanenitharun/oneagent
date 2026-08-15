@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -11,11 +12,21 @@ import (
 
 	"github.com/oneagent/agent/internal/config"
 	"github.com/oneagent/agent/internal/daemon"
+	"github.com/oneagent/agent/internal/version"
 )
 
 func main() {
 	configPath := flag.String("config", "/etc/oneagent-agent/agent.yaml", "path to agent config file")
+	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
+
+	// Answered before the config is read, so this still works on a host
+	// whose config is missing or malformed — which is exactly when you
+	// most need to know what is installed.
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -30,7 +41,29 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("oneagent-agent starting (agent_id=%s, interval=%s)", cfg.AgentID, cfg.Interval)
+	// SIGHUP re-reads the config file. Settings that can be applied to a
+	// running agent (log paths, aggregation, trace sampling and stats) take
+	// effect immediately; the daemon logs anything that needs a restart.
+	//
+	// A config that fails to parse is reported and discarded — the agent keeps
+	// running on the configuration it already has. Exiting here would mean a
+	// typo during a routine edit costs you all telemetry from the host, which
+	// is a far worse outcome than running briefly on stale settings.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			newCfg, err := config.Load(*configPath)
+			if err != nil {
+				log.Printf("reload: %v — keeping the current configuration", err)
+				continue
+			}
+			log.Printf("reload: re-read %s", *configPath)
+			d.Reload(newCfg)
+		}
+	}()
+
+	log.Printf("oneagent-agent starting (version=%s, agent_id=%s, interval=%s)", version.Version, cfg.AgentID, cfg.Interval)
 	if err := d.Run(ctx); err != nil {
 		log.Fatalf("daemon error: %v", err)
 	}

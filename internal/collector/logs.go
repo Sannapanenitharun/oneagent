@@ -1,97 +1,58 @@
 package collector
 
 import (
-	"bufio"
 	"context"
-	"os"
-	"path/filepath"
 	"time"
 )
 
-// LogTailCollector follows a set of file globs and emits each new line as
-// an Envelope. Uses simple poll-based tailing (seek to end, read on
-// interval) rather than inotify: less efficient per-file, but has zero
-// platform-specific syscall dependencies and degrades predictably if a
-// file is rotated out from under it — correctness over throughput for v1.
+// LogTailCollector follows a set of file globs and emits each new line as an
+// Envelope. The actual tailing — rotation detection, offset persistence,
+// partial-line handling, picking up files that appear after startup — lives in
+// tail.go and is shared with the access log collector; this type is only the
+// adapter from "a line of text" to our Envelope shape.
 type LogTailCollector struct {
 	agentID string
-	globs   []string
-	stop    chan struct{}
+	mgr     *tailManager
 }
 
-func NewLogTailCollector(agentID string, globs []string) *LogTailCollector {
-	return &LogTailCollector{agentID: agentID, globs: globs, stop: make(chan struct{})}
+func NewLogTailCollector(agentID string, globs []string, opts TailingOptions) *LogTailCollector {
+	c := &LogTailCollector{agentID: agentID}
+	c.mgr = newTailManager(tailOptions{
+		globs:        globs,
+		scanInterval: opts.ScanInterval,
+		pollInterval: opts.PollInterval,
+		maxLineBytes: opts.MaxLineBytes,
+		registry:     opts.Registry,
+	})
+	return c
 }
 
 func (l *LogTailCollector) Name() string { return "log.tail" }
 
 func (l *LogTailCollector) Start(ctx context.Context, out chan<- Envelope) error {
-	paths, err := l.resolvePaths()
-	if err != nil {
-		return err
+	l.mgr.opts.handle = func(path, line string, at time.Time) {
+		// Blocking here is deliberate back-pressure: if the exporter is behind,
+		// slowing the tailer is better than dropping lines. ctx keeps it
+		// interruptible so shutdown is never held up by a stalled backend.
+		select {
+		case out <- Envelope{
+			Kind:      KindLog,
+			AgentID:   l.agentID,
+			Source:    path,
+			Timestamp: at,
+			Message:   line,
+		}:
+		case <-ctx.Done():
+		}
 	}
-	for _, p := range paths {
-		go l.tailFile(ctx, p, out)
-	}
+	l.mgr.Start(ctx)
 	return nil
 }
+
+// SetPaths replaces the watched globs on config reload.
+func (l *LogTailCollector) SetPaths(globs []string) { l.mgr.UpdateGlobs(globs) }
 
 func (l *LogTailCollector) Stop() error {
-	close(l.stop)
+	l.mgr.Stop()
 	return nil
-}
-
-func (l *LogTailCollector) resolvePaths() ([]string, error) {
-	var matched []string
-	for _, g := range l.globs {
-		found, err := filepath.Glob(g)
-		if err != nil {
-			return nil, err
-		}
-		matched = append(matched, found...)
-	}
-	return matched, nil
-}
-
-func (l *LogTailCollector) tailFile(ctx context.Context, path string, out chan<- Envelope) {
-	f, err := os.Open(path)
-	if err != nil {
-		return // missing file at startup is non-fatal — other sources keep running
-	}
-	defer f.Close()
-
-	// Start at end of file: agent reports new activity going forward,
-	// not a full historical replay (would flood the exporter on first run).
-	if _, err := f.Seek(0, 2); err != nil {
-		return
-	}
-
-	reader := bufio.NewReader(f)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-l.stop:
-			return
-		case <-ticker.C:
-			for {
-				line, err := reader.ReadString('\n')
-				if line != "" {
-					out <- Envelope{
-						Kind:      KindLog,
-						AgentID:   l.agentID,
-						Source:    path,
-						Timestamp: time.Now().UTC(),
-						Message:   line,
-					}
-				}
-				if err != nil {
-					break // caught up to EOF; wait for next tick
-				}
-			}
-		}
-	}
 }

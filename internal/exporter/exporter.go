@@ -35,9 +35,21 @@ func New(cfg config.ExporterConfig) (Exporter, error) {
 	case "file":
 		return newFileExporter(cfg.Path)
 	case "http":
-		return newHTTPExporter(cfg)
+		// Network exporters are wrapped so delivery happens off the
+		// collectors' goroutines — see async.go for why that matters. stdout
+		// and file are left synchronous: they are local, fast, and tests rely
+		// on their output being deterministic.
+		h, err := newHTTPExporter(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return newAsyncExporter(h, cfg.QueueSize, cfg.ShutdownTimeout), nil
 	case "otlp_http":
-		return newOTLPHTTPExporter(cfg)
+		o, err := newOTLPHTTPExporter(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return newAsyncExporter(o, cfg.QueueSize, cfg.ShutdownTimeout), nil
 	default:
 		return nil, fmt.Errorf("unknown exporter type %q", cfg.Type)
 	}
@@ -87,7 +99,13 @@ func (fe *fileExporter) Close() error { return fe.f.Close() }
 // fine for a demo, but it's the first thing that falls over under real
 // telemetry volume (thousands of envelopes/minute per host).
 type httpExporter struct {
-	endpoint      string
+	endpoint string
+	// headers are sent on every POST — typically an ingestion key resolved
+	// from the environment by the daemon. These were previously accepted in
+	// config, documented as applying to this exporter, and then never read,
+	// so any endpoint requiring authentication rejected every batch while the
+	// config looked correct.
+	headers       map[string]string
 	client        *http.Client
 	batchSize     int
 	flushInterval time.Duration
@@ -118,6 +136,7 @@ func newHTTPExporter(cfg config.ExporterConfig) (*httpExporter, error) {
 
 	h := &httpExporter{
 		endpoint:      cfg.Endpoint,
+		headers:       cfg.Headers,
 		client:        &http.Client{Timeout: 10 * time.Second},
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
@@ -203,6 +222,9 @@ func (h *httpExporter) postWithRetry(compressed []byte, batchLen int) error {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Content-Encoding", "gzip")
+		for k, v := range h.headers {
+			req.Header.Set(k, v)
+		}
 
 		resp, err := h.client.Do(req)
 		if err != nil {

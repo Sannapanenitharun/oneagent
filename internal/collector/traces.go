@@ -2,11 +2,16 @@ package collector
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log"
+	"net"
 	"net/http"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -112,44 +117,145 @@ func (v otlpAnyValue) toString() string {
 
 type otlpExportTraceResponse struct{} // empty body per spec on full success
 
-// OTLPTraceReceiverCollector runs an OTLP/HTTP+JSON compliant trace
-// endpoint apps can point their OTel SDK exporter at.
+// OTLPTraceReceiverCollector runs an OTLP/HTTP compliant trace endpoint apps
+// can point their OTel SDK exporter at.
+//
+// This is the agent's only inbound network surface, so it is also the only
+// place where an outsider gets to hand us work. Three limits apply:
+//
+//   - the body is capped (maxBytes), because the protobuf path reads the whole
+//     request into memory before it can decode anything;
+//   - concurrent decodes are capped by a semaphore, so we cannot be pushed into
+//     decoding faster than the pipeline drains — the failure mode there is
+//     memory growth, not slowness, which is much harder to diagnose;
+//   - an optional bearer token is required, which matters as soon as the
+//     listener is not on loopback.
 type OTLPTraceReceiverCollector struct {
-	agentID string
-	addr    string
-	server  *http.Server
+	agentID   string
+	addr      string
+	maxBytes  int64
+	authToken string
+	// sem admits a bounded number of concurrent decodes. Requests that cannot
+	// get a slot promptly are refused with 429 rather than queued, because a
+	// queue here is just memory we have not accounted for.
+	sem    chan struct{}
+	server *http.Server
 }
 
-func NewOTLPTraceReceiverCollector(agentID, addr string) *OTLPTraceReceiverCollector {
-	return &OTLPTraceReceiverCollector{agentID: agentID, addr: addr}
+// decodeWaitTimeout is how long a request waits for a decode slot before being
+// told to back off. Short on purpose: an OTel SDK exporter retries.
+const decodeWaitTimeout = 2 * time.Second
+
+func NewOTLPTraceReceiverCollector(agentID, addr string, maxBytes int64, authToken string) *OTLPTraceReceiverCollector {
+	if maxBytes <= 0 {
+		maxBytes = 4 << 20
+	}
+	slots := runtime.GOMAXPROCS(0)
+	if slots < 2 {
+		slots = 2
+	}
+	return &OTLPTraceReceiverCollector{
+		agentID:   agentID,
+		addr:      addr,
+		maxBytes:  maxBytes,
+		authToken: authToken,
+		sem:       make(chan struct{}, slots),
+	}
 }
 
 func (t *OTLPTraceReceiverCollector) Name() string { return "trace.otlp_http" }
 
 func (t *OTLPTraceReceiverCollector) Start(ctx context.Context, out chan<- Envelope) error {
+	if !isLoopbackAddr(t.addr) && t.authToken == "" {
+		log.Printf("trace receiver: WARNING listening on %s with no auth token — "+
+			"anything that can reach this host can inject spans into your backend. "+
+			"Set traces.listen_addr to 127.0.0.1:4319 or configure traces.auth_token_env.", t.addr)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/traces", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		contentType := r.Header.Get("Content-Type")
-		if isProtobufContentType(contentType) {
+		if !t.authorized(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		select {
+		case t.sem <- struct{}{}:
+			defer func() { <-t.sem }()
+		case <-r.Context().Done():
+			return
+		case <-time.After(decodeWaitTimeout):
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "receiver busy", http.StatusTooManyRequests)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, t.maxBytes)
+
+		if isProtobufContentType(r.Header.Get("Content-Type")) {
 			t.handleProtobuf(w, r, out)
 			return
 		}
 		t.handleJSON(w, r, out)
 	})
 
-	t.server = &http.Server{Addr: t.addr, Handler: mux}
+	t.server = &http.Server{
+		Addr:    t.addr,
+		Handler: mux,
+		// Without these a single idle or slow client holds a connection
+		// indefinitely.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		_ = t.server.Close()
 	}()
 	go func() {
-		_ = t.server.ListenAndServe() // ErrServerClosed on shutdown is expected
+		if err := t.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			// Previously swallowed, so a port already in use looked exactly
+			// like an app that simply was not sending traces.
+			log.Printf("trace receiver: listener on %s stopped: %v", t.addr, err)
+		}
 	}()
 	return nil
+}
+
+// authorized checks the bearer token when one is configured. The comparison is
+// constant-time so a caller cannot recover the token by measuring responses.
+func (t *OTLPTraceReceiverCollector) authorized(r *http.Request) bool {
+	if t.authToken == "" {
+		return true
+	}
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, prefix) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(h, prefix)), []byte(t.authToken)) == 1
+}
+
+// isLoopbackAddr reports whether a listen address binds only to loopback. A
+// bare ":4319" or "0.0.0.0:4319" binds every interface.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (t *OTLPTraceReceiverCollector) Stop() error {
@@ -257,8 +363,15 @@ func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *tracepb.Spa
 	if scopeName != "" {
 		labels["scope.name"] = scopeName
 	}
-	if sp.Status != nil && sp.Status.Message != "" {
-		labels["status.message"] = sp.Status.Message
+	if sp.Status != nil {
+		// The code, not just the message, is what identifies a failed span:
+		// 0=UNSET, 1=OK, 2=ERROR per the OTLP spec. Only the message was
+		// recorded before, and it is empty on most error spans, so there was
+		// no reliable way to tell a failure from a success downstream.
+		labels["status.code"] = strconv.Itoa(int(sp.Status.Code))
+		if sp.Status.Message != "" {
+			labels["status.message"] = sp.Status.Message
+		}
 	}
 
 	attrs := make(map[string]any, len(sp.Attributes))
@@ -313,8 +426,12 @@ func spanToEnvelopeJSON(agentID, serviceName, scopeName string, sp otlpSpan) Env
 	if scopeName != "" {
 		labels["scope.name"] = scopeName
 	}
-	if sp.Status != nil && sp.Status.Message != "" {
-		labels["status.message"] = sp.Status.Message
+	if sp.Status != nil {
+		// See the protobuf path above: the code is the reliable error signal.
+		labels["status.code"] = strconv.Itoa(sp.Status.Code)
+		if sp.Status.Message != "" {
+			labels["status.message"] = sp.Status.Message
+		}
 	}
 
 	attrs := make(map[string]any, len(sp.Attributes))

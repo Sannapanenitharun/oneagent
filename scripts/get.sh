@@ -123,6 +123,37 @@ echo "==> preparing log/export directory"
 mkdir -p /var/log/oneagent-agent
 chown oneagent-agent:oneagent-agent /var/log/oneagent-agent
 
+echo "==> preparing state directory"
+# Holds the tailing offset registry, so a restart resumes where it left off
+# instead of silently skipping whatever was logged while the agent was down.
+mkdir -p /var/lib/oneagent-agent
+chown oneagent-agent:oneagent-agent /var/lib/oneagent-agent
+chmod 0750 /var/lib/oneagent-agent
+
+echo "==> preparing secrets file"
+# Config never holds a credential value, only the NAME of the env var holding
+# one — this is where those env vars actually get set. Root-owned and 0600:
+# systemd reads it before dropping to the agent user, so the agent process
+# never needs read access to the file itself.
+if [[ ! -f /etc/oneagent-agent/env ]]; then
+  cat > /etc/oneagent-agent/env <<'ENVEOF'
+# Environment for oneagent-agent. Values here are secrets; the agent.yaml
+# config references them by variable name only.
+#
+# Examples — uncomment and fill in the ones you need:
+# SIGNOZ_INGESTION_KEY=
+# ONEAGENT_TRACE_TOKEN=
+# AWS_ACCESS_KEY_ID=
+# AWS_SECRET_ACCESS_KEY=
+# AWS_SESSION_TOKEN=
+ENVEOF
+  echo "    created /etc/oneagent-agent/env — put ingestion keys and cloud credentials there"
+else
+  echo "    /etc/oneagent-agent/env already exists — leaving it in place"
+fi
+chown root:root /etc/oneagent-agent/env
+chmod 0600 /etc/oneagent-agent/env
+
 echo "==> installing systemd unit"
 install -m 0644 "$EXTRACTED_DIR/oneagent-agent.service" /etc/systemd/system/oneagent-agent.service
 systemctl daemon-reload

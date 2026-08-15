@@ -105,6 +105,7 @@ func (c *CloudWatchCollector) Start(ctx context.Context, out chan<- Envelope) er
 	ticker := time.NewTicker(c.interval)
 	go func() {
 		defer ticker.Stop()
+		plog := &pollLogger{name: c.Name()}
 		for {
 			select {
 			case <-ctx.Done():
@@ -112,16 +113,19 @@ func (c *CloudWatchCollector) Start(ctx context.Context, out chan<- Envelope) er
 			case <-c.stop:
 				return
 			case <-ticker.C:
-				if env, err := c.poll(ctx); err != nil {
-					// Non-fatal by design: one failed poll (throttling,
-					// transient network blip) shouldn't kill the collector
-					// goroutine — log via envelope-less side channel would
-					// need a logger; keep it simple and swallow, matching
-					// how daemon.go already treats export errors as
-					// non-fatal.
-					_ = err
-				} else {
-					out <- env
+				// One failed poll (throttling, a transient blip) must not kill
+				// the collector goroutine, but it must not vanish either —
+				// pollLogger reports it without flooding the journal.
+				env, err := c.poll(ctx)
+				if err != nil {
+					plog.fail(err)
+					continue
+				}
+				plog.ok()
+				select {
+				case out <- env:
+				case <-ctx.Done():
+					return
 				}
 			}
 		}

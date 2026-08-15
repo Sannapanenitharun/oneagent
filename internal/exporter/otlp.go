@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/oneagent/agent/internal/collector"
 	"github.com/oneagent/agent/internal/config"
+	"github.com/oneagent/agent/internal/version"
 )
 
 // This file exists because SigNoz (and any other OTLP-native backend)
@@ -301,6 +303,23 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	attrs := []otlpKeyValue{
 		stringAttr("service.name", serviceName),
 		stringAttr("host.name", o.hostName()),
+		// os.type is what SigNoz's Infrastructure Monitoring > Hosts page
+		// reads to populate its "OS Type" filter. Without it every host
+		// this agent reports lands in an unnamed, unselectable bucket in
+		// that facet. runtime.GOOS already spells the OTel-defined values
+		// ("linux", "darwin", "windows") identically, so no mapping table
+		// is needed for any platform this agent builds for.
+		stringAttr("os.type", runtime.GOOS),
+		// Which build produced this telemetry. Deliberately NOT
+		// service.version: on spans forwarded from an externally
+		// instrumented app, service.name is that app's identity, and
+		// pairing it with the agent's version would claim the app is
+		// running a version it isn't. telemetry.distro.* describes the
+		// thing doing the collecting, which is exactly what this is, and
+		// so stays correct on every resource regardless of whose signal
+		// it carries.
+		stringAttr("telemetry.distro.name", "oneagent"),
+		stringAttr("telemetry.distro.version", version.Version),
 	}
 	// host.id is recommended (not required) by SigNoz's Infrastructure
 	// Monitoring as a fallback identifier when hostnames collide (cloned
@@ -340,50 +359,91 @@ func envelopeAttrs(e collector.Envelope) []otlpKeyValue {
 	return attrs
 }
 
+// cumulativeMetrics are the OTel-defined monotonic cumulative counters
+// (seconds/bytes/count since boot), which must be sent as Sum rather than
+// Gauge. system.disk.pending_operations and system.network.connections are
+// deliberately absent: both are point-in-time gauges — a queue depth and a
+// connection count can go down as well as up — not cumulative counters.
+// IsCumulative reports whether a metric name is a monotonic cumulative
+// counter rather than a point-in-time gauge. Exported because consumers
+// outside this package need the same answer — the local dashboard has to
+// know whether to plot a series raw or differentiate it into a rate, and
+// a second hand-maintained copy of this list would drift the moment a
+// metric is added on one side only.
+func IsCumulative(metricName string) bool { return cumulativeMetrics[metricName] }
+
+var cumulativeMetrics = map[string]bool{
+	"system.cpu.time":            true,
+	"system.network.io":          true,
+	"system.network.packets":     true,
+	"system.network.errors":      true,
+	"system.network.dropped":     true,
+	"system.disk.io":             true,
+	"system.disk.operations":     true,
+	"system.disk.operation_time": true,
+}
+
+// startTimeFor returns the cumulative counter's start time, which OTel requires
+// a Sum to declare. The collector smuggles boot time through an internal label
+// (see infra_hostmetrics.go); absent it, the field is omitted rather than
+// guessed.
+func startTimeFor(e collector.Envelope) string {
+	bootUnix, ok := e.Labels["_boot_time_unix"]
+	if !ok {
+		return ""
+	}
+	secs, err := strconv.ParseInt(bootUnix, 10, 64)
+	if err != nil {
+		return ""
+	}
+	return strconv.FormatInt(secs*1e9, 10)
+}
+
 func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
-	points := make([]otlpMetric, 0, len(envs))
+	// Group data points under one metric entry per name instead of emitting a
+	// separate metric object per envelope. A host sampling ~70 series repeated
+	// each metric name once per point in every payload; OTLP's model is one
+	// metric carrying many points, and consumers are entitled to expect that
+	// shape. Insertion order is preserved so payloads stay diffable.
+	order := make([]string, 0, 16)
+	byName := make(map[string]*otlpMetric, 16)
+
 	for _, e := range envs {
-		switch e.Source {
-		case "system.cpu.time", "system.network.io", "system.network.packets", "system.network.errors", "system.network.dropped",
-			"system.disk.io", "system.disk.operations", "system.disk.operation_time":
-			// All of these are OTel-defined monotonic cumulative counters
-			// (seconds/bytes/count since boot) — same Sum treatment
-			// applies to all. system.disk.pending_operations and
-			// system.network.connections are deliberately NOT in this
-			// list — both are point-in-time gauges (a queue depth and a
-			// connection count can go down as well as up), not
-			// cumulative counters.
-			startNano := ""
-			if bootUnix, ok := e.Labels["_boot_time_unix"]; ok {
-				if secs, err := strconv.ParseInt(bootUnix, 10, 64); err == nil {
-					startNano = strconv.FormatInt(secs*1e9, 10)
-				}
-			}
-			points = append(points, otlpMetric{
-				Name: e.Source,
-				Sum: &otlpSum{
+		cumulative := cumulativeMetrics[e.Source]
+
+		m, ok := byName[e.Source]
+		if !ok {
+			m = &otlpMetric{Name: e.Source}
+			if cumulative {
+				m.Sum = &otlpSum{
 					AggregationTemporality: 2, // CUMULATIVE
 					IsMonotonic:            true,
-					DataPoints: []otlpNumberDataPoint{{
-						StartTimeUnixNano: startNano,
-						TimeUnixNano:      strconv.FormatInt(e.Timestamp.UnixNano(), 10),
-						AsDouble:          e.Value,
-						Attributes:        envelopeAttrs(e),
-					}},
-				},
-			})
-			continue
+				}
+			} else {
+				m.Gauge = &otlpGauge{}
+			}
+			byName[e.Source] = m
+			order = append(order, e.Source)
 		}
 
-		points = append(points, otlpMetric{
-			Name: e.Source,
-			Gauge: &otlpGauge{DataPoints: []otlpNumberDataPoint{{
-				TimeUnixNano: strconv.FormatInt(e.Timestamp.UnixNano(), 10),
-				AsDouble:     e.Value,
-				Attributes:   envelopeAttrs(e),
-			}}},
-		})
+		dp := otlpNumberDataPoint{
+			TimeUnixNano: strconv.FormatInt(e.Timestamp.UnixNano(), 10),
+			AsDouble:     e.Value,
+			Attributes:   envelopeAttrs(e),
+		}
+		if cumulative {
+			dp.StartTimeUnixNano = startTimeFor(e)
+			m.Sum.DataPoints = append(m.Sum.DataPoints, dp)
+		} else {
+			m.Gauge.DataPoints = append(m.Gauge.DataPoints, dp)
+		}
 	}
+
+	points := make([]otlpMetric, 0, len(order))
+	for _, name := range order {
+		points = append(points, *byName[name])
+	}
+
 	req := otlpMetricsRequest{ResourceMetrics: []otlpResourceMetrics{{
 		Resource:     o.resourceFor(o.hostName()),
 		ScopeMetrics: []otlpScopeMetrics{{Scope: otlpScope{Name: "oneagent-agent"}, Metrics: points}},

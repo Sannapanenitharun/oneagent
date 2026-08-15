@@ -1,3 +1,11 @@
+# Reloading: `systemctl reload oneagent-agent` (or `kill -HUP <pid>`) re-reads
+# this file without restarting. Applied live: logs.paths, access_logs.paths,
+# the whole aggregation block, and traces.sampling / traces.stats. Everything
+# else — agent_id, interval, listen_addr, exporter, which collectors are
+# enabled — needs a restart, and the agent logs exactly which of your changes
+# it could not apply. A file that fails to parse is reported and ignored; the
+# agent keeps running on the configuration it already has.
+
 agent_id: "host-001"
 interval: 15s
 
@@ -22,9 +30,101 @@ access_logs:
   #   duration_ms: "duration_ms"
   #   remote_addr: "remote_addr"
 
+# Shared by logs and access_logs. Both use one offset registry, so these are
+# set once rather than per source.
+tailing:
+  # How often the globs above are re-evaluated. This is what picks up files
+  # created after startup and closes the gap after a log rotation.
+  scan_interval: 30s
+  # How often open files are read.
+  poll_interval: 500ms
+  # Cap on a single line. A file with no newlines (a binary accidentally
+  # matched by a glob) would otherwise buffer without bound; over-long lines
+  # are cut and marked with a ...TRUNCATED... suffix.
+  max_line_bytes: 262144
+  # Per-file read offsets, so a restart resumes where it left off instead of
+  # skipping everything written while the agent was down. Keyed by inode, so
+  # it survives rotation. The directory must be writable by the agent user —
+  # the installers create it and the systemd unit allows it.
+  registry_path: "/var/lib/oneagent-agent/registry.json"
+
+# Summarise access log requests into per-interval metrics instead of shipping
+# one record per HTTP request.
+#
+# Worth understanding before enabling: a server at 200 req/s produces ~17M
+# individual records per day per host. Aggregating answers the same questions
+# (how many, how slow, how many errors) with a few hundred metric points per
+# interval, and the counts are exact rather than whatever survived sampling.
+# What you give up is per-request detail — see keep_raw_events.
+#
+# Disabled by default so that upgrading does not silently change what an
+# existing deployment receives. If you have access_logs enabled and are paying
+# per ingested record, this is the setting to turn on.
+aggregation:
+  enabled: false
+  interval: 60s                  # summary window
+  max_contexts: 2000             # distinct (method, path, status) per window before overflow
+  max_samples_per_context: 2048  # latency samples retained for percentiles
+  keep_raw_events: false         # also forward the per-request records (removes the volume benefit)
+
+# A local web view of what this agent is collecting right now, served from
+# memory on loopback. Nothing is sent anywhere and no backend is involved —
+# it answers "is the agent actually collecting?" on the host, without
+# waiting for data to surface in SigNoz.
+#
+# Open http://127.0.0.1:8088 on the host (or forward it:
+# `ssh -N -L 8088:127.0.0.1:8088 user@host` and open it locally).
+#
+# Not enabled by config default — an existing deployment that upgrades
+# should not silently start listening on a new port. It is on here, so
+# fresh installs get it; add this block to an existing
+# /etc/oneagent-agent/agent.yaml to switch it on there.
+dashboard:
+  enabled: true
+  # Loopback deliberately: this endpoint has no authentication and exposes
+  # this host's metrics, logs and trace contents. Binding it to a reachable
+  # interface publishes all of that; the agent logs a warning if you do.
+  listen_addr: "127.0.0.1:8088"
+  # How much history is kept in memory. A debug window, not storage.
+  retain: 15m
+  # Cap on distinct (metric, label-set) combinations held. Past this, new
+  # series are refused rather than evicting existing ones, and the page says
+  # the view is incomplete instead of quietly showing a subset.
+  max_series: 500
+
 traces:
   enabled: true
-  listen_addr: ":4319"   # OTLP/HTTP+JSON endpoint: POST /v1/traces (JSON encoding only, not binary protobuf — see traces.go)
+  # OTLP/HTTP endpoint: POST /v1/traces, accepting both JSON and binary
+  # protobuf. Loopback by default: apps instrumented by auto-instrument.sh
+  # always send to localhost, and a receiver on 0.0.0.0 lets anything that can
+  # reach this host inject spans into your backend.
+  listen_addr: "127.0.0.1:4319"
+  # Cap on a single request body. The protobuf path must read the whole body
+  # into memory before it can decode it.
+  max_request_bytes: 4194304   # 4 MiB
+  # Optional. Names an env var holding a bearer token clients must present as
+  # "Authorization: Bearer <token>". Set this if you ever move listen_addr off
+  # loopback; put the value in /etc/oneagent-agent/env.
+  # auth_token_env: "ONEAGENT_TRACE_TOKEN"
+
+  # RED metrics (count, errors, latency distribution) computed over 100% of
+  # spans. Computed BEFORE sampling, so these counts stay exact no matter how
+  # few spans you actually forward — that is the whole reason to keep them
+  # separately rather than deriving them from stored traces.
+  stats:
+    enabled: false
+    interval: 60s
+    max_contexts: 2000             # distinct (service, operation, status) per window
+    max_samples_per_context: 2048
+
+  # Reduce how many spans are forwarded. The decision is derived from the
+  # trace ID, so a trace is kept or dropped as a whole — sampling spans
+  # independently would deliver traces with holes in them.
+  sampling:
+    enabled: false
+    rate: 1.0                      # fraction of ordinary traces kept, 0.0-1.0
+    keep_errors: true              # forward error spans regardless of rate
+    slow_threshold_ms: 0           # forward spans at least this slow regardless of rate (0 = off)
 
 cloud:
   aws:
@@ -37,19 +137,27 @@ cloud:
     dimension_value: "i-0123456789abcdef0"
     access_key_id_env: "AWS_ACCESS_KEY_ID"         # name of the env var holding the key — not the key itself
     secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
-  gcp:
-    enabled: false
-    project_id: "my-gcp-project"
-    metric_type: "compute.googleapis.com/instance/cpu/utilization"
-    service_account_key_path: "/etc/oneagent-agent/gcp-sa.json"
-  azure:
-    enabled: false
-    tenant_id: "00000000-0000-0000-0000-000000000000"
-    client_id: "00000000-0000-0000-0000-000000000000"
-    subscription_id: "00000000-0000-0000-0000-000000000000"
-    resource_id: "/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/virtualMachines/vm1"
-    metric_name: "Percentage CPU"
-    client_secret_env: "AZURE_CLIENT_SECRET"        # name of the env var — not the secret itself
+    # session_token_env: "AWS_SESSION_TOKEN"       # optional, for temporary/STS credentials
+
+  # GCP and Azure are disabled in this build — the collectors are still in the
+  # tree but excluded from compilation (see internal/collector/gcpmonitoring.go
+  # and azuremonitor.go). Uncommenting these blocks alone will not enable them;
+  # the build tag and the commented structs in internal/config/config.go and
+  # internal/daemon/daemon.go have to be restored too.
+  #
+  # gcp:
+  #   enabled: false
+  #   project_id: "my-gcp-project"
+  #   metric_type: "compute.googleapis.com/instance/cpu/utilization"
+  #   service_account_key_path: "/etc/oneagent-agent/gcp-sa.json"
+  # azure:
+  #   enabled: false
+  #   tenant_id: "00000000-0000-0000-0000-000000000000"
+  #   client_id: "00000000-0000-0000-0000-000000000000"
+  #   subscription_id: "00000000-0000-0000-0000-000000000000"
+  #   resource_id: "/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/virtualMachines/vm1"
+  #   metric_name: "Percentage CPU"
+  #   client_secret_env: "AZURE_CLIENT_SECRET"
 
 exporter:
   type: "stdout"   # "stdout" | "file" | "http" (our own JSON format) | "otlp_http" (real OTLP — use this for SigNoz or any OTLP-native backend)
@@ -60,3 +168,8 @@ exporter:
   # batch_size: 100          # envelopes per POST before a size-triggered flush
   # flush_interval: 5s       # max time a partial batch waits before flushing
   # max_retries: 3           # retries on 5xx/network error; 4xx responses are never retried
+  #
+  # The http and otlp_http exporters deliver on their own goroutine so a slow
+  # backend cannot stall collection. These bound that buffer:
+  # queue_size: 4096         # envelopes buffered before the oldest are dropped (drops are logged)
+  # shutdown_timeout: 5s     # bound on the final flush attempt at SIGTERM

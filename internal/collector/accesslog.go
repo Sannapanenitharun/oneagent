@@ -1,12 +1,9 @@
 package collector
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -152,88 +149,64 @@ func parseJSONLine(line string, fields JSONFieldMap) (*apiCallEvent, error) {
 	}, nil
 }
 
-// AccessLogCollector tails access log files and emits a KindAPICall
-// envelope per successfully-parsed request. Reuses the same poll-based
-// tailing approach as LogTailCollector (see logs.go) for the same
-// reasons — no platform-specific inotify dependency, predictable
-// behavior on log rotation.
+// AccessLogCollector tails access log files and emits a KindAPICall envelope
+// per successfully-parsed request. Tailing itself — rotation, offsets,
+// partial lines, files appearing after startup — is handled by the shared
+// tailer in tail.go; everything specific to access logs is the parsing above.
 type AccessLogCollector struct {
 	agentID string
-	globs   []string
 	format  AccessLogFormat
 	fields  JSONFieldMap
-	stop    chan struct{}
+	mgr     *tailManager
 }
 
-func NewAccessLogCollector(agentID string, globs []string, format AccessLogFormat, fields JSONFieldMap) *AccessLogCollector {
-	return &AccessLogCollector{
+func NewAccessLogCollector(agentID string, globs []string, format AccessLogFormat, fields JSONFieldMap, opts TailingOptions) *AccessLogCollector {
+	c := &AccessLogCollector{
 		agentID: agentID,
-		globs:   globs,
 		format:  format,
 		fields:  fields.withDefaults(),
-		stop:    make(chan struct{}),
 	}
+	c.mgr = newTailManager(tailOptions{
+		globs:        globs,
+		scanInterval: opts.ScanInterval,
+		pollInterval: opts.PollInterval,
+		maxLineBytes: opts.MaxLineBytes,
+		registry:     opts.Registry,
+	})
+	return c
 }
 
 func (a *AccessLogCollector) Name() string { return "http.access_log" }
 
 func (a *AccessLogCollector) Start(ctx context.Context, out chan<- Envelope) error {
-	var matched []string
-	for _, g := range a.globs {
-		found, err := filepath.Glob(g)
-		if err != nil {
-			return err
+	a.mgr.opts.handle = func(path, line string, at time.Time) {
+		env, ok := a.parse(path, line)
+		if !ok {
+			return
 		}
-		matched = append(matched, found...)
+		select {
+		case out <- env:
+		case <-ctx.Done():
+		}
 	}
-	for _, p := range matched {
-		go a.tailFile(ctx, p, out)
-	}
+	a.mgr.Start(ctx)
 	return nil
 }
+
+// SetPaths replaces the watched globs on config reload.
+func (a *AccessLogCollector) SetPaths(globs []string) { a.mgr.UpdateGlobs(globs) }
 
 func (a *AccessLogCollector) Stop() error {
-	close(a.stop)
+	a.mgr.Stop()
 	return nil
 }
 
-func (a *AccessLogCollector) tailFile(ctx context.Context, path string, out chan<- Envelope) {
-	f, err := os.Open(path)
-	if err != nil {
-		return // missing file at startup is non-fatal, same rationale as LogTailCollector
-	}
-	defer f.Close()
-
-	if _, err := f.Seek(0, 2); err != nil { // start at EOF: report new requests going forward, not a historical replay
-		return
-	}
-
-	reader := bufio.NewReader(f)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.stop:
-			return
-		case <-ticker.C:
-			for {
-				line, err := reader.ReadString('\n')
-				line = strings.TrimRight(line, "\r\n")
-				if line != "" {
-					a.emitParsed(path, line, out)
-				}
-				if err != nil {
-					break
-				}
-			}
-		}
-	}
-}
-
-func (a *AccessLogCollector) emitParsed(path, line string, out chan<- Envelope) {
+// parse turns one access log line into an Envelope. A line that does not parse
+// is dropped: one malformed entry should not stop the tailer. Note that with
+// the shared tailer a "malformed" line is now genuinely malformed — previously
+// this also silently swallowed the two half-lines produced every time a write
+// was caught mid-line.
+func (a *AccessLogCollector) parse(path, line string) (Envelope, bool) {
 	var (
 		event *apiCallEvent
 		err   error
@@ -245,7 +218,7 @@ func (a *AccessLogCollector) emitParsed(path, line string, out chan<- Envelope) 
 		event, err = parseCombinedLine(line)
 	}
 	if err != nil {
-		return // a malformed/unparseable line is dropped, not fatal — one bad line shouldn't stop the tailer or crash the agent
+		return Envelope{}, false
 	}
 
 	labels := map[string]string{
@@ -257,12 +230,12 @@ func (a *AccessLogCollector) emitParsed(path, line string, out chan<- Envelope) 
 		labels["remote_addr"] = event.remoteAddr
 	}
 
-	out <- Envelope{
+	return Envelope{
 		Kind:      KindAPICall,
 		AgentID:   a.agentID,
 		Source:    "http.access_log:" + path,
 		Timestamp: event.timestamp,
 		Labels:    labels,
 		Value:     event.durationMs,
-	}
+	}, true
 }

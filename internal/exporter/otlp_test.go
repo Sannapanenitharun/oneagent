@@ -6,12 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/oneagent/agent/internal/collector"
 	"github.com/oneagent/agent/internal/config"
+	"github.com/oneagent/agent/internal/version"
 )
 
 func decodeGzipJSON(t *testing.T, r *http.Request, v any) {
@@ -30,6 +32,89 @@ func decodeGzipJSON(t *testing.T, r *http.Request, v any) {
 	}
 	if err := json.Unmarshal(body, v); err != nil {
 		t.Fatalf("unmarshaling: %v (body: %s)", err, body)
+	}
+}
+
+// TestOTLPHTTPExporter_GroupsDataPointsUnderOneMetric covers the payload shape
+// for the common case: several series sharing a metric name, differing only by
+// attributes. Each envelope used to become its own metric object, so a single
+// flush repeated "system.cpu.time" once per CPU state; OTLP models this as one
+// metric carrying many data points.
+func TestOTLPHTTPExporter_GroupsDataPointsUnderOneMetric(t *testing.T) {
+	var got otlpMetricsRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		decodeGzipJSON(t, r, &got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exp, err := newOTLPHTTPExporter(config.ExporterConfig{
+		Endpoint:      server.URL,
+		BatchSize:     6,
+		FlushInterval: time.Hour,
+		MaxRetries:    1,
+	})
+	if err != nil {
+		t.Fatalf("newOTLPHTTPExporter: %v", err)
+	}
+	defer exp.Close()
+
+	ts := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	// Four points of one cumulative metric, then two of a gauge.
+	for _, state := range []string{"user", "system", "idle", "iowait"} {
+		if err := exp.Export(collector.Envelope{
+			Kind: collector.KindMetric, AgentID: "host-001",
+			Source: "system.cpu.time", Timestamp: ts, Value: 1,
+			Labels: map[string]string{"state": state, "_boot_time_unix": "1700000000"},
+		}); err != nil {
+			t.Fatalf("Export: %v", err)
+		}
+	}
+	for _, dev := range []string{"sda", "sdb"} {
+		if err := exp.Export(collector.Envelope{
+			Kind: collector.KindMetric, AgentID: "host-001",
+			Source: "system.disk.pending_operations", Timestamp: ts, Value: 2,
+			Labels: map[string]string{"device": dev},
+		}); err != nil {
+			t.Fatalf("Export: %v", err)
+		}
+	}
+
+	metrics := got.ResourceMetrics[0].ScopeMetrics[0].Metrics
+	if len(metrics) != 2 {
+		t.Fatalf("expected 2 metric entries (one per name), got %d: %+v", len(metrics), metrics)
+	}
+
+	byName := map[string]otlpMetric{}
+	for _, m := range metrics {
+		byName[m.Name] = m
+	}
+
+	cpu, ok := byName["system.cpu.time"]
+	if !ok {
+		t.Fatal("system.cpu.time missing")
+	}
+	if cpu.Sum == nil {
+		t.Fatal("system.cpu.time must be a Sum, not a Gauge")
+	}
+	if len(cpu.Sum.DataPoints) != 4 {
+		t.Errorf("system.cpu.time has %d data points, want 4 grouped under one metric", len(cpu.Sum.DataPoints))
+	}
+	for _, dp := range cpu.Sum.DataPoints {
+		if dp.StartTimeUnixNano == "" {
+			t.Error("cumulative data point is missing startTimeUnixNano")
+		}
+	}
+
+	disk, ok := byName["system.disk.pending_operations"]
+	if !ok {
+		t.Fatal("system.disk.pending_operations missing")
+	}
+	if disk.Gauge == nil {
+		t.Fatal("pending_operations is a point-in-time value and must stay a Gauge")
+	}
+	if len(disk.Gauge.DataPoints) != 2 {
+		t.Errorf("pending_operations has %d data points, want 2", len(disk.Gauge.DataPoints))
 	}
 }
 
@@ -81,6 +166,33 @@ func TestOTLPHTTPExporter_MetricsShapeAndEndpoint(t *testing.T) {
 		rm.Resource.Attributes[1].Value.StringValue == nil || *rm.Resource.Attributes[1].Value.StringValue != "host-001" {
 		t.Errorf("resource host.name not set — SigNoz's Infrastructure/Hosts page needs this or it falls back to reverse-DNS: %+v", rm.Resource.Attributes)
 	}
+	// os.type populates SigNoz's "OS Type" facet on the Hosts page; without
+	// it hosts appear under a blank, unselectable filter entry. The distro
+	// pair identifies which build shipped the data, so a host running a
+	// stale binary is visible from the backend rather than only by SSHing
+	// in and asking it.
+	resAttrs := map[string]string{}
+	for _, a := range rm.Resource.Attributes {
+		if a.Value.StringValue != nil {
+			resAttrs[a.Key] = *a.Value.StringValue
+		}
+	}
+	if resAttrs["os.type"] != runtime.GOOS {
+		t.Errorf("resource os.type = %q, want %q — SigNoz's OS Type filter reads this", resAttrs["os.type"], runtime.GOOS)
+	}
+	if resAttrs["telemetry.distro.name"] != "oneagent" {
+		t.Errorf("resource telemetry.distro.name = %q, want oneagent", resAttrs["telemetry.distro.name"])
+	}
+	if resAttrs["telemetry.distro.version"] != version.Version {
+		t.Errorf("resource telemetry.distro.version = %q, want %q", resAttrs["telemetry.distro.version"], version.Version)
+	}
+	// service.version must NOT be set here: on forwarded spans service.name
+	// is the instrumented app's identity, and pairing it with the agent's
+	// version would misreport that app's version.
+	if v, ok := resAttrs["service.version"]; ok {
+		t.Errorf("resource service.version = %q, want it absent — the agent's version must not be attributed to a forwarded app", v)
+	}
+
 	metrics := rm.ScopeMetrics[0].Metrics
 	if len(metrics) != 1 || metrics[0].Name != "host.cpu.used_pct" {
 		t.Fatalf("unexpected metrics: %+v", metrics)

@@ -57,7 +57,7 @@ func TestOTLPTraceReceiver_AcceptsRealBinaryProtobuf(t *testing.T) {
 		t.Fatalf("marshaling test request: %v", err)
 	}
 
-	coll := NewOTLPTraceReceiverCollector("test-agent", "127.0.0.1:14329")
+	coll := NewOTLPTraceReceiverCollector("test-agent", "127.0.0.1:14329", 4<<20, "")
 	out := make(chan Envelope, 5)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -114,7 +114,7 @@ func TestOTLPTraceReceiver_AcceptsRealBinaryProtobuf(t *testing.T) {
 }
 
 func TestOTLPTraceReceiver_RejectsInvalidProtobuf(t *testing.T) {
-	coll := NewOTLPTraceReceiverCollector("test-agent", "127.0.0.1:14330")
+	coll := NewOTLPTraceReceiverCollector("test-agent", "127.0.0.1:14330", 4<<20, "")
 	out := make(chan Envelope, 5)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -143,7 +143,7 @@ func TestOTLPTraceReceiver_RejectsInvalidProtobuf(t *testing.T) {
 func TestOTLPTraceReceiver_JSONStillWorksAlongsideProtobuf(t *testing.T) {
 	// Regression guard: adding protobuf support must not have broken the
 	// existing JSON path on the same endpoint.
-	coll := NewOTLPTraceReceiverCollector("test-agent", "127.0.0.1:14331")
+	coll := NewOTLPTraceReceiverCollector("test-agent", "127.0.0.1:14331", 4<<20, "")
 	out := make(chan Envelope, 5)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

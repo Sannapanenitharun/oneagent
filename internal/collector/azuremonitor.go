@@ -1,3 +1,16 @@
+//go:build ignore
+
+// DISABLED: this agent currently ships AWS/CloudWatch only.
+//
+// The code is kept rather than deleted so it can be brought back without
+// rewriting it. The build tag above excludes it from compilation; delete that
+// line (and uncomment the matching blocks in internal/config/config.go,
+// internal/daemon/daemon.go and configs/agent.yaml) to re-enable.
+//
+// Note that being excluded from the build also means it is excluded from
+// go vet, gofmt and the test suite, so it will drift as the rest of the agent
+// changes. Expect to fix it up before trusting it again.
+
 package collector
 
 import (
