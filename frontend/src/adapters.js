@@ -433,6 +433,188 @@ export function fmtRps(v) {
   return "0";
 }
 
+// ---------------------------------------------------------------------------
+// host metric panels
+// ---------------------------------------------------------------------------
+
+// Merges several series onto one time axis. Recharts wants a row per
+// timestamp with a column per series; the agent speaks one array per series.
+//
+// A series missing at a timestamp gets null rather than 0 or a carried-forward
+// value. Nulls draw as a gap, which is the truth — "we have no sample here" is
+// not the same statement as "the value was zero", and on an error or drop chart
+// those two read as opposite conclusions.
+export function alignSeries(list) {
+  const stamps = new Set();
+  for (const s of list) for (const p of s.points) stamps.add(p.t);
+  const sorted = [...stamps].sort((a, b) => a - b);
+
+  const byKey = list.map((s) => {
+    const m = new Map();
+    for (const p of s.points) m.set(p.t, p.v);
+    return { key: s.key, m };
+  });
+
+  const rows = sorted.map((t) => {
+    const row = { t, time: clock(t) };
+    for (const { key, m } of byKey) row[key] = m.has(t) ? m.get(t) : null;
+    return row;
+  });
+  return { rows, keys: list.map((s) => s.key) };
+}
+
+// Categorical palettes are a fixed set of hues, and a chart must never invent
+// a new one for series N+1 — two generated hues are indistinguishable long
+// before the eye runs out of patience. Past the limit the smallest series are
+// summed into a single "other" entry, ranked by peak rather than by last value
+// so a device that spiked and settled is not mistaken for an idle one.
+export const MAX_SERIES_PER_PANEL = 6;
+
+export function foldSmallest(list, max = MAX_SERIES_PER_PANEL) {
+  if (list.length <= max) return list;
+  const peak = (s) => s.points.reduce((a, p) => Math.max(a, Math.abs(p.v)), 0);
+  const ranked = [...list].sort((a, b) => peak(b) - peak(a));
+  const kept = ranked.slice(0, max - 1);
+  const rest = ranked.slice(max - 1);
+
+  const summed = new Map();
+  for (const s of rest) {
+    for (const p of s.points) summed.set(p.t, (summed.get(p.t) || 0) + p.v);
+  }
+  const points = [...summed.keys()]
+    .sort((a, b) => a - b)
+    .map((t) => ({ t, v: summed.get(t) }));
+
+  return [...kept, { key: `other (${rest.length})`, points }];
+}
+
+// Groups a metric into one series per label combination.
+function group(snap, name, keyFn) {
+  return pick(snap, name)
+    .map((s) => ({ key: keyFn(s.labels || {}), points: prepare(s) }))
+    .filter((s) => s.points.length > 0)
+    .sort((a, b) => a.key.localeCompare(b.key));
+}
+
+// Each state's share of total CPU time. system.cpu.time is a cumulative
+// per-state counter, so the rates across states sum to the number of cores;
+// dividing by that total is what turns it into the percentage a reader
+// expects, independent of how many cores the host has.
+function cpuPercentByState(snap) {
+  const states = group(snap, "system.cpu.time", (l) => l.state || "?");
+  if (!states.length) return [];
+
+  const totals = new Map();
+  for (const s of states) {
+    for (const p of s.points) totals.set(p.t, (totals.get(p.t) || 0) + p.v);
+  }
+  return states.map((s) => ({
+    key: s.key,
+    points: s.points
+      .filter((p) => (totals.get(p.t) || 0) > 0)
+      .map((p) => ({ t: p.t, v: (p.v / totals.get(p.t)) * 100 })),
+  }));
+}
+
+// Used share per mountpoint. Reported as a percentage because the question a
+// disk chart answers is "how close to full", which a byte count cannot answer
+// without also knowing capacity.
+function filesystemPercent(snap) {
+  const byMount = {};
+  for (const s of pick(snap, "system.filesystem.usage")) {
+    const mp = s.labels?.mountpoint || "?";
+    const state = s.labels?.state || "?";
+    byMount[mp] = byMount[mp] || {};
+    byMount[mp][state] = s.points;
+  }
+  return Object.entries(byMount)
+    .map(([mount, states]) => {
+      const used = states.used || [];
+      const free = new Map((states.free || []).map((p) => [p.t, p.v]));
+      return {
+        key: mount,
+        points: used
+          .filter((p) => free.has(p.t) && p.v + free.get(p.t) > 0)
+          .map((p) => ({ t: p.t, v: (p.v / (p.v + free.get(p.t))) * 100 })),
+      };
+    })
+    .filter((s) => s.points.length)
+    .sort((a, b) => a.key.localeCompare(b.key));
+}
+
+const pair = (a, b) => (l) => `${l[a] || "?"}::${l[b] || "?"}`;
+
+// The panel set, in the order a host is actually read: what it is doing (cpu,
+// memory, load), then what it is talking to (network), then what it is storing
+// (disk). Every panel names the metric it needs, so an empty one explains
+// itself instead of rendering a blank box.
+export function hostMetricPanels(snap) {
+  const defs = [
+    { id: "cpu", title: "CPU Usage", unit: "%", domain: [0, 100], needs: "system.cpu.time",
+      series: cpuPercentByState(snap) },
+    { id: "mem", title: "Memory Usage", unit: "bytes", needs: "system.memory.usage",
+      series: group(snap, "system.memory.usage", (l) => l.state || "?") },
+    { id: "load", title: "System Load Average", unit: "", needs: "system.cpu.load_average.*",
+      series: ["1m", "5m", "15m"]
+        .map((w) => ({ key: w, points: prepare(pick(snap, `system.cpu.load_average.${w}`)[0] || { points: [] }) }))
+        .filter((s) => s.points.length) },
+    { id: "net.io", title: "Network usage (bytes/s)", unit: "bytes/s", needs: "system.network.io",
+      series: group(snap, "system.network.io", pair("device", "direction")) },
+    { id: "net.packets", title: "Network usage (packets/s)", unit: "/s", needs: "system.network.packets",
+      series: group(snap, "system.network.packets", pair("device", "direction")) },
+    { id: "net.errors", title: "Network errors", unit: "/s", needs: "system.network.errors",
+      series: group(snap, "system.network.errors", pair("device", "direction")) },
+    { id: "net.drops", title: "Network drops", unit: "/s", needs: "system.network.dropped",
+      series: group(snap, "system.network.dropped", pair("device", "direction")) },
+    { id: "net.conn", title: "Network connections", unit: "", needs: "system.network.connections",
+      series: group(snap, "system.network.connections", pair("protocol", "state")) },
+    { id: "disk.io", title: "Disk I/O (bytes/s)", unit: "bytes/s", needs: "system.disk.io",
+      series: group(snap, "system.disk.io", pair("device", "direction")) },
+    { id: "disk.ops", title: "Disk operations/s", unit: "/s", needs: "system.disk.operations",
+      series: group(snap, "system.disk.operations", pair("device", "direction")) },
+    { id: "disk.queue", title: "Queue size", unit: "", needs: "system.disk.pending_operations",
+      series: group(snap, "system.disk.pending_operations", (l) => l.device || "?") },
+    { id: "disk.time", title: "Disk operation time/s", unit: "s/s", needs: "system.disk.operation_time",
+      series: group(snap, "system.disk.operation_time", pair("device", "direction")) },
+    { id: "fs", title: "Disk usage (%) by mountpoint", unit: "%", domain: [0, 100], needs: "system.filesystem.usage",
+      series: filesystemPercent(snap) },
+  ];
+
+  return defs.map((d) => {
+    const folded = foldSmallest(d.series);
+    // One point cannot be drawn as a line. Reporting the count lets the panel
+    // say "waiting for a second sample" rather than looking broken on a host
+    // whose agent started ten seconds ago.
+    const drawable = folded.filter((s) => s.points.length > 1);
+    return { ...d, ...alignSeries(drawable), series: drawable, points: drawable[0]?.points.length || 0 };
+  });
+}
+
+// Byte counts span nine orders of magnitude on the same chart, so an axis of
+// raw numbers is unreadable. Binary units because that is what the kernel
+// reports and what df agrees with.
+export function fmtBytes(v, perSec = false) {
+  const suffix = perSec ? "/s" : "";
+  const abs = Math.abs(v);
+  if (abs >= 1024 ** 3) return `${(v / 1024 ** 3).toFixed(1)} GiB${suffix}`;
+  if (abs >= 1024 ** 2) return `${(v / 1024 ** 2).toFixed(1)} MiB${suffix}`;
+  if (abs >= 1024) return `${(v / 1024).toFixed(1)} KiB${suffix}`;
+  return `${Math.round(v)} B${suffix}`;
+}
+
+export function fmtMetric(v, unit) {
+  if (v == null || Number.isNaN(v)) return "—";
+  if (unit === "bytes") return fmtBytes(v);
+  if (unit === "bytes/s") return fmtBytes(v, true);
+  if (unit === "%") return `${v.toFixed(1)}%`;
+  if (unit === "s/s") return `${(v * 1000).toFixed(1)} ms/s`;
+  const abs = Math.abs(v);
+  if (abs >= 1000) return Math.round(v).toLocaleString();
+  if (abs >= 10) return v.toFixed(1);
+  if (abs > 0) return v.toFixed(2);
+  return "0";
+}
+
 export function globalStats(snap) {
   const services = deriveServices(snap);
   const totalRps = services.reduce((a, s) => a + s.rps, 0);

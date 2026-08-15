@@ -13,6 +13,7 @@ import {
   deriveServices, deriveTraces, deriveEdges, layoutTopology,
   deriveInfra, deriveAllSeries, deriveLogs, deriveTraffic,
   globalStats, toRate, fmtRps,
+  alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -113,6 +114,65 @@ check("low rate keeps precision", fmtRps(0.004) === "0.004");
 check("mid rate one decimal", fmtRps(4.25) === "4.3");
 check("high rate rounded", fmtRps(842.4) === "842");
 check("zero stays zero", fmtRps(0) === "0");
+
+console.log("host metric panels");
+{
+  // A gap in one series must stay a gap. Filling it with 0 on an errors chart
+  // states "no errors happened", which is a different claim from "we did not
+  // sample here" — and the one a reader would act on.
+  const { rows, keys } = alignSeries([
+    { key: "a", points: [{ t: 1, v: 10 }, { t: 2, v: 20 }] },
+    { key: "b", points: [{ t: 2, v: 5 }] },
+  ]);
+  check("aligned on the union of timestamps", rows.length === 2);
+  check("missing sample is null, not zero", rows[0].b === null);
+  check("present sample kept", rows[1].b === 5);
+  check("keys preserved", keys.join(",") === "a,b");
+}
+{
+  // Ranked by peak, not by last value: a device that spiked and settled is
+  // the interesting one, and last-value ranking would drop it.
+  const many = [
+    { key: "spiky", points: [{ t: 1, v: 900 }, { t: 2, v: 0 }] },
+    ...["a", "b", "c", "d", "e", "f"].map((k, i) => ({ key: k, points: [{ t: 1, v: i }, { t: 2, v: i }] })),
+  ];
+  const folded = foldSmallest(many);
+  check("folded to the palette limit", folded.length === MAX_SERIES_PER_PANEL);
+  check("peak series survives folding", folded.some((s) => s.key === "spiky"));
+  check("remainder becomes one labelled series", folded[folded.length - 1].key.startsWith("other ("));
+  // 7 series in, 5 kept by peak, so "other" is the 2 lowest: peaks 0 and 1.
+  const other = folded[folded.length - 1];
+  check("remainder is summed, not dropped", other.key === "other (2)" && other.points[0].v === 1);
+  check("under the limit is left alone", foldSmallest(many.slice(0, 3)).length === 3);
+}
+{
+  // system.cpu.time is a cumulative per-state counter; its rates sum to the
+  // core count, so the panel must divide by that total to read as a percentage
+  // regardless of how many cores the host has.
+  // Three samples, because a cumulative counter yields its first rate only on
+  // the second one — and a single point is not drawable as a line.
+  // Per 2s interval: idle accrues 3s, user 1s. That is 2 cores' worth of time,
+  // and the panel must still read 75%/25% rather than 150%/50%.
+  const cpuSnap = { series: ["idle", "user"].map((state) => ({
+    name: "system.cpu.time", cumulative: true, labels: { state, cpu: "cpu-total" },
+    points: [0, 1, 2].map((n) => ({ t: n * 2000, v: n * (state === "idle" ? 3 : 1) })),
+  })) };
+  const cpu = hostMetricPanels(cpuSnap).find((p) => p.id === "cpu");
+  check("cpu panel is drawable", cpu.rows.length === 2);
+  check("cpu is normalised to a percentage", Math.round(cpu.rows[0].idle) === 75);
+  check("cpu states sum to 100", Math.round(cpu.rows[0].idle + cpu.rows[0].user) === 100);
+}
+{
+  const panels = hostMetricPanels({ series: [] });
+  check("every panel present on an empty agent", panels.length === 13);
+  check("empty panels name what they need", panels.every((p) => p.needs && p.series.length === 0));
+  check("empty panels are safe to render", panels.every((p) => Array.isArray(p.rows) && Array.isArray(p.keys)));
+}
+check("bytes use binary units", fmtBytes(1536) === "1.5 KiB");
+check("byte rates carry the suffix", fmtBytes(1024 * 1024, true) === "1.0 MiB/s");
+check("percent keeps one decimal", fmtMetric(12.34, "%") === "12.3%");
+check("seconds-per-second read as ms", fmtMetric(0.0125, "s/s") === "12.5 ms/s");
+check("null renders as a dash", fmtMetric(null, "") === "—");
 
 console.log("empty snapshot (agent just started)");
 const EMPTY = { agent_id: "x", version: "v", started_at: T0, now: T0, retain_sec: 900, counts: {}, series: [], logs: [], spans: [] };

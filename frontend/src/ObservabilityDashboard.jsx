@@ -15,7 +15,7 @@ import { useTheme } from "./useTheme";
 import {
   deriveServices, deriveTraces, deriveEdges, layoutTopology,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
-  pick, prepare, sumBy, toChart, fmtRps,
+  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -80,6 +80,86 @@ function ChartTooltip({ active, payload, label, unit }) {
       <div className="text-[var(--ink)]">{payload[0].value}{unit}</div>
     </div>
   );
+}
+
+// A multi-series host metric panel: one line per label combination, a legend
+// naming every one of them, and a tooltip listing all series at the hovered
+// instant rather than only the line under the cursor — on a per-device chart
+// the comparison between devices is the reason to look at it.
+function MultiSeriesTooltip({ active, payload, label, unit }) {
+  if (!active || !payload || !payload.length) return null;
+  const shown = payload.filter((p) => p.value != null).sort((a, b) => b.value - a.value);
+  if (!shown.length) return null;
+  return (
+    <div className="bg-[var(--surface)] border border-[var(--n5)] rounded px-2.5 py-2 text-[11px] font-mono shadow-lg">
+      <div className="text-[var(--ink-3)] mb-1">{label}</div>
+      <div className="flex flex-col gap-0.5">
+        {shown.map((p) => (
+          <div key={p.dataKey} className="flex items-center gap-2 justify-between">
+            <span className="flex items-center gap-1.5 min-w-0">
+              <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: p.color }} />
+              {/* Text stays on ink tokens; the swatch beside it carries the
+                  identity. Colouring the label too makes a legend of values. */}
+              <span className="text-[var(--ink-2)] truncate">{p.dataKey}</span>
+            </span>
+            <span className="text-[var(--ink)] tabular-nums">{fmtMetric(p.value, unit)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MetricPanel({ panel, height = 170 }) {
+  const { title, unit, domain, needs, rows, keys, series, points } = panel;
+
+  let body;
+  if (!series.length) {
+    body = <EmptyHint>needs {needs}</EmptyHint>;
+  } else if (points < 2) {
+    // A cumulative counter yields its first rate only on the second sample.
+    body = <EmptyHint>waiting for a second sample</EmptyHint>;
+  } else {
+    body = (
+      <>
+        <ResponsiveContainer width="100%" height={height}>
+          <LineChart data={rows} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+            <CartesianGrid stroke="var(--n3)" vertical={false} />
+            <XAxis dataKey="time" tick={{ fill: "var(--ink-5)", fontSize: 10 }}
+              axisLine={{ stroke: "var(--n4)" }} tickLine={false} minTickGap={28} />
+            <YAxis
+              width={52} domain={domain || ["auto", "auto"]}
+              tick={{ fill: "var(--ink-5)", fontSize: 10 }}
+              axisLine={false} tickLine={false}
+              tickFormatter={(v) => fmtMetric(v, unit)}
+            />
+            <Tooltip content={<MultiSeriesTooltip unit={unit} />} cursor={{ stroke: "var(--n5)" }} />
+            {keys.map((k, i) => (
+              <Line
+                key={k} type="monotone" dataKey={k}
+                stroke={SERVICE_PALETTE[i % SERVICE_PALETTE.length]}
+                strokeWidth={1.5} dot={false} isAnimationActive={false}
+                // A gap means "no sample", which must not be drawn as a line
+                // through it — on an errors chart that reads as zero errors.
+                connectNulls={false}
+              />
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+        {/* Always present for 2+ series: identity must never be colour alone. */}
+        <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2">
+          {keys.map((k, i) => (
+            <span key={k} className="flex items-center gap-1.5 text-[10px] font-mono text-[var(--ink-3)]">
+              <span className="w-2 h-2 rounded-full flex-shrink-0"
+                style={{ background: SERVICE_PALETTE[i % SERVICE_PALETTE.length] }} />
+              {k}
+            </span>
+          ))}
+        </div>
+      </>
+    );
+  }
+  return <Panel title={title}>{body}</Panel>;
 }
 
 function GaugeBar({ value, warn = 70, bad = 90 }) {
@@ -476,69 +556,21 @@ function LogsView({ logs }) {
   );
 }
 
-function MetricsView({ snap, d }) {
-  const cpu = useMemo(() => {
-    const series = pick(snap, "system.cpu.time").map((s) => ({ state: s.labels?.state, points: prepare(s) }));
-    if (!series.length) return [];
-    const totals = {};
-    series.forEach((s) => s.points.forEach((p) => { totals[p.t] = (totals[p.t] || 0) + p.v; }));
-    const busy = series.filter((s) => s.state !== "idle");
-    const merged = {};
-    busy.forEach((s) => s.points.forEach((p) => { merged[p.t] = (merged[p.t] || 0) + p.v; }));
-    return Object.keys(merged).map(Number).sort((a, b) => a - b).map((t) => ({
-      time: new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      value: totals[t] > 0 ? Math.round((merged[t] / totals[t]) * 1000) / 10 : 0,
-    }));
-  }, [snap]);
-
-  const net = useMemo(() => {
-    const groups = sumBy(snap, "system.network.io", "direction");
-    const rx = groups.find((g) => g.key === "receive");
-    return rx ? toChart(rx.points.map((p) => ({ t: p.t, v: p.v / 1024 }))) : [];
-  }, [snap]);
-
+// The raw series explorer, and only that.
+//
+// This used to carry a CPU chart and a network chart too. Both are now in
+// Infrastructure's host grid, plotted per state and per device instead of
+// summed into one line — strictly more information in one place, so keeping
+// reduced copies here would be the same numbers twice with no way to tell
+// which was authoritative. The per-service table lives on Service Topology
+// for the same reason: there, selecting a row actually does something.
+function MetricsView({ d }) {
   return (
     <div className="flex flex-col gap-4">
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Panel title="CPU busy (%)">
-          {cpu.length > 1 ? (
-            <ResponsiveContainer width="100%" height={200}>
-              <AreaChart data={cpu}>
-                <defs>
-                  <linearGradient id="cpuFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="var(--accent)" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="var(--n3)" vertical={false} />
-                <XAxis dataKey="time" tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={{ stroke: "var(--n4)" }} tickLine={false} />
-                <YAxis hide domain={[0, 100]} />
-                <Tooltip content={<ChartTooltip unit="%" />} />
-                <Area type="monotone" dataKey="value" stroke="var(--accent)" strokeWidth={1.5} fill="url(#cpuFill)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          ) : <EmptyHint>needs system.cpu.time</EmptyHint>}
-        </Panel>
-
-        <Panel title="Network received (KiB/s)">
-          {net.length > 1 ? (
-            <ResponsiveContainer width="100%" height={200}>
-              <LineChart data={net}>
-                <CartesianGrid stroke="var(--n3)" vertical={false} />
-                <XAxis dataKey="time" tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={{ stroke: "var(--n4)" }} tickLine={false} />
-                <YAxis hide />
-                <Tooltip content={<ChartTooltip unit=" KiB/s" />} />
-                <Line type="monotone" dataKey="value" stroke="var(--s3)" strokeWidth={1.5} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          ) : <EmptyHint>needs system.network.io</EmptyHint>}
-        </Panel>
+      <div className="text-[11px] text-[var(--ink-4)] px-0.5">
+        Every series the agent is currently holding, as collected. Host charts are
+        in <span className="text-[var(--ink-3)]">Infrastructure</span>.
       </div>
-
-      {/* The per-service table lives on Service Topology, where selecting a
-          row actually does something. Rendering the identical table here as
-          well meant the same numbers in two places with no way to tell which
-          was authoritative. This view is host metrics and the raw series. */}
 
       <Panel title={`All Series (${d.allSeries.length})`}>
         <div className="overflow-auto max-h-[420px]">
@@ -748,40 +780,66 @@ function TopologyView({ d, selected, setSelected }) {
   );
 }
 
-function InfrastructureView({ d }) {
-  if (!d.infra.length) return <NotWired title="Infrastructure" why="No host metrics received. Set metrics.enabled: true in the agent config." needs="metrics.enabled" />;
+// Host detail: a summary strip, then the metric grid. Ordered the way a host is
+// actually read — what it is doing (cpu, memory, load), what it is talking to
+// (network), what it is storing (disk) — rather than alphabetically, so the
+// panels most likely to explain a problem are the ones you reach first.
+function InfrastructureView({ snap, d }) {
+  const panels = useMemo(() => hostMetricPanels(snap), [snap]);
+
+  if (!d.infra.length) {
+    return <NotWired title="Infrastructure" why="No host metrics received. Set metrics.enabled: true in the agent config." needs="metrics.enabled" />;
+  }
+  const n = d.infra[0];
+  const retainMin = snap?.retain_sec ? Math.round(snap.retain_sec / 60) : null;
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      {d.infra.map((n) => (
-        <Panel key={n.host} title={n.host} right={<StatusDot status={n.status} />}>
-          <div className="text-[11px] text-[var(--ink-3)] font-mono mb-3">{n.role}</div>
-          <div className="flex flex-col gap-2.5">
-            <div className="flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono"><Cpu size={12} /> CPU</span>
-              <GaugeBar value={n.cpu} />
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono"><MemoryStick size={12} /> Memory</span>
-              <GaugeBar value={n.mem} />
-            </div>
-            {n.mounts.map((m) => (
-              <div key={m.mount} className="flex items-center justify-between">
-                <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono truncate"><HardDrive size={12} /> {m.mount}</span>
-                <GaugeBar value={m.pct} />
-              </div>
-            ))}
-            <div className="flex items-center justify-between text-[11px] font-mono pt-1 border-t border-[var(--n3)]">
-              <span className="text-[var(--ink-3)]">load 1m</span><span>{n.load1}</span>
-            </div>
-          </div>
-        </Panel>
-      ))}
-      <Panel title="Note" className="lg:col-span-2">
-        <div className="text-[12px] text-[var(--ink-3)] leading-relaxed">
-          One host, because this dashboard talks to one agent. A fleet view needs a backend that aggregates
-          many agents — the agent's own dashboard is deliberately per-host, and SigNoz is where the fleet view lives.
+    <div className="flex flex-col gap-4">
+      {/* Summary strip: identity and the two numbers that decide whether the
+          grid below is worth reading. */}
+      <div className="bg-[var(--surface)] border border-[var(--n4)] rounded-lg px-4 py-3.5">
+        <div className="flex items-center gap-2 mb-3">
+          <Server size={14} className="text-[var(--ink-3)]" />
+          <span className="font-mono text-sm">{n.host}</span>
         </div>
-      </Panel>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-3">
+          <Fact label="Status">
+            <span className="flex items-center"><StatusDot status={n.status} />
+              <span style={{ color: statusColor[n.status] }}>{n.status}</span></span>
+          </Fact>
+          {/* The agent reads /proc for every metric here and only builds for
+              Linux, so this is a property of the binary, not a guess. */}
+          <Fact label="Operating system">linux</Fact>
+          <Fact label="CPU usage"><GaugeBar value={n.cpu} /></Fact>
+          <Fact label="Memory usage"><GaugeBar value={n.mem} /></Fact>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between text-[10px] font-mono text-[var(--ink-4)] px-0.5">
+        <span>{n.role}</span>
+        {retainMin && <span>last {retainMin} min · live</span>}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {panels.map((p) => <MetricPanel key={p.id} panel={p} />)}
+      </div>
+
+      <div className="text-[11px] text-[var(--ink-4)] leading-relaxed px-0.5">
+        One host, because this dashboard talks to one agent — the agent's view is
+        deliberately per-host. A fleet view needs a backend that aggregates many
+        agents. Panels with more than {MAX_SERIES_PER_PANEL} series fold the smallest
+        into <span className="text-[var(--ink-3)]">other</span>, ranked by peak, rather
+        than inventing colours nobody checked for contrast.
+      </div>
+    </div>
+  );
+}
+
+function Fact({ label, children }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[10px] tracking-widest uppercase font-mono text-[var(--ink-4)]">{label}</span>
+      <span className="font-mono text-[12px]">{children}</span>
     </div>
   );
 }
@@ -958,9 +1016,9 @@ export default function ObservabilityDashboard() {
           )}
           {view === "topology" && <TopologyView d={d} selected={selected} setSelected={setSelected} />}
           {view === "logs" && <LogsView logs={d.logs} />}
-          {view === "metrics" && <MetricsView snap={snapshot} d={d} />}
+          {view === "metrics" && <MetricsView d={d} />}
           {view === "traces" && <TracesView traces={d.traces} />}
-          {view === "infra" && <InfrastructureView d={d} />}
+          {view === "infra" && <InfrastructureView snap={snapshot} d={d} />}
 
           {view === "problems" && (
             <NotWired title="Problems"
