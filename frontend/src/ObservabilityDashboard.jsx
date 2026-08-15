@@ -784,7 +784,40 @@ function TopologyView({ d, selected, setSelected }) {
 // actually read — what it is doing (cpu, memory, load), what it is talking to
 // (network), what it is storing (disk) — rather than alphabetically, so the
 // panels most likely to explain a problem are the ones you reach first.
+// Tabs on a host, not in the sidebar: these are the three signals *for this
+// host*, and the point of putting them here is to pivot from "this host looks
+// bad" to "what was it logging" without losing which host you were on.
+function HostTabs({ tab, setTab, tabs }) {
+  return (
+    <div className="flex items-center gap-1 border-b border-[var(--n4)]">
+      {tabs.map(({ id, label, icon: Icon, count }) => {
+        const active = tab === id;
+        return (
+          <button
+            key={id} onClick={() => setTab(id)}
+            aria-current={active ? "page" : undefined}
+            className="flex items-center gap-1.5 px-3.5 py-2 text-[11px] font-mono -mb-px border-b-2 transition-colors"
+            style={{
+              color: active ? "var(--ink)" : "var(--ink-3)",
+              borderColor: active ? "var(--accent)" : "transparent",
+            }}
+          >
+            <Icon size={12} />
+            {label}
+            {count != null && (
+              <span className="text-[10px] tabular-nums" style={{ color: active ? "var(--ink-3)" : "var(--ink-4)" }}>
+                {count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function InfrastructureView({ snap, d }) {
+  const [tab, setTab] = useState("metrics");
   const panels = useMemo(() => hostMetricPanels(snap), [snap]);
 
   if (!d.infra.length) {
@@ -815,22 +848,42 @@ function InfrastructureView({ snap, d }) {
         </div>
       </div>
 
-      <div className="flex items-center justify-between text-[10px] font-mono text-[var(--ink-4)] px-0.5">
-        <span>{n.role}</span>
-        {retainMin && <span>last {retainMin} min · live</span>}
+      <div className="flex items-end justify-between gap-4">
+        <HostTabs
+          tab={tab} setTab={setTab}
+          tabs={[
+            { id: "metrics", label: "Metrics", icon: Gauge },
+            { id: "logs", label: "Logs", icon: ScrollText, count: d.logs.length },
+            { id: "traces", label: "Traces", icon: Waypoints, count: d.traces.length },
+          ]}
+        />
+        <div className="flex items-center gap-3 text-[10px] font-mono text-[var(--ink-4)] pb-2 flex-shrink-0">
+          <span>{n.role}</span>
+          {retainMin && <span>last {retainMin} min · live</span>}
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {panels.map((p) => <MetricPanel key={p.id} panel={p} />)}
-      </div>
+      {tab === "metrics" && (
+        <>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {panels.map((p) => <MetricPanel key={p.id} panel={p} />)}
+          </div>
+          <div className="text-[11px] text-[var(--ink-4)] leading-relaxed px-0.5">
+            One host, because this dashboard talks to one agent — the agent's view is
+            deliberately per-host. A fleet view needs a backend that aggregates many
+            agents. Panels with more than {MAX_SERIES_PER_PANEL} series fold the smallest
+            into <span className="text-[var(--ink-3)]">other</span>, ranked by peak, rather
+            than inventing colours nobody checked for contrast.
+          </div>
+        </>
+      )}
 
-      <div className="text-[11px] text-[var(--ink-4)] leading-relaxed px-0.5">
-        One host, because this dashboard talks to one agent — the agent's view is
-        deliberately per-host. A fleet view needs a backend that aggregates many
-        agents. Panels with more than {MAX_SERIES_PER_PANEL} series fold the smallest
-        into <span className="text-[var(--ink-3)]">other</span>, ranked by peak, rather
-        than inventing colours nobody checked for contrast.
-      </div>
+      {/* The same components the sidebar renders, not copies. With one agent
+          per dashboard, "this host's logs" and "all logs" are the same set, so
+          these tabs are a pivot rather than a filter — they become a real
+          narrowing only once a backend puts several hosts behind one view. */}
+      {tab === "logs" && <LogsView logs={d.logs} />}
+      {tab === "traces" && <TracesView traces={d.traces} />}
     </div>
   );
 }
