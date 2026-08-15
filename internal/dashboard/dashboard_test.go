@@ -135,6 +135,68 @@ func TestStore_BoundsLogsAndSpans(t *testing.T) {
 	}
 }
 
+// Logs and spans were previously bounded by count alone, so on a host with
+// light traffic the view kept serving an hours-old span while advertising a
+// 15-minute window. Age must bound them too.
+func TestStore_DropsLogsAndSpansOlderThanRetention(t *testing.T) {
+	s := NewStore("host-001", "v1", 30*time.Second, 100)
+	now := time.Now().UTC()
+	s.nowFn = func() time.Time { return now }
+
+	old, fresh := now.Add(-5*time.Minute), now.Add(-5*time.Second)
+	s.Record(collector.Envelope{Kind: collector.KindLog, Source: "app.log", Timestamp: old, Message: "stale"})
+	s.Record(collector.Envelope{Kind: collector.KindLog, Source: "app.log", Timestamp: fresh, Message: "current"})
+	s.Record(collector.Envelope{
+		Kind: collector.KindTrace, Source: "otlp.span", Timestamp: old,
+		Labels: map[string]string{"span_id": "stale"},
+	})
+	s.Record(collector.Envelope{
+		Kind: collector.KindTrace, Source: "otlp.span", Timestamp: fresh,
+		Labels: map[string]string{"span_id": "current"},
+	})
+
+	snap := s.Snapshot()
+	if len(snap.Logs) != 1 || snap.Logs[0].Message != "current" {
+		t.Errorf("aged-out log survived: %+v", snap.Logs)
+	}
+	if len(snap.Spans) != 1 || snap.Spans[0].SpanID != "current" {
+		t.Errorf("aged-out span survived: %+v", snap.Spans)
+	}
+}
+
+// The failure this guards is a collector going silent. Trimming used to happen
+// only when a sample arrived, so no samples meant no trimming and the last
+// points stayed on the chart indefinitely — which reads as "steady" when the
+// truth is "stopped".
+func TestStore_QuietCollectorAgesOutWithoutNewSamples(t *testing.T) {
+	s := NewStore("host-001", "v1", 30*time.Second, 100)
+	now := time.Now().UTC()
+	s.nowFn = func() time.Time { return now }
+
+	s.Record(metric("system.cpu.time", 1, now, map[string]string{"state": "idle"}))
+	if len(s.Snapshot().Series) != 1 {
+		t.Fatal("series should be present while fresh")
+	}
+
+	// Nothing else is ever recorded; only the clock moves.
+	now = now.Add(10 * time.Minute)
+
+	snap := s.Snapshot()
+	if len(snap.Series) != 0 {
+		t.Errorf("stale series still served after going quiet: %+v", snap.Series)
+	}
+	// The slot must be released too, or a host whose containers come and go
+	// exhausts maxSeries with series that no longer exist.
+	if got := len(s.series); got != 0 {
+		t.Errorf("emptied series not released from the map: %d retained", got)
+	}
+	// Counts are lifetime totals, not windowed — they must survive pruning, or
+	// "is this agent collecting anything at all?" becomes unanswerable.
+	if snap.Counts["metric"] != 1 {
+		t.Errorf("lifetime counts should not be pruned, got %d", snap.Counts["metric"])
+	}
+}
+
 func TestStore_SpanFieldsAreMapped(t *testing.T) {
 	s := NewStore("host-001", "v1", time.Hour, 100)
 	s.Record(collector.Envelope{

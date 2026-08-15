@@ -206,18 +206,74 @@ func (s *Store) trim(buf *seriesBuf) {
 	}
 }
 
+// prune enforces the retention window across everything the store holds.
+//
+// Two reasons it exists rather than trimming only on write. First, logs and
+// spans were previously bounded by COUNT alone: on a host with light trace
+// traffic a span sat in the view until maxSpans newer ones displaced it, so a
+// snapshot advertising retain_sec=900 could serve a span from hours ago and
+// the UI would present it as current. Second, per-series trimming only ran
+// when that series received a sample — so a collector going quiet froze its
+// last points in place forever, which reads as "steady" when the truth is
+// "stopped", the single most misleading thing a monitoring view can do.
+//
+// Dropping series that empty also releases their slot against maxSeries.
+// Without that, a host whose containers come and go exhausts the cap with
+// series that no longer exist and starts refusing live ones.
+//
+// Caller must hold s.mu.
+func (s *Store) prune(now time.Time) {
+	cutoff := now.Add(-s.retain).UnixMilli()
+
+	for key, buf := range s.series {
+		s.trim(buf)
+		if len(buf.points) == 0 {
+			delete(s.series, key)
+		}
+	}
+	s.logs = dropBefore(s.logs, cutoff, func(l LogLine) int64 { return l.T })
+	s.spans = dropBefore(s.spans, cutoff, func(sp Span) int64 { return sp.T })
+}
+
+// dropBefore removes entries older than cutoff, filtering rather than seeking
+// the first survivor: these buffers are appended from batches that can carry
+// slightly out-of-order timestamps, and a scan that stops at the first
+// in-window entry would keep every older one behind it.
+func dropBefore[T any](buf []T, cutoff int64, at func(T) int64) []T {
+	keep := buf[:0]
+	for _, v := range buf {
+		if at(v) >= cutoff {
+			keep = append(keep, v)
+		}
+	}
+	// Release the tail so dropped entries are not pinned by the backing array.
+	var zero T
+	for i := len(keep); i < len(buf); i++ {
+		buf[i] = zero
+	}
+	return keep
+}
+
 // Snapshot returns a deep copy of the current view. Copying matters: the
 // caller marshals this to JSON without holding the lock, and sharing the
 // backing arrays would race with the drain loop appending to them.
+//
+// It prunes before copying, so the window is enforced on read. That is what
+// makes the guarantee hold on an agent that has gone quiet: pruning only on
+// write means no writes, no pruning, and a view that keeps serving whatever
+// it last saw. The cost is that Snapshot mutates.
 func (s *Store) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	now := s.nowFn()
+	s.prune(now)
 
 	out := Snapshot{
 		AgentID:       s.agentID,
 		Version:       s.version,
 		StartedAt:     s.startedAt.UnixMilli(),
-		Now:           s.nowFn().UnixMilli(),
+		Now:           now.UnixMilli(),
 		RetainSec:     int(s.retain / time.Second),
 		Counts:        make(map[string]uint64, len(s.counts)),
 		SeriesDropped: s.dropped,
