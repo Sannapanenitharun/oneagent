@@ -64,6 +64,37 @@ Two known limits, both honest rather than hidden:
 - **Logs carry no trace ID**, so there is no log↔trace jump. That needs the
   application to emit `trace_id` into its log line and the agent to parse it.
 
+## Theming
+
+Light and dark, switched from the header. Three states, not two: **System**
+follows the OS and is the default, **Light** and **Dark** pin a choice. The
+selection persists in `localStorage`.
+
+All colour lives in `src/index.css` as tokens. Components reference
+`var(--token)` and never a literal, so nothing has to be re-rendered when the
+theme changes — CSS re-resolves the variables at paint time, including inside
+the Recharts SVG.
+
+The rule that keeps it correct: every token is defined at bare `:root` first
+and only *redefined* under `@media (prefers-color-scheme: dark)` and
+`:root[data-theme="dark"]`. The media query is guarded with
+`:root:not([data-theme="light"])` so an explicit Light choice still wins on a
+dark OS. A colour whose only definition sits inside a media query never applies
+in the un-stamped "system" state, which is how a page ends up rendering one
+theme's text on the other theme's background.
+
+Each theme has its own six-hue categorical palette for service colours. The
+same hex cannot serve both grounds — a colour bright enough to read on
+near-black is too pale on white. Both sets were checked for colour-vision
+separation, chroma, lightness band and contrast against their own surface,
+and are ordered so no two adjacent slots collide (blue and violet are kept
+apart; they are the pair that fails first under deuteranopia). The palette
+that shipped with the original mock had violet and blue at ΔE 1.3 under
+deuteranopia — effectively the same colour — which is why the hues changed.
+
+Status colours (good / warning / critical) are deliberately separate from the
+series palette: a hue that means "critical" must never also mean "series 4".
+
 ## Build for production
 
 ```bash

@@ -7,20 +7,30 @@ import {
   Activity, AlertTriangle, CheckCircle2, XCircle, Server,
   Cpu, MemoryStick, Gauge, Clock, Search, Bell, ChevronRight,
   LayoutDashboard, ScrollText, Waypoints, HardDrive,
-  Network, PlugZap, Pause, Play,
+  Network, PlugZap, Pause, Play, Sun, Moon, Monitor,
 } from "lucide-react";
 
 import { useSnapshot } from "./api";
+import { useTheme } from "./useTheme";
 import {
   deriveServices, deriveTraces, deriveEdges, layoutTopology,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
   pick, prepare, sumBy, toChart, fmtRps,
 } from "./adapters";
 
-const statusColor = { healthy: "#4ADE80", degraded: "#FBBF24", down: "#F87171" };
-const lvlColor = { ERROR: "#F87171", WARN: "#FBBF24", INFO: "#7B8496", DEBUG: "#5A6273", TRACE: "#5A6273" };
+const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
+const lvlColor = { ERROR: "var(--crit)", WARN: "var(--warn)", INFO: "var(--ink-3)", DEBUG: "var(--ink-4)", TRACE: "var(--ink-4)" };
 
-const SERVICE_PALETTE = ["#5EEBD1", "#60A5FA", "#C084FC", "#FB923C", "#F472B6", "#A3E635"];
+// Categorical series slots, in the validated order. Each theme supplies its
+// own six hues (see index.css) — the same hex cannot serve both grounds, since
+// a colour bright enough to read on near-black is too pale on white.
+// Assigned in fixed order and never generated: a seventh service reuses slot 1
+// rather than inventing a hue nobody checked.
+const SERVICE_PALETTE = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)", "var(--s6)"];
+
+// Deterministic per-service colour, the same idea as Jaeger's colorGenerator:
+// hash the name to a fixed slot so a service keeps its colour across the
+// waterfall, flame graph and topology views, and across reloads.
 function serviceColor(name) {
   let hash = 0;
   for (let i = 0; i < (name || "").length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
@@ -38,9 +48,9 @@ function StatusDot({ status }) {
 
 function Panel({ title, right, children, className = "" }) {
   return (
-    <div className={`bg-[#12161F] border border-[#232838] rounded-lg ${className}`}>
-      <div className="flex items-center justify-between px-4 py-3 border-b border-[#232838]">
-        <h3 className="text-[11px] tracking-widest uppercase text-[#7B8496] font-mono">{title}</h3>
+    <div className={`bg-[var(--surface)] border border-[var(--n4)] rounded-lg ${className}`}>
+      <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--n4)]">
+        <h3 className="text-[11px] tracking-widest uppercase text-[var(--ink-3)] font-mono">{title}</h3>
         {right}
       </div>
       <div className="p-4">{children}</div>
@@ -49,15 +59,15 @@ function Panel({ title, right, children, className = "" }) {
 }
 
 function KpiTile({ icon: Icon, label, value, sub, tone = "normal" }) {
-  const toneColor = tone === "bad" ? "#F87171" : tone === "warn" ? "#FBBF24" : "#E6E9F0";
+  const toneColor = tone === "bad" ? "var(--crit)" : tone === "warn" ? "var(--warn)" : "var(--ink)";
   return (
-    <div className="bg-[#12161F] border border-[#232838] rounded-lg px-4 py-3 flex flex-col gap-1">
-      <div className="flex items-center gap-2 text-[#7B8496]">
+    <div className="bg-[var(--surface)] border border-[var(--n4)] rounded-lg px-4 py-3 flex flex-col gap-1">
+      <div className="flex items-center gap-2 text-[var(--ink-3)]">
         <Icon size={13} />
         <span className="text-[10px] tracking-widest uppercase font-mono">{label}</span>
       </div>
       <div className="font-mono text-2xl leading-none" style={{ color: toneColor }}>{value}</div>
-      {sub && <div className="text-[11px] text-[#7B8496]">{sub}</div>}
+      {sub && <div className="text-[11px] text-[var(--ink-3)]">{sub}</div>}
     </div>
   );
 }
@@ -65,18 +75,18 @@ function KpiTile({ icon: Icon, label, value, sub, tone = "normal" }) {
 function ChartTooltip({ active, payload, label, unit }) {
   if (!active || !payload || !payload.length) return null;
   return (
-    <div className="bg-[#181C27] border border-[#2A3040] rounded px-2 py-1.5 text-[11px] font-mono">
-      <div className="text-[#7B8496]">{label}</div>
-      <div className="text-[#E6E9F0]">{payload[0].value}{unit}</div>
+    <div className="bg-[var(--n2)] border border-[var(--n5)] rounded px-2 py-1.5 text-[11px] font-mono">
+      <div className="text-[var(--ink-3)]">{label}</div>
+      <div className="text-[var(--ink)]">{payload[0].value}{unit}</div>
     </div>
   );
 }
 
 function GaugeBar({ value, warn = 70, bad = 90 }) {
-  const color = value >= bad ? "#F87171" : value >= warn ? "#FBBF24" : "#5EEBD1";
+  const color = value >= bad ? "var(--crit)" : value >= warn ? "var(--warn)" : "var(--accent)";
   return (
     <div className="flex items-center gap-2">
-      <div className="w-20 h-1.5 rounded-full bg-[#1B2030] overflow-hidden">
+      <div className="w-20 h-1.5 rounded-full bg-[var(--n3)] overflow-hidden">
         <div className="h-full rounded-full" style={{ width: `${Math.min(100, value)}%`, background: color }} />
       </div>
       <span className="font-mono text-[11px] w-8 text-right" style={{ color }}>{value}%</span>
@@ -91,17 +101,49 @@ function NotWired({ title, needs, why }) {
   return (
     <Panel title={title}>
       <div className="flex flex-col items-center text-center py-8 gap-2">
-        <PlugZap size={20} className="text-[#3A4154]" />
-        <div className="text-[13px] text-[#B4BACB]">Not available from the agent yet</div>
-        <div className="text-[12px] text-[#7B8496] max-w-md leading-relaxed">{why}</div>
-        <div className="text-[11px] font-mono text-[#5EEBD1] mt-1">needs: {needs}</div>
+        <PlugZap size={20} className="text-[var(--ink-5)]" />
+        <div className="text-[13px] text-[var(--ink-2)]">Not available from the agent yet</div>
+        <div className="text-[12px] text-[var(--ink-3)] max-w-md leading-relaxed">{why}</div>
+        <div className="text-[11px] font-mono text-[var(--accent)] mt-1">needs: {needs}</div>
       </div>
     </Panel>
   );
 }
 
 function EmptyHint({ children }) {
-  return <div className="text-[#3A4154] text-[12px] py-6 text-center font-mono">{children}</div>;
+  return <div className="text-[var(--ink-5)] text-[12px] py-6 text-center font-mono">{children}</div>;
+}
+
+// Three explicit options rather than a two-state toggle, so "follow my OS"
+// stays reachable after someone has picked a side once.
+function ThemeSwitch({ theme, setTheme }) {
+  const opts = [
+    { id: "light", icon: Sun, label: "Light" },
+    { id: "system", icon: Monitor, label: "System" },
+    { id: "dark", icon: Moon, label: "Dark" },
+  ];
+  return (
+    <div className="flex items-center rounded border border-[var(--n4)] overflow-hidden" role="group" aria-label="Colour theme">
+      {opts.map(({ id, icon: Icon, label }) => {
+        const active = theme === id;
+        return (
+          <button
+            key={id}
+            onClick={() => setTheme(id)}
+            title={label}
+            aria-pressed={active}
+            className="w-7 h-7 flex items-center justify-center"
+            style={{
+              background: active ? "var(--accent)" : "transparent",
+              color: active ? "var(--surface)" : "var(--ink-3)",
+            }}
+          >
+            <Icon size={13} />
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 function TopologyGraph({ services, edges, positions, selected, onSelect }) {
@@ -110,13 +152,13 @@ function TopologyGraph({ services, edges, positions, selected, onSelect }) {
     <svg viewBox="0 0 460 190" className="w-full h-[220px]">
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-          <path d="M0,0 L8,4 L0,8 z" fill="#2A3040" />
+          <path d="M0,0 L8,4 L0,8 z" fill="var(--n5)" />
         </marker>
       </defs>
       {edges.map(([from, to], i) => {
         const a = positions[from], b = positions[to];
         if (!a || !b) return null;
-        return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="#2A3040" strokeWidth="1.5" markerEnd="url(#arrow)" />;
+        return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="var(--n5)" strokeWidth="1.5" markerEnd="url(#arrow)" />;
       })}
       {services.map((s) => {
         const p = positions[s.id];
@@ -130,9 +172,9 @@ function TopologyGraph({ services, edges, positions, selected, onSelect }) {
                 <animate attributeName="opacity" values="0.25;0;0.25" dur="2s" repeatCount="indefinite" />
               </circle>
             )}
-            <circle r="13" fill="#181C27" stroke={isSelected ? "#5EEBD1" : statusColor[s.status]} strokeWidth={isSelected ? 2.5 : 1.5} />
+            <circle r="13" fill="var(--n2)" stroke={isSelected ? "var(--accent)" : statusColor[s.status]} strokeWidth={isSelected ? 2.5 : 1.5} />
             <circle r="3.5" fill={statusColor[s.status]} />
-            <text y="26" textAnchor="middle" className="font-mono" fontSize="9.5" fill={isSelected ? "#5EEBD1" : "#7B8496"}>
+            <text y="26" textAnchor="middle" className="font-mono" fontSize="9.5" fill={isSelected ? "var(--accent)" : "var(--ink-3)"}>
               {s.label}
             </text>
           </g>
@@ -149,25 +191,25 @@ function ServiceDetail({ svc, edges }) {
     <>
       <div className="flex items-center justify-between mb-3">
         <span className="font-mono text-base">{svc.label}</span>
-        <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded" style={{ color: statusColor[svc.status], background: `${statusColor[svc.status]}1A` }}>
+        <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded" style={{ color: statusColor[svc.status], background: `color-mix(in srgb, ${statusColor[svc.status]} 12%, transparent)` }}>
           {svc.status}
         </span>
       </div>
       <div className="grid grid-cols-2 gap-3 text-sm mb-4">
-        <div><div className="text-[10px] text-[#7B8496] font-mono uppercase">p50</div><div className="font-mono">{svc.p50}ms</div></div>
-        <div><div className="text-[10px] text-[#7B8496] font-mono uppercase">p99</div><div className="font-mono" style={{ color: svc.p99 > 300 ? "#F87171" : "#E6E9F0" }}>{svc.p99}ms</div></div>
-        <div><div className="text-[10px] text-[#7B8496] font-mono uppercase">req/s</div><div className="font-mono">{fmtRps(svc.rps)}</div></div>
-        <div><div className="text-[10px] text-[#7B8496] font-mono uppercase">error rate</div><div className="font-mono" style={{ color: svc.err > 1 ? "#F87171" : "#E6E9F0" }}>{svc.err}%</div></div>
+        <div><div className="text-[10px] text-[var(--ink-3)] font-mono uppercase">p50</div><div className="font-mono">{svc.p50}ms</div></div>
+        <div><div className="text-[10px] text-[var(--ink-3)] font-mono uppercase">p99</div><div className="font-mono" style={{ color: svc.p99 > 300 ? "var(--crit)" : "var(--ink)" }}>{svc.p99}ms</div></div>
+        <div><div className="text-[10px] text-[var(--ink-3)] font-mono uppercase">req/s</div><div className="font-mono">{fmtRps(svc.rps)}</div></div>
+        <div><div className="text-[10px] text-[var(--ink-3)] font-mono uppercase">error rate</div><div className="font-mono" style={{ color: svc.err > 1 ? "var(--crit)" : "var(--ink)" }}>{svc.err}%</div></div>
       </div>
       {related.length > 0 && (
         <>
-          <div className="text-[10px] text-[#7B8496] font-mono uppercase mb-1.5">Upstream / Downstream</div>
+          <div className="text-[10px] text-[var(--ink-3)] font-mono uppercase mb-1.5">Upstream / Downstream</div>
           <div className="flex flex-col gap-1">
             {related.map(([from, to], i) => (
-              <div key={i} className="flex items-center gap-1.5 text-[11px] font-mono text-[#B4BACB]">
-                <span className={from === svc.id ? "text-[#5EEBD1]" : ""}>{from}</span>
-                <ChevronRight size={11} className="text-[#3A4154]" />
-                <span className={to === svc.id ? "text-[#5EEBD1]" : ""}>{to}</span>
+              <div key={i} className="flex items-center gap-1.5 text-[11px] font-mono text-[var(--ink-2)]">
+                <span className={from === svc.id ? "text-[var(--accent)]" : ""}>{from}</span>
+                <ChevronRight size={11} className="text-[var(--ink-5)]" />
+                <span className={to === svc.id ? "text-[var(--accent)]" : ""}>{to}</span>
               </div>
             ))}
           </div>
@@ -183,7 +225,7 @@ function ServiceTable({ services, selected, setSelected }) {
     <div className="overflow-x-auto">
       <table className="w-full text-[12px] font-mono">
         <thead>
-          <tr className="text-[10px] text-[#7B8496] uppercase tracking-wide text-left border-b border-[#232838]">
+          <tr className="text-[10px] text-[var(--ink-3)] uppercase tracking-wide text-left border-b border-[var(--n4)]">
             <th className="py-2 pr-4 font-normal">Service</th>
             <th className="py-2 pr-4 font-normal">Status</th>
             <th className="py-2 pr-4 font-normal">p50</th>
@@ -197,15 +239,15 @@ function ServiceTable({ services, selected, setSelected }) {
             <tr
               key={s.id}
               onClick={() => setSelected?.(s.id)}
-              className="border-b border-[#161A24] last:border-0 cursor-pointer hover:bg-[#161A24]"
-              style={{ background: selected === s.id ? "#5EEBD10D" : "transparent" }}
+              className="border-b border-[var(--n1)] last:border-0 cursor-pointer hover:bg-[var(--n1)]"
+              style={{ background: selected === s.id ? "color-mix(in srgb, var(--accent) 5%, transparent)" : "transparent" }}
             >
-              <td className="py-2 pr-4" style={{ color: selected === s.id ? "#5EEBD1" : "#E6E9F0" }}>{s.label}</td>
+              <td className="py-2 pr-4" style={{ color: selected === s.id ? "var(--accent)" : "var(--ink)" }}>{s.label}</td>
               <td className="py-2 pr-4"><StatusDot status={s.status} />{s.status}</td>
               <td className="py-2 pr-4">{s.p50}ms</td>
-              <td className="py-2 pr-4" style={{ color: s.p99 > 300 ? "#F87171" : "#E6E9F0" }}>{s.p99}ms</td>
+              <td className="py-2 pr-4" style={{ color: s.p99 > 300 ? "var(--crit)" : "var(--ink)" }}>{s.p99}ms</td>
               <td className="py-2 pr-4">{fmtRps(s.rps)}</td>
-              <td className="py-2 pr-4" style={{ color: s.err > 1 ? "#F87171" : "#E6E9F0" }}>{s.err}%</td>
+              <td className="py-2 pr-4" style={{ color: s.err > 1 ? "var(--crit)" : "var(--ink)" }}>{s.err}%</td>
             </tr>
           ))}
         </tbody>
@@ -218,73 +260,139 @@ function ServiceTable({ services, selected, setSelected }) {
 // Views
 // ---------------------------------------------------------------------------
 
-function OverviewView({ snap, d, selected, setSelected }) {
+// Overview summarises; it does not re-host other views' tables. Where a panel
+// shows the same entity another view owns, clicking it navigates there rather
+// than selecting in place — a selection that changes nothing on screen is a
+// control that lies about what it does.
+function OverviewView({ snap, d, openService, openHost, openLogs }) {
   const healthy = d.services.filter((s) => s.status === "healthy").length;
-  const svc = d.services.find((s) => s.id === selected) || d.services[0];
   const infra = d.infra[0];
 
   return (
     <>
+      {/* Deliberately does NOT restate rate, errors or p99 — those are the
+          three charts immediately below, and a number sitting directly above
+          its own chart is noise, not a summary. These are the facts the RED
+          row cannot show: how much the agent is holding, and over what. */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
         <KpiTile icon={Server} label="Services" value={d.services.length ? `${healthy}/${d.services.length}` : "—"}
           tone={d.services.length && healthy < d.services.length ? "warn" : "normal"} sub="healthy / seen" />
-        <KpiTile icon={Gauge} label="Requests / sec" value={d.services.length ? fmtRps(d.totalRps) : "—"} sub="from received spans" />
-        <KpiTile icon={Clock} label="p99 Latency" value={Number.isFinite(d.p99) ? `${d.p99}ms` : "—"} sub="worst service" />
+        <KpiTile icon={Waypoints} label="Spans" value={(snap?.spans?.length || 0).toLocaleString()}
+          sub={`in the last ${Math.round((snap?.retain_sec || 900) / 60)} min`} />
+        <KpiTile icon={Gauge} label="Series" value={d.allSeries.length.toLocaleString()}
+          tone={d.seriesDropped > 0 ? "warn" : "normal"} sub={d.seriesDropped > 0 ? `${d.seriesDropped} refused` : "metric streams held"} />
         <KpiTile icon={Activity} label="Envelopes" value={d.envelopes.toLocaleString()} sub={`${d.envelopesPerSec}/s since start`} />
       </div>
 
       {d.seriesDropped > 0 && (
-        <div className="mb-4 border border-[#FBBF24] border-l-2 rounded px-3 py-2 text-[12px] text-[#B4BACB] bg-[#FBBF240A]">
+        <div className="mb-4 border border-[var(--warn)] border-l-2 rounded px-3 py-2 text-[12px] text-[var(--ink-2)] bg-[color-mix(in srgb, var(--warn) 4%, transparent)]">
           {d.seriesDropped} series refused — the agent's in-memory cap was reached, so this view is incomplete.
-          Raise <span className="font-mono text-[#FBBF24]">dashboard.max_series</span> or narrow what is collected.
+          Raise <span className="font-mono text-[var(--warn)]">dashboard.max_series</span> or narrow what is collected.
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      {/* RED hero row. Rate and errors on the left, duration on the right —
+          the convention every platform surveyed follows, and the order an
+          operator actually asks the questions in: is it serving, is it
+          broken, is it slow. These are taller than everything below them so
+          the layout itself says which panels matter; a uniform grid makes you
+          scan all of them equally, every time. */}
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+        <Panel title="Rate" className="lg:col-span-2" right={<span className="text-[10px] font-mono text-[var(--ink-5)]">req/s</span>}>
+          {d.traffic.rps.length > 1 ? (
+            <ResponsiveContainer width="100%" height={210}>
+              <AreaChart data={d.traffic.rps}>
+                <defs>
+                  <linearGradient id="rpsFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.35} />
+                    <stop offset="100%" stopColor="var(--accent)" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="var(--n3)" vertical={false} />
+                <XAxis dataKey="time" tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={{ stroke: "var(--n4)" }} tickLine={false} minTickGap={24} />
+                <YAxis width={34} tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={false} tickLine={false} />
+                <Tooltip content={<ChartTooltip unit=" req/s" />} />
+                <Area type="monotone" dataKey="value" stroke="var(--accent)" strokeWidth={2} fill="url(#rpsFill)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : <EmptyHint>needs spans</EmptyHint>}
+        </Panel>
+
+        <Panel title="Errors" className="lg:col-span-1" right={<span className="text-[10px] font-mono text-[var(--ink-5)]">per min</span>}>
+          {d.traffic.errors.length > 1 ? (
+            <ResponsiveContainer width="100%" height={210}>
+              <BarChart data={d.traffic.errors}>
+                <CartesianGrid stroke="var(--n3)" vertical={false} />
+                <XAxis dataKey="time" tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={{ stroke: "var(--n4)" }} tickLine={false} minTickGap={24} />
+                <YAxis width={26} tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={false} tickLine={false} allowDecimals={false} />
+                <Tooltip content={<ChartTooltip unit=" errs" />} />
+                <Bar dataKey="value" fill="var(--crit)" radius={[2, 2, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : <EmptyHint>needs spans</EmptyHint>}
+        </Panel>
+
+        <Panel title="Duration" className="lg:col-span-2" right={<span className="text-[10px] font-mono text-[var(--ink-5)]">p99 ms</span>}>
+          {d.traffic.latency.length > 1 ? (
+            <ResponsiveContainer width="100%" height={210}>
+              <LineChart data={d.traffic.latency}>
+                <CartesianGrid stroke="var(--n3)" vertical={false} />
+                <XAxis dataKey="time" tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={{ stroke: "var(--n4)" }} tickLine={false} minTickGap={24} />
+                <YAxis width={38} tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={false} tickLine={false} />
+                <Tooltip content={<ChartTooltip unit="ms" />} />
+                <Line type="monotone" dataKey="value" stroke="var(--warn)" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : <EmptyHint>needs spans</EmptyHint>}
+        </Panel>
+      </div>
+
+      {/* Secondary: context for the row above, deliberately shorter. */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-4">
         <Panel title="Service Health" className="lg:col-span-2">
           {d.services.length ? (
             <div className="flex flex-col gap-1.5">
               {d.services.map((s) => (
-                <button key={s.id} onClick={() => setSelected(s.id)}
-                  className="flex items-center justify-between px-2.5 py-2 rounded border text-left"
-                  style={{ borderColor: selected === s.id ? "#5EEBD1" : "#1B2030", background: selected === s.id ? "#5EEBD10D" : "transparent" }}>
+                <button key={s.id} onClick={() => openService(s.id)} title={`Open ${s.label} in Service Topology`}
+                  className="group flex items-center justify-between px-2.5 py-2 rounded border border-[var(--n3)] text-left hover:border-[var(--accent)]">
                   <span className="flex items-center font-mono text-[12.5px]"><StatusDot status={s.status} />{s.label}</span>
-                  <span className="flex items-center gap-3 text-[11px] font-mono text-[#7B8496]">
+                  <span className="flex items-center gap-3 text-[11px] font-mono text-[var(--ink-3)]">
                     <span>{fmtRps(s.rps)} rps</span>
-                    <span style={{ color: s.p99 > 300 ? "#F87171" : "#7B8496" }}>{s.p99}ms p99</span>
+                    <span style={{ color: s.p99 > 300 ? "var(--crit)" : "var(--ink-3)" }}>{s.p99}ms p99</span>
+                    <ChevronRight size={12} className="text-[var(--ink-5)] group-hover:text-[var(--accent)]" />
                   </span>
                 </button>
               ))}
             </div>
           ) : (
             <EmptyHint>
-              no services yet — enable <span className="text-[#5EEBD1]">traces.enabled</span> and point an app at the agent's OTLP receiver
+              no services yet — enable <span className="text-[var(--accent)]">traces.enabled</span> and point an app at the agent's OTLP receiver
             </EmptyHint>
           )}
         </Panel>
 
-        <Panel title="This Host" right={infra && <StatusDot status={infra.status} />}>
+        <Panel title="This Host" right={infra && (<button onClick={openHost} className="text-[10px] font-mono text-[var(--accent)]">open ↗</button>)}>
           {infra ? (
             <>
               <div className="flex items-center justify-between mb-3">
                 <span className="font-mono text-base">{infra.host}</span>
-                <span className="text-[10px] font-mono text-[#7B8496]">{infra.role}</span>
+                <span className="text-[10px] font-mono text-[var(--ink-3)]">{infra.role}</span>
               </div>
               <div className="flex flex-col gap-2.5">
                 <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-1.5 text-[11px] text-[#7B8496] font-mono"><Cpu size={12} /> CPU</span>
+                  <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono"><Cpu size={12} /> CPU</span>
                   <GaugeBar value={infra.cpu} />
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-1.5 text-[11px] text-[#7B8496] font-mono"><MemoryStick size={12} /> Memory</span>
+                  <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono"><MemoryStick size={12} /> Memory</span>
                   <GaugeBar value={infra.mem} />
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-1.5 text-[11px] text-[#7B8496] font-mono"><HardDrive size={12} /> Disk (worst)</span>
+                  <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono"><HardDrive size={12} /> Disk (worst)</span>
                   <GaugeBar value={infra.disk} />
                 </div>
                 <div className="flex items-center justify-between text-[11px] font-mono">
-                  <span className="text-[#7B8496]">load 1m</span><span>{infra.load1}</span>
+                  <span className="text-[var(--ink-3)]">load 1m</span><span>{infra.load1}</span>
                 </div>
               </div>
             </>
@@ -292,69 +400,22 @@ function OverviewView({ snap, d, selected, setSelected }) {
         </Panel>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-4">
-        <Panel title="Throughput (req/s)">
-          {d.traffic.rps.length > 1 ? (
-            <ResponsiveContainer width="100%" height={140}>
-              <AreaChart data={d.traffic.rps}>
-                <defs>
-                  <linearGradient id="rpsFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#5EEBD1" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="#5EEBD1" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="#1B2030" vertical={false} />
-                <XAxis dataKey="time" hide /><YAxis hide />
-                <Tooltip content={<ChartTooltip unit=" req/s" />} />
-                <Area type="monotone" dataKey="value" stroke="#5EEBD1" strokeWidth={1.5} fill="url(#rpsFill)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          ) : <EmptyHint>needs spans</EmptyHint>}
-        </Panel>
-
-        <Panel title="Latency p99 (ms)">
-          {d.traffic.latency.length > 1 ? (
-            <ResponsiveContainer width="100%" height={140}>
-              <LineChart data={d.traffic.latency}>
-                <CartesianGrid stroke="#1B2030" vertical={false} />
-                <XAxis dataKey="time" hide /><YAxis hide />
-                <Tooltip content={<ChartTooltip unit="ms" />} />
-                <Line type="monotone" dataKey="value" stroke="#FBBF24" strokeWidth={1.5} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          ) : <EmptyHint>needs spans</EmptyHint>}
-        </Panel>
-
-        <Panel title="Errors / min">
-          {d.traffic.errors.length > 1 ? (
-            <ResponsiveContainer width="100%" height={140}>
-              <BarChart data={d.traffic.errors}>
-                <CartesianGrid stroke="#1B2030" vertical={false} />
-                <XAxis dataKey="time" hide /><YAxis hide />
-                <Tooltip content={<ChartTooltip unit=" errs" />} />
-                <Bar dataKey="value" fill="#F87171" radius={[2, 2, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          ) : <EmptyHint>needs spans</EmptyHint>}
-        </Panel>
-      </div>
-
       <div className="mt-4">
-        <Panel title="Live Log Stream">
+        <Panel title="Live Log Stream" right={d.logs.length > 0 && (<button onClick={openLogs} className="text-[10px] font-mono text-[var(--accent)]">open explorer ↗</button>)}>
           {d.logs.length ? (
             <div className="flex flex-col gap-1 max-h-[220px] overflow-y-auto font-mono text-[11.5px]">
               {d.logs.slice(0, 10).map((l, i) => (
-                <div key={i} className="flex gap-3 py-1 border-b border-[#161A24] last:border-0">
-                  <span className="text-[#3A4154] flex-shrink-0">{l.t}</span>
+                <div key={i} className="flex gap-3 py-1 border-b border-[var(--n1)] last:border-0">
+                  <span className="text-[var(--ink-5)] flex-shrink-0">{l.t}</span>
                   <span className="w-12 flex-shrink-0 font-semibold" style={{ color: lvlColor[l.lvl] }}>{l.lvl}</span>
-                  <span className="text-[#5EEBD1] flex-shrink-0 w-28 truncate">{l.svc}</span>
-                  <span className="text-[#B4BACB] truncate">{l.msg}</span>
+                  <span className="text-[var(--accent)] flex-shrink-0 w-28 truncate">{l.svc}</span>
+                  <span className="text-[var(--ink-2)] truncate">{l.msg}</span>
                 </div>
               ))}
             </div>
           ) : (
             <EmptyHint>
-              no log lines — enable <span className="text-[#5EEBD1]">logs.enabled</span> with a matching path in logs.paths
+              no log lines — enable <span className="text-[var(--accent)]">logs.enabled</span> with a matching path in logs.paths
             </EmptyHint>
           )}
         </Panel>
@@ -381,9 +442,9 @@ function LogsView({ logs }) {
             <button key={l} onClick={() => setFilter(l)}
               className="text-[10px] font-mono uppercase px-2 py-0.5 rounded border"
               style={{
-                color: filter === l ? "#0B0E14" : lvlColor[l] || "#7B8496",
-                background: filter === l ? (lvlColor[l] || "#7B8496") : "transparent",
-                borderColor: lvlColor[l] || "#3A4154",
+                color: filter === l ? "var(--bg)" : lvlColor[l] || "var(--ink-3)",
+                background: filter === l ? (lvlColor[l] || "var(--ink-3)") : "transparent",
+                borderColor: lvlColor[l] || "var(--ink-5)",
               }}>
               {l}
             </button>
@@ -391,22 +452,22 @@ function LogsView({ logs }) {
         </div>
       }
     >
-      <div className="flex items-center gap-2 bg-[#0E1119] border border-[#232838] rounded px-3 py-1.5 mb-3">
-        <Search size={13} className="text-[#7B8496]" />
+      <div className="flex items-center gap-2 bg-[var(--sunk)] border border-[var(--n4)] rounded px-3 py-1.5 mb-3">
+        <Search size={13} className="text-[var(--ink-3)]" />
         <input value={q} onChange={(e) => setQ(e.target.value)}
           placeholder="filter by message or source…"
-          className="bg-transparent outline-none text-[12px] font-mono flex-1 text-[#E6E9F0] placeholder:text-[#3A4154]" />
+          className="bg-transparent outline-none text-[12px] font-mono flex-1 text-[var(--ink)] placeholder:text-[var(--ink-5)]" />
       </div>
-      <div className="text-[10px] font-mono text-[#3A4154] mb-2">
+      <div className="text-[10px] font-mono text-[var(--ink-5)] mb-2">
         severity is classified from the line text — the agent forwards log lines verbatim and does not parse levels
       </div>
       <div className="flex flex-col gap-1 font-mono text-[12px] max-h-[520px] overflow-y-auto">
         {filtered.map((l, i) => (
-          <div key={i} className="flex gap-3 py-1.5 border-b border-[#161A24] last:border-0 items-center">
-            <span className="text-[#3A4154] flex-shrink-0 w-16">{l.t}</span>
+          <div key={i} className="flex gap-3 py-1.5 border-b border-[var(--n1)] last:border-0 items-center">
+            <span className="text-[var(--ink-5)] flex-shrink-0 w-16">{l.t}</span>
             <span className="w-12 flex-shrink-0 font-semibold" style={{ color: lvlColor[l.lvl] }}>{l.lvl}</span>
-            <span className="text-[#5EEBD1] flex-shrink-0 w-32 truncate" title={l.svc}>{l.svc}</span>
-            <span className="text-[#B4BACB] truncate flex-1" title={l.msg}>{l.msg}</span>
+            <span className="text-[var(--accent)] flex-shrink-0 w-32 truncate" title={l.svc}>{l.svc}</span>
+            <span className="text-[var(--ink-2)] truncate flex-1" title={l.msg}>{l.msg}</span>
           </div>
         ))}
         {!filtered.length && <EmptyHint>no logs match this filter</EmptyHint>}
@@ -445,15 +506,15 @@ function MetricsView({ snap, d }) {
               <AreaChart data={cpu}>
                 <defs>
                   <linearGradient id="cpuFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#5EEBD1" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="#5EEBD1" stopOpacity={0} />
+                    <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.35} />
+                    <stop offset="100%" stopColor="var(--accent)" stopOpacity={0} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid stroke="#1B2030" vertical={false} />
-                <XAxis dataKey="time" tick={{ fill: "#3A4154", fontSize: 10 }} axisLine={{ stroke: "#232838" }} tickLine={false} />
+                <CartesianGrid stroke="var(--n3)" vertical={false} />
+                <XAxis dataKey="time" tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={{ stroke: "var(--n4)" }} tickLine={false} />
                 <YAxis hide domain={[0, 100]} />
                 <Tooltip content={<ChartTooltip unit="%" />} />
-                <Area type="monotone" dataKey="value" stroke="#5EEBD1" strokeWidth={1.5} fill="url(#cpuFill)" />
+                <Area type="monotone" dataKey="value" stroke="var(--accent)" strokeWidth={1.5} fill="url(#cpuFill)" />
               </AreaChart>
             </ResponsiveContainer>
           ) : <EmptyHint>needs system.cpu.time</EmptyHint>}
@@ -463,24 +524,27 @@ function MetricsView({ snap, d }) {
           {net.length > 1 ? (
             <ResponsiveContainer width="100%" height={200}>
               <LineChart data={net}>
-                <CartesianGrid stroke="#1B2030" vertical={false} />
-                <XAxis dataKey="time" tick={{ fill: "#3A4154", fontSize: 10 }} axisLine={{ stroke: "#232838" }} tickLine={false} />
+                <CartesianGrid stroke="var(--n3)" vertical={false} />
+                <XAxis dataKey="time" tick={{ fill: "var(--ink-5)", fontSize: 10 }} axisLine={{ stroke: "var(--n4)" }} tickLine={false} />
                 <YAxis hide />
                 <Tooltip content={<ChartTooltip unit=" KiB/s" />} />
-                <Line type="monotone" dataKey="value" stroke="#60A5FA" strokeWidth={1.5} dot={false} />
+                <Line type="monotone" dataKey="value" stroke="var(--s3)" strokeWidth={1.5} dot={false} />
               </LineChart>
             </ResponsiveContainer>
           ) : <EmptyHint>needs system.network.io</EmptyHint>}
         </Panel>
       </div>
 
-      <Panel title="Per-Service Metrics"><ServiceTable services={d.services} /></Panel>
+      {/* The per-service table lives on Service Topology, where selecting a
+          row actually does something. Rendering the identical table here as
+          well meant the same numbers in two places with no way to tell which
+          was authoritative. This view is host metrics and the raw series. */}
 
       <Panel title={`All Series (${d.allSeries.length})`}>
         <div className="overflow-auto max-h-[420px]">
           <table className="w-full text-[12px] font-mono">
             <thead>
-              <tr className="text-[10px] text-[#7B8496] uppercase tracking-wide text-left border-b border-[#232838] sticky top-0 bg-[#12161F]">
+              <tr className="text-[10px] text-[var(--ink-3)] uppercase tracking-wide text-left border-b border-[var(--n4)] sticky top-0 bg-[var(--surface)]">
                 <th className="py-2 pr-4 font-normal">Metric</th>
                 <th className="py-2 pr-4 font-normal">Labels</th>
                 <th className="py-2 pr-4 font-normal text-right">Latest</th>
@@ -489,14 +553,14 @@ function MetricsView({ snap, d }) {
             </thead>
             <tbody>
               {d.allSeries.map((s, i) => (
-                <tr key={i} className="border-b border-[#161A24] last:border-0">
+                <tr key={i} className="border-b border-[var(--n1)] last:border-0">
                   <td className="py-1.5 pr-4">
                     {s.name}
-                    {s.cumulative && <span className="ml-2 text-[9px] px-1 py-0.5 rounded bg-[#1B2030] text-[#7B8496]">RATE</span>}
+                    {s.cumulative && <span className="ml-2 text-[9px] px-1 py-0.5 rounded bg-[var(--n3)] text-[var(--ink-3)]">RATE</span>}
                   </td>
-                  <td className="py-1.5 pr-4 text-[10.5px] text-[#7B8496] max-w-[340px] truncate" title={s.labels}>{s.labels || "—"}</td>
+                  <td className="py-1.5 pr-4 text-[10.5px] text-[var(--ink-3)] max-w-[340px] truncate" title={s.labels}>{s.labels || "—"}</td>
                   <td className="py-1.5 pr-4 text-right">{s.latest.toFixed(2)}</td>
-                  <td className="py-1.5 pr-4 text-right text-[#7B8496]">{s.points}</td>
+                  <td className="py-1.5 pr-4 text-right text-[var(--ink-3)]">{s.points}</td>
                 </tr>
               ))}
             </tbody>
@@ -514,21 +578,21 @@ function SpanWaterfall({ trace, onSelectSpan, selectedIdx }) {
     <div className="flex flex-col gap-2.5">
       {trace.spans.map((s, i) => (
         <div key={i} onClick={() => onSelectSpan(i)} className="cursor-pointer rounded px-1.5 py-1 -mx-1.5"
-          style={{ background: selectedIdx === i ? "#5EEBD10D" : "transparent" }}>
+          style={{ background: selectedIdx === i ? "color-mix(in srgb, var(--accent) 5%, transparent)" : "transparent" }}>
           <div className="flex justify-between text-[11px] font-mono mb-1" style={{ paddingLeft: s.depth * 14 }}>
             <span className="flex items-center gap-1.5 truncate">
-              {s.error && <AlertTriangle size={11} className="text-[#F87171] flex-shrink-0" />}
+              {s.error && <AlertTriangle size={11} className="text-[var(--crit)] flex-shrink-0" />}
               <span style={{ color: serviceColor(s.svc) }}>{s.svc}</span>
-              <span className="text-[#3A4154] truncate">· {s.op}</span>
+              <span className="text-[var(--ink-5)] truncate">· {s.op}</span>
             </span>
-            <span className="text-[#7B8496] flex-shrink-0 pl-2">{s.dur}ms</span>
+            <span className="text-[var(--ink-3)] flex-shrink-0 pl-2">{s.dur}ms</span>
           </div>
-          <div className="w-full h-2 bg-[#161A24] rounded-sm relative">
+          <div className="w-full h-2 bg-[var(--n1)] rounded-sm relative">
             <div className="absolute h-2 rounded-sm"
               style={{
                 left: `${(s.start / maxDur) * 100}%`,
                 width: `${Math.max((s.dur / maxDur) * 100, 1)}%`,
-                background: s.error ? "#F87171" : serviceColor(s.svc),
+                background: s.error ? "var(--crit)" : serviceColor(s.svc),
               }} />
           </div>
         </div>
@@ -550,19 +614,19 @@ function FlameGraph({ trace, onSelectSpan, selectedIdx }) {
               style={{
                 left: `${(s.start / maxDur) * 100}%`,
                 width: `${Math.max((s.dur / maxDur) * 100, 1.5)}%`,
-                background: s.error ? "#F8717133" : `${serviceColor(s.svc)}33`,
-                borderColor: selectedIdx === s.i ? "#5EEBD1" : s.error ? "#F8717166" : `${serviceColor(s.svc)}66`,
+                background: s.error ? "color-mix(in srgb, var(--crit) 20%, transparent)" : `color-mix(in srgb, ${serviceColor(s.svc)} 20%, transparent)`,
+                borderColor: selectedIdx === s.i ? "var(--accent)" : s.error ? "color-mix(in srgb, var(--crit) 40%, transparent)" : `color-mix(in srgb, ${serviceColor(s.svc)} 40%, transparent)`,
               }}>
-              <span className="text-[10px] font-mono truncate" style={{ color: s.error ? "#F87171" : serviceColor(s.svc) }}>{s.svc}</span>
+              <span className="text-[10px] font-mono truncate" style={{ color: s.error ? "var(--crit)" : serviceColor(s.svc) }}>{s.svc}</span>
             </div>
           ))}
         </div>
       ))}
-      <div className="flex items-center gap-4 mt-2 pt-2 border-t border-[#1B2030] flex-wrap">
+      <div className="flex items-center gap-4 mt-2 pt-2 border-t border-[var(--n3)] flex-wrap">
         {[...new Set(trace.spans.map((s) => s.svc))].map((svc) => (
           <div key={svc} className="flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-sm" style={{ background: serviceColor(svc) }} />
-            <span className="text-[10px] text-[#7B8496] font-mono">{svc}</span>
+            <span className="text-[10px] text-[var(--ink-3)] font-mono">{svc}</span>
           </div>
         ))}
       </div>
@@ -597,15 +661,15 @@ function TracesView({ traces }) {
           {traces.slice(0, 50).map((t) => (
             <button key={t.id} onClick={() => setSelectedTrace(t.id)}
               className="text-left px-2 py-2 rounded border"
-              style={{ borderColor: trace.id === t.id ? "#5EEBD1" : "#1B2030", background: trace.id === t.id ? "#5EEBD10D" : "transparent" }}>
+              style={{ borderColor: trace.id === t.id ? "var(--accent)" : "var(--n3)", background: trace.id === t.id ? "color-mix(in srgb, var(--accent) 5%, transparent)" : "transparent" }}>
               <div className="flex items-center justify-between">
-                <span className="font-mono text-[11px] text-[#5EEBD1] truncate">{t.id.slice(0, 16)}</span>
-                <span className="font-mono text-[11px]" style={{ color: t.status === "error" ? "#F87171" : "#4ADE80" }}>{t.duration}ms</span>
+                <span className="font-mono text-[11px] text-[var(--accent)] truncate">{t.id.slice(0, 16)}</span>
+                <span className="font-mono text-[11px]" style={{ color: t.status === "error" ? "var(--crit)" : "var(--good)" }}>{t.duration}ms</span>
               </div>
-              <div className="text-[12px] mt-0.5 text-[#B4BACB] truncate">{t.op}</div>
+              <div className="text-[12px] mt-0.5 text-[var(--ink-2)] truncate">{t.op}</div>
               <div className="flex items-center justify-between">
-                <span className="text-[10px] text-[#7B8496] font-mono">{t.root} · {t.spans.length} spans</span>
-                {t.status === "error" && <AlertTriangle size={11} className="text-[#F87171]" />}
+                <span className="text-[10px] text-[var(--ink-3)] font-mono">{t.root} · {t.spans.length} spans</span>
+                {t.status === "error" && <AlertTriangle size={11} className="text-[var(--crit)]" />}
               </div>
             </button>
           ))}
@@ -620,7 +684,7 @@ function TracesView({ traces }) {
               {["waterfall", "flame"].map((m) => (
                 <button key={m} onClick={() => setMode(m)}
                   className="text-[10px] font-mono uppercase px-2 py-0.5 rounded"
-                  style={{ color: mode === m ? "#0B0E14" : "#7B8496", background: mode === m ? "#5EEBD1" : "transparent" }}>
+                  style={{ color: mode === m ? "var(--bg)" : "var(--ink-3)", background: mode === m ? "var(--accent)" : "transparent" }}>
                   {m === "waterfall" ? "Waterfall" : "Flame Graph"}
                 </button>
               ))}
@@ -631,15 +695,15 @@ function TracesView({ traces }) {
             : <FlameGraph trace={trace} onSelectSpan={setSelectedSpanIdx} selectedIdx={selectedSpanIdx} />}
         </Panel>
 
-        <Panel title="Span Detail" right={span?.error && <span className="text-[10px] font-mono text-[#F87171]">ERROR</span>}>
+        <Panel title="Span Detail" right={span?.error && <span className="text-[10px] font-mono text-[var(--crit)]">ERROR</span>}>
           {span && (
             <>
               <div className="flex items-center justify-between mb-2">
                 <span className="font-mono text-[13px]" style={{ color: serviceColor(span.svc) }}>{span.svc}</span>
-                <span className="text-[11px] font-mono text-[#7B8496]">{span.dur}ms</span>
+                <span className="text-[11px] font-mono text-[var(--ink-3)]">{span.dur}ms</span>
               </div>
-              <div className="text-[12px] text-[#B4BACB] mb-3">{span.op}</div>
-              <div className="text-[10px] font-mono text-[#3A4154]">
+              <div className="text-[12px] text-[var(--ink-2)] mb-3">{span.op}</div>
+              <div className="text-[10px] font-mono text-[var(--ink-5)]">
                 depth {span.depth} · starts +{span.start}ms into the trace
               </div>
             </>
@@ -658,16 +722,16 @@ function TopologyView({ d, selected, setSelected }) {
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
       <Panel title="Service Topology" className="lg:col-span-2">
         <TopologyGraph services={d.services} edges={d.edges} positions={positions} selected={svc?.id} onSelect={setSelected} />
-        <div className="flex items-center justify-between mt-3 pt-3 border-t border-[#1B2030]">
+        <div className="flex items-center justify-between mt-3 pt-3 border-t border-[var(--n3)]">
           <div className="flex items-center gap-4">
             {["healthy", "degraded"].map((s) => (
               <div key={s} className="flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full" style={{ background: statusColor[s] }} />
-                <span className="text-[10px] text-[#7B8496] font-mono uppercase">{s}</span>
+                <span className="text-[10px] text-[var(--ink-3)] font-mono uppercase">{s}</span>
               </div>
             ))}
           </div>
-          <span className="text-[10px] font-mono text-[#3A4154]">
+          <span className="text-[10px] font-mono text-[var(--ink-5)]">
             {d.edges.length} edge{d.edges.length === 1 ? "" : "s"} derived from span parent links
           </span>
         </div>
@@ -690,30 +754,30 @@ function InfrastructureView({ d }) {
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
       {d.infra.map((n) => (
         <Panel key={n.host} title={n.host} right={<StatusDot status={n.status} />}>
-          <div className="text-[11px] text-[#7B8496] font-mono mb-3">{n.role}</div>
+          <div className="text-[11px] text-[var(--ink-3)] font-mono mb-3">{n.role}</div>
           <div className="flex flex-col gap-2.5">
             <div className="flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-[11px] text-[#7B8496] font-mono"><Cpu size={12} /> CPU</span>
+              <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono"><Cpu size={12} /> CPU</span>
               <GaugeBar value={n.cpu} />
             </div>
             <div className="flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-[11px] text-[#7B8496] font-mono"><MemoryStick size={12} /> Memory</span>
+              <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono"><MemoryStick size={12} /> Memory</span>
               <GaugeBar value={n.mem} />
             </div>
             {n.mounts.map((m) => (
               <div key={m.mount} className="flex items-center justify-between">
-                <span className="flex items-center gap-1.5 text-[11px] text-[#7B8496] font-mono truncate"><HardDrive size={12} /> {m.mount}</span>
+                <span className="flex items-center gap-1.5 text-[11px] text-[var(--ink-3)] font-mono truncate"><HardDrive size={12} /> {m.mount}</span>
                 <GaugeBar value={m.pct} />
               </div>
             ))}
-            <div className="flex items-center justify-between text-[11px] font-mono pt-1 border-t border-[#1B2030]">
-              <span className="text-[#7B8496]">load 1m</span><span>{n.load1}</span>
+            <div className="flex items-center justify-between text-[11px] font-mono pt-1 border-t border-[var(--n3)]">
+              <span className="text-[var(--ink-3)]">load 1m</span><span>{n.load1}</span>
             </div>
           </div>
         </Panel>
       ))}
       <Panel title="Note" className="lg:col-span-2">
-        <div className="text-[12px] text-[#7B8496] leading-relaxed">
+        <div className="text-[12px] text-[var(--ink-3)] leading-relaxed">
           One host, because this dashboard talks to one agent. A fleet view needs a backend that aggregates
           many agents — the agent's own dashboard is deliberately per-host, and SigNoz is where the fleet view lives.
         </div>
@@ -745,10 +809,10 @@ const NAV_ITEMS = NAV_GROUPS.flatMap((g) => g.items);
 
 function Sidebar({ view, setView, snap }) {
   return (
-    <div className="w-[200px] flex-shrink-0 border-r border-[#181C27] flex flex-col py-4 overflow-y-auto">
+    <div className="w-[200px] flex-shrink-0 border-r border-[var(--n2)] flex flex-col py-4 overflow-y-auto">
       {NAV_GROUPS.map((group) => (
         <nav key={group.label} className="flex flex-col gap-0.5 px-2 mb-3">
-          <div className="px-3 pb-1 text-[9.5px] font-mono uppercase tracking-widest text-[#3A4154]">{group.label}</div>
+          <div className="px-3 pb-1 text-[9.5px] font-mono uppercase tracking-widest text-[var(--ink-5)]">{group.label}</div>
           {group.items.map((item) => {
             const Icon = item.icon;
             const active = view === item.id;
@@ -756,9 +820,9 @@ function Sidebar({ view, setView, snap }) {
               <button key={item.id} onClick={() => setView(item.id)}
                 className="flex items-center gap-2.5 px-3 py-2 rounded text-[12.5px] font-mono transition-colors"
                 style={{
-                  color: active ? "#5EEBD1" : "#7B8496",
-                  background: active ? "#5EEBD114" : "transparent",
-                  borderLeft: active ? "2px solid #5EEBD1" : "2px solid transparent",
+                  color: active ? "var(--accent)" : "var(--ink-3)",
+                  background: active ? "color-mix(in srgb, var(--accent) 8%, transparent)" : "transparent",
+                  borderLeft: active ? "2px solid var(--accent)" : "2px solid transparent",
                 }}>
                 <Icon size={14} />
                 <span className="flex-1 text-left">{item.label}</span>
@@ -767,10 +831,21 @@ function Sidebar({ view, setView, snap }) {
           })}
         </nav>
       ))}
-      <div className="mt-auto px-4 pt-4 border-t border-[#181C27] mx-2">
-        <div className="text-[10px] text-[#3A4154] font-mono leading-relaxed">
+      <div className="mt-auto px-4 pt-4 border-t border-[var(--n2)] mx-2 flex flex-col gap-2">
+        <div className="text-[10px] text-[var(--ink-5)] font-mono leading-relaxed">
           agent-i {snap?.version || "—"}<br />{snap?.agent_id || "not connected"}
         </div>
+        {/* Where to point an instrumented app. Every question about this
+            ends up being "what URL do I send to", so it belongs on screen
+            rather than in a config file someone has to go and read. */}
+        <div className="text-[9.5px] text-[var(--ink-5)] font-mono leading-relaxed">
+          <div className="uppercase tracking-widest pb-0.5">send traces to</div>
+          <div className="text-[var(--ink-4)] break-all">{window.location.origin}/v1/traces</div>
+        </div>
+        <a href="/agent" target="_blank" rel="noreferrer"
+           className="text-[9.5px] font-mono text-[var(--ink-5)] hover:text-[var(--accent)] underline decoration-dotted">
+          agent's built-in page ↗
+        </a>
       </div>
     </div>
   );
@@ -781,6 +856,9 @@ export default function ObservabilityDashboard() {
   const [selected, setSelected] = useState(null);
   const [now, setNow] = useState(new Date());
   const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000);
+  // Charts need no re-render on theme change: their colours are var()
+  // references that CSS re-resolves at paint time.
+  const { theme, setTheme } = useTheme();
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
@@ -806,30 +884,31 @@ export default function ObservabilityDashboard() {
   const connected = !!snapshot && !error;
 
   return (
-    <div className="min-h-screen w-full bg-[#0B0E14] text-[#E6E9F0] font-sans flex flex-col">
-      <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#181C27]">
+    <div className="min-h-screen w-full bg-[var(--bg)] text-[var(--ink)] font-sans flex flex-col">
+      <div className="flex items-center justify-between px-5 py-3.5 border-b border-[var(--n2)]">
         <div className="flex items-center gap-3">
-          <div className="w-7 h-7 rounded bg-[#5EEBD1]/10 border border-[#5EEBD1]/30 flex items-center justify-center">
-            <Activity size={14} className="text-[#5EEBD1]" />
+          <div className="w-7 h-7 rounded bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] border border-[color-mix(in_srgb,var(--accent)_30%,transparent)] flex items-center justify-center">
+            <Activity size={14} className="text-[var(--accent)]" />
           </div>
           <div>
             <h1 className="font-mono text-sm tracking-wide">AGENT-I</h1>
-            <p className="text-[10px] text-[#7B8496] font-mono">
+            <p className="text-[10px] text-[var(--ink-3)] font-mono">
               {snapshot?.agent_id || "—"} · {now.toLocaleTimeString()}
             </p>
           </div>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-[11px] font-mono">
-            <span className="w-2 h-2 rounded-full" style={{ background: connected ? "#4ADE80" : "#F87171" }} />
-            <span style={{ color: connected ? "#7B8496" : "#F87171" }}>
+            <span className="w-2 h-2 rounded-full" style={{ background: connected ? "var(--good)" : "var(--crit)" }} />
+            <span style={{ color: connected ? "var(--ink-3)" : "var(--crit)" }}>
               {loading ? "connecting…" : connected ? "live" : `agent unreachable — ${error}`}
             </span>
           </div>
           <button onClick={() => setPaused(!paused)}
-            className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1.5 rounded bg-[#12161F] border border-[#232838] text-[#7B8496]">
+            className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1.5 rounded bg-[var(--surface)] border border-[var(--n4)] text-[var(--ink-3)]">
             {paused ? <Play size={12} /> : <Pause size={12} />}{paused ? "Resume" : "Pause"}
           </button>
+          <ThemeSwitch theme={theme} setTheme={setTheme} />
         </div>
       </div>
 
@@ -837,11 +916,19 @@ export default function ObservabilityDashboard() {
         <Sidebar view={view} setView={setView} snap={snapshot} />
 
         <div className="flex-1 min-w-0 p-5 overflow-y-auto">
-          <div className="flex items-center gap-2 text-[11px] text-[#3A4154] font-mono mb-3">
-            <span>agent-i</span><ChevronRight size={11} /><span className="text-[#7B8496]">{activeLabel}</span>
+          <div className="flex items-center gap-2 text-[11px] text-[var(--ink-5)] font-mono mb-3">
+            <span>agent-i</span><ChevronRight size={11} /><span className="text-[var(--ink-3)]">{activeLabel}</span>
           </div>
 
-          {view === "overview" && <OverviewView snap={snapshot} d={d} selected={selected} setSelected={setSelected} />}
+          {view === "overview" && (
+            <OverviewView
+              snap={snapshot}
+              d={d}
+              openService={(id) => { setSelected(id); setView("topology"); }}
+              openHost={() => setView("infra")}
+              openLogs={() => setView("logs")}
+            />
+          )}
           {view === "topology" && <TopologyView d={d} selected={selected} setSelected={setSelected} />}
           {view === "logs" && <LogsView logs={d.logs} />}
           {view === "metrics" && <MetricsView snap={snapshot} d={d} />}
@@ -864,7 +951,7 @@ export default function ObservabilityDashboard() {
               needs="an alerting rule engine" />
           )}
 
-          <div className="flex items-center gap-2 text-[10px] text-[#3A4154] font-mono mt-5">
+          <div className="flex items-center gap-2 text-[10px] text-[var(--ink-5)] font-mono mt-5">
             <Cpu size={11} />
             {connected
               ? `live from agent-i · ${d.envelopes.toLocaleString()} envelopes · ${snapshot.retain_sec}s window`
