@@ -336,14 +336,50 @@ var realFilesystemTypes = map[string]bool{
 
 // readFilesystemUsageStates parses /proc/mounts for real filesystems and
 // calls statfs(2) on each mountpoint to get used/free bytes.
+//
+// One device is reported once, under its shortest mountpoint. A filesystem can
+// appear in /proc/mounts many times — every bind mount of it is another line —
+// and statfs answers for the whole filesystem regardless of which path you ask
+// about, so those lines carry byte-for-byte identical numbers. Emitting all of
+// them multiplies the series count and, worse, makes any sum over mountpoints
+// count the same disk several times.
+//
+// This is not a hypothetical: the agent's own systemd unit causes it. PrivateTmp
+// creates /tmp and /var/tmp, and each ReadWritePaths entry creates another bind
+// mount, so a packaged agent saw its root filesystem five times while a dev run
+// or a container — with none of that hardening — saw it once. That is why no
+// test caught it.
+//
+// Shortest mountpoint wins because it is the real mount; the longer paths are
+// the binds hanging off it. Deduplicating by device rather than by the reported
+// numbers is deliberate — two filesystems that happen to be the same size are
+// still two filesystems, and must not collapse into one.
 func readFilesystemUsageStates() ([]filesystemUsageSample, error) {
-	f, err := os.Open("/proc/mounts")
+	return readFilesystemUsageStatesFrom("/proc/mounts", syscall.Statfs)
+}
+
+// readFilesystemUsageStatesFrom is the testable body: the mounts file and the
+// statfs call are both parameters. Reading /proc/mounts directly is what let
+// the duplicate-bind-mount bug ship — the behaviour could only be observed on
+// a host whose mount table already had the problem, which no test environment
+// did.
+func readFilesystemUsageStatesFrom(mountsPath string, statfs func(string, *syscall.Statfs_t) error) ([]filesystemUsageSample, error) {
+	f, err := os.Open(mountsPath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	var samples []filesystemUsageSample
+	type mount struct {
+		mountpoint string
+		fstype     string
+		used, free float64
+	}
+	// Insertion order is kept separately: ranging a map would reorder the
+	// output on every collection, which fragments series keys downstream.
+	byDevice := make(map[string]mount)
+	var order []string
+
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -355,8 +391,12 @@ func readFilesystemUsageStates() ([]filesystemUsageSample, error) {
 			continue
 		}
 
+		if prev, seen := byDevice[device]; seen && len(prev.mountpoint) <= len(mountpoint) {
+			continue // already have this filesystem under an equal or shorter path
+		}
+
 		var stat syscall.Statfs_t
-		if err := syscall.Statfs(mountpoint, &stat); err != nil {
+		if err := statfs(mountpoint, &stat); err != nil {
 			continue // transient mounts, permission issues — skip rather than fail the whole sample
 		}
 		blockSize := float64(stat.Bsize)
@@ -367,9 +407,18 @@ func readFilesystemUsageStates() ([]filesystemUsageSample, error) {
 			used = 0
 		}
 
+		if _, seen := byDevice[device]; !seen {
+			order = append(order, device)
+		}
+		byDevice[device] = mount{mountpoint: mountpoint, fstype: fstype, used: used, free: free}
+	}
+
+	samples := make([]filesystemUsageSample, 0, len(order)*2)
+	for _, device := range order {
+		m := byDevice[device]
 		samples = append(samples,
-			filesystemUsageSample{mountpoint: mountpoint, device: device, fstype: fstype, state: "used", bytes: used},
-			filesystemUsageSample{mountpoint: mountpoint, device: device, fstype: fstype, state: "free", bytes: free},
+			filesystemUsageSample{mountpoint: m.mountpoint, device: device, fstype: m.fstype, state: "used", bytes: m.used},
+			filesystemUsageSample{mountpoint: m.mountpoint, device: device, fstype: m.fstype, state: "free", bytes: m.free},
 		)
 	}
 	return samples, nil

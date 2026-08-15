@@ -2,7 +2,11 @@ package collector
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -116,6 +120,113 @@ func TestReadNetworkPacketStates_RealProcNetDev(t *testing.T) {
 	}
 	if !foundLo["transmit"] || !foundLo["receive"] {
 		t.Errorf("expected both directions for loopback, got: %+v", foundLo)
+	}
+}
+
+// The exact mount table a packaged agent sees: its own systemd unit adds
+// PrivateTmp (/tmp, /var/tmp) and a bind mount per ReadWritePaths entry, all of
+// them the same /dev/root. statfs answers for the whole filesystem whichever
+// path you ask about, so every one of those lines carries identical bytes.
+// Emitting them all made a sum over mountpoints report five times the real disk.
+func TestReadFilesystemUsageStates_DeduplicatesBindMounts(t *testing.T) {
+	mounts := `proc /proc proc rw,nosuid 0 0
+/dev/root / ext4 rw,relatime 0 0
+tmpfs /run tmpfs rw,nosuid 0 0
+/dev/nvme0n1p16 /boot ext4 rw,relatime 0 0
+/dev/nvme0n1p15 /boot/efi vfat rw,relatime 0 0
+/dev/root /tmp ext4 rw,relatime 0 0
+/dev/root /var/tmp ext4 rw,relatime 0 0
+/dev/root /var/lib/agent-i ext4 rw,relatime 0 0
+/dev/root /var/log/agent-i ext4 rw,relatime 0 0
+`
+	path := filepath.Join(t.TempDir(), "mounts")
+	if err := os.WriteFile(path, []byte(mounts), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Distinct sizes per device so a collapse of two *different* filesystems
+	// would be caught, not just the duplicates.
+	sizes := map[string]int64{"/": 1000, "/boot": 200, "/boot/efi": 50}
+	statfs := func(mountpoint string, st *syscall.Statfs_t) error {
+		blocks, ok := sizes[mountpoint]
+		if !ok {
+			// A bind mount of / — statfs reports the underlying filesystem.
+			blocks = sizes["/"]
+		}
+		st.Bsize = 4096
+		st.Blocks = uint64(blocks)
+		st.Bfree = uint64(blocks / 4)
+		st.Bavail = uint64(blocks / 4)
+		return nil
+	}
+
+	samples, err := readFilesystemUsageStatesFrom(path, statfs)
+	if err != nil {
+		t.Fatalf("readFilesystemUsageStatesFrom: %v", err)
+	}
+
+	byDevice := map[string]map[string]bool{}
+	for _, s := range samples {
+		if byDevice[s.device] == nil {
+			byDevice[s.device] = map[string]bool{}
+		}
+		byDevice[s.device][s.mountpoint] = true
+	}
+
+	if len(byDevice) != 3 {
+		t.Errorf("expected 3 devices (root, boot, efi), got %d: %+v", len(byDevice), byDevice)
+	}
+	if got := byDevice["/dev/root"]; len(got) != 1 || !got["/"] {
+		t.Errorf("/dev/root should appear once, under its shortest mountpoint /, got %+v", got)
+	}
+	// Two states per device and no more — the whole point is the count.
+	if len(samples) != 6 {
+		t.Errorf("expected 6 samples (3 devices x used/free), got %d", len(samples))
+	}
+
+	// The virtual filesystems must still be excluded by the fstype allowlist.
+	for _, s := range samples {
+		if s.fstype == "proc" || s.fstype == "tmpfs" {
+			t.Errorf("virtual filesystem leaked into output: %+v", s)
+		}
+	}
+}
+
+// Order must be stable across collections. Ranging a map to emit results would
+// reorder the output every time, which fragments a series downstream into a
+// different key on each sample.
+func TestReadFilesystemUsageStates_StableOrder(t *testing.T) {
+	mounts := "/dev/sdc /c ext4 rw 0 0\n/dev/sda /a ext4 rw 0 0\n/dev/sdb /b ext4 rw 0 0\n"
+	path := filepath.Join(t.TempDir(), "mounts")
+	if err := os.WriteFile(path, []byte(mounts), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statfs := func(_ string, st *syscall.Statfs_t) error {
+		st.Bsize, st.Blocks, st.Bfree, st.Bavail = 4096, 100, 25, 25
+		return nil
+	}
+
+	var first []string
+	for i := 0; i < 8; i++ {
+		samples, err := readFilesystemUsageStatesFrom(path, statfs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, s := range samples {
+			got = append(got, s.device+":"+s.state)
+		}
+		if i == 0 {
+			first = got
+			continue
+		}
+		if !reflect.DeepEqual(first, got) {
+			t.Fatalf("order changed between collections:\n  first: %v\n  now:   %v", first, got)
+		}
+	}
+	// Mount-table order, not sorted — /dev/sdc was listed first.
+	if first[0] != "/dev/sdc:used" {
+		t.Errorf("expected mount-table order preserved, got %v", first)
 	}
 }
 
