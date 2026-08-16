@@ -33,6 +33,23 @@ endpoint deliberately sends no CORS headers — it is an unauthenticated
 loopback debug surface, and permissive CORS would let any page you happen to
 visit read this host's metrics, logs and trace contents.
 
+## Pointing it at a remote host
+
+The dashboard binds loopback on the agent's side for the same reason, so reach
+a remote agent through an SSH forward rather than by rebinding it:
+
+```bash
+scripts/dev-tunnel.sh -i ~/.ssh/key.pem ubuntu@203.0.113.10
+AGENT_I_URL=http://127.0.0.1:8089 npm run dev
+```
+
+The script reconnects on drop. A plain `ssh -N` forward has no keepalive, so an
+idle connection gets dropped and stays dead — and the UI then shows "agent not
+reachable" until someone notices. When that does happen, the error names the
+layer that failed: a proxy that cannot reach its upstream is reported as such,
+never as an error from the agent, which returns 200 on this endpoint or
+nothing at all.
+
 ## What is live and what is not
 
 Everything is derived client-side in `src/adapters.js` from the raw snapshot.

@@ -7,3 +7,6 @@ agent-i-linux-*
 # Local development configs (e.g. running the dashboard against a container).
 # The committed default lives at configs/agent.yaml.
 configs/agent.local.yaml
+
+# Local dev tunnel with machine-specific key path and host; use scripts/dev-tunnel.sh instead.
+tunnel.sh
