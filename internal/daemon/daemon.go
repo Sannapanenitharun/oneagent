@@ -21,6 +21,17 @@ import (
 	"github.com/agent-i/agent/internal/version"
 )
 
+// apiTokenEnv names the environment variable holding an optional bearer token
+// for the agent's two listeners. It is a fixed name rather than one named by
+// the config, so auth can be switched on by setting one variable in
+// /etc/agent-i/env and restarting — no config edit, no redeploy, and nothing
+// new on disk. The secret still never appears in the config file, which is the
+// rule that matters.
+//
+// Unset means no authentication, which is the historical behaviour on both
+// listeners and remains the default.
+const apiTokenEnv = "AGENT_I_API_TOKEN"
+
 type Daemon struct {
 	cfg        *config.Config
 	collectors []collector.Collector
@@ -98,11 +109,19 @@ func New(cfg *config.Config) (*Daemon, error) {
 		collectors = append(collectors, collector.NewAccessLogCollector(cfg.AgentID, cfg.AccessLogs.Paths, format, fields, tailOpts))
 	}
 	if cfg.Traces.Enabled {
+		// traces.auth_token_env wins when it is set and non-empty, so a host
+		// that already configured a receiver-specific token keeps exactly the
+		// token it had. AGENT_I_API_TOKEN is only a fallback, which is what
+		// lets one variable cover both listeners without a config edit.
+		traceToken := os.Getenv(cfg.Traces.AuthTokenEnv) // empty env name yields ""
+		if traceToken == "" {
+			traceToken = os.Getenv(apiTokenEnv)
+		}
 		collectors = append(collectors, collector.NewOTLPTraceReceiverCollector(
 			cfg.AgentID,
 			cfg.Traces.ListenAddr,
 			cfg.Traces.MaxRequestBytes,
-			os.Getenv(cfg.Traces.AuthTokenEnv), // empty env name yields "", i.e. no auth
+			traceToken,
 		))
 	}
 
@@ -161,7 +180,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 		// startup error the operator sees immediately, alongside every other
 		// configuration failure, instead of a log line after the agent has
 		// already reported itself healthy.
-		srv, err := dashboard.NewServer(cfg.Dashboard.ListenAddr, d.dash)
+		srv, err := dashboard.NewServer(cfg.Dashboard.ListenAddr, d.dash, os.Getenv(apiTokenEnv))
 		if err != nil {
 			return nil, err
 		}

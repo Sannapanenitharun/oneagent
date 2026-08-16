@@ -79,6 +79,11 @@ aggregation:
 # should not silently start listening on a new port. It is on here, so
 # fresh installs get it; add this block to an existing
 # /etc/agent-i/agent.yaml to switch it on there.
+# Optional bearer auth for BOTH listeners (this one and traces below) is
+# enabled by setting AGENT_I_API_TOKEN in /etc/agent-i/env and restarting.
+# There is no setting for it here on purpose: the token is a secret, and
+# secrets never live in this file. Unset means no authentication, which is
+# the default and is why both listeners bind loopback.
 dashboard:
   enabled: true
   # Loopback deliberately: this endpoint has no authentication and exposes

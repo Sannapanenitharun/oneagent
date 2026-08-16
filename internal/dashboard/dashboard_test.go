@@ -290,7 +290,7 @@ func TestServer_ServesIndexAndSnapshot(t *testing.T) {
 	st.Record(metric("system.cpu.time", 7, time.Now().UTC(), map[string]string{"state": "idle"}))
 
 	// Port 0 lets the OS choose, so the test never collides with a real agent.
-	srv, err := NewServer("127.0.0.1:0", st)
+	srv, err := NewServer("127.0.0.1:0", st, "")
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -353,5 +353,113 @@ func TestIsLoopbackAddr(t *testing.T) {
 		if got := isLoopbackAddr(addr); got != want {
 			t.Errorf("isLoopbackAddr(%q) = %t, want %t", addr, got, want)
 		}
+	}
+}
+
+// The default path must be exactly what it always was. Not "auth that happens
+// to allow everything" — no auth layer at all, no Authorization header read,
+// no 401 reachable.
+func TestServer_NoTokenConfiguredMeansNoAuth(t *testing.T) {
+	st := NewStore("host-001", "v1", time.Minute, 100)
+	srv, err := NewServer("127.0.0.1:0", st, "")
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go srv.Serve()
+	defer srv.Close()
+	base := "http://" + srv.Addr()
+
+	for _, path := range []string{"/", "/api/snapshot", "/healthz"} {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Errorf("GET %s = %d, want 200 with no token configured", path, resp.StatusCode)
+		}
+	}
+
+	// A bogus credential must not matter either — nothing is inspecting it.
+	req, _ := http.NewRequest("GET", base+"/api/snapshot", nil)
+	req.Header.Set("Authorization", "Bearer nonsense")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET with bogus token: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("a stray Authorization header changed the response: got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_TokenConfiguredRequiresBearer(t *testing.T) {
+	const token = "s3cret-token"
+	st := NewStore("host-001", "v1", time.Minute, 100)
+	st.Record(metric("m", 1, time.Now().UTC(), nil))
+	srv, err := NewServer("127.0.0.1:0", st, token)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go srv.Serve()
+	defer srv.Close()
+	base := "http://" + srv.Addr()
+
+	do := func(t *testing.T, path, auth string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest("GET", base+path, nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		return resp
+	}
+
+	// Every way of getting it wrong.
+	for name, auth := range map[string]string{
+		"no header":             "",
+		"wrong token":           "Bearer wrong-token",
+		"missing Bearer prefix": token,
+		"wrong scheme":          "Basic " + token,
+		"empty bearer":          "Bearer ",
+		// A prefix of the real token must fail: ConstantTimeCompare returns 0
+		// on a length mismatch, which is the property being relied on.
+		"token prefix": "Bearer s3cret",
+	} {
+		for _, path := range []string{"/", "/api/snapshot"} {
+			resp := do(t, path, auth)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("%s: GET %s = %d, want 401", name, path, resp.StatusCode)
+			}
+			if resp.Header.Get("WWW-Authenticate") == "" {
+				t.Errorf("%s: 401 without a WWW-Authenticate header", name)
+			}
+		}
+	}
+
+	// The correct token still serves real data.
+	resp := do(t, "/api/snapshot", "Bearer "+token)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET /api/snapshot with the right token = %d, want 200", resp.StatusCode)
+	}
+	var snap Snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+		t.Fatalf("decoding snapshot: %v", err)
+	}
+	if len(snap.Series) != 1 {
+		t.Errorf("authenticated snapshot should carry the recorded series, got %+v", snap.Series)
+	}
+
+	// Liveness must stay reachable without a credential, or protecting the
+	// dashboard silently breaks every probe pointed at it.
+	hz := do(t, "/healthz", "")
+	hz.Body.Close()
+	if hz.StatusCode != 200 {
+		t.Errorf("GET /healthz = %d with a token configured, want 200 (deliberately unguarded)", hz.StatusCode)
 	}
 }

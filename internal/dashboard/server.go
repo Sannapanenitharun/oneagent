@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -25,12 +26,19 @@ type Server struct {
 	srv   *http.Server
 	ln    net.Listener
 	addr  string
+	// authToken is empty unless the operator sets one, and empty means no
+	// authentication at all — the historical behaviour, unchanged.
+	authToken string
 }
 
 // NewServer binds the listener immediately so a port conflict is reported
 // at startup, next to the rest of the agent's initialization, rather than
 // silently in a goroutine after Run has already reported success.
-func NewServer(addr string, store *Store) (*Server, error) {
+//
+// authToken is optional. When empty the handlers are registered exactly as
+// they always were, with no auth layer in the request path at all; when set,
+// the data-bearing routes require "Authorization: Bearer <token>".
+func NewServer(addr string, store *Store, authToken string) (*Server, error) {
 	if addr == "" {
 		addr = "127.0.0.1:8088"
 	}
@@ -40,16 +48,25 @@ func NewServer(addr string, store *Store) (*Server, error) {
 	}
 	if !isLoopbackAddr(addr) {
 		// Deliberately a warning, not an error: binding elsewhere is a
-		// legitimate choice on a trusted network. But the dashboard has no
-		// authentication, so exposing it off loopback publishes this host's
-		// metrics, logs and traces to anything that can reach the port.
-		log.Printf("dashboard: WARNING listening on %s, which is not loopback — this endpoint is unauthenticated", addr)
+		// legitimate choice on a trusted network. Off loopback the endpoint
+		// publishes this host's metrics, logs and traces to anything that can
+		// reach the port — unless a token is set, which is the one thing that
+		// makes that binding defensible.
+		if authToken == "" {
+			log.Printf("dashboard: WARNING listening on %s, which is not loopback — this endpoint is unauthenticated", addr)
+		} else {
+			log.Printf("dashboard: listening on %s (not loopback) with bearer auth required", addr)
+		}
 	}
 
-	s := &Server{store: store, ln: ln, addr: addr}
+	s := &Server{store: store, ln: ln, addr: addr, authToken: authToken}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/api/snapshot", s.handleSnapshot)
+	mux.HandleFunc("/", s.guard(s.handleIndex))
+	mux.HandleFunc("/api/snapshot", s.guard(s.handleSnapshot))
+	// Deliberately NOT guarded. It returns the literal string "ok" and no host
+	// data, and it is what liveness probes and the UI's own connection check
+	// call — requiring a credential here would break monitoring to protect
+	// nothing.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
@@ -79,6 +96,41 @@ func (s *Server) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.srv.Shutdown(ctx)
+}
+
+// guard applies the optional bearer check.
+//
+// When no token is configured it returns the handler itself — not a wrapper
+// that always passes. That keeps the default path byte-for-byte what it was:
+// no extra frame, no header read, nothing to get wrong on the request path
+// every 5 seconds.
+func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
+	if s.authToken == "" {
+		return h
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="agent-i"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// authorized mirrors the OTLP receiver's check so both listeners behave the
+// same way. Constant-time comparison: a caller must not be able to recover the
+// token by measuring how long a rejection takes.
+func (s *Server) authorized(r *http.Request) bool {
+	if s.authToken == "" {
+		return true
+	}
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, prefix) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(h, prefix)), []byte(s.authToken)) == 1
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {

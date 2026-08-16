@@ -147,6 +147,8 @@ if [[ ! -f /etc/agent-i/env ]]; then
 # config references them by variable name only.
 #
 # Examples — uncomment and fill in the ones you need:
+# AGENT_I_API_TOKEN=            # if set, the dashboard API and OTLP receiver require
+#                               # 'Authorization: Bearer <token>'. Unset means no auth.
 # OTLP_INGESTION_KEY=
 # AGENT_I_TRACE_TOKEN=
 # AWS_ACCESS_KEY_ID=
