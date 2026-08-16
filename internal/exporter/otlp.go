@@ -19,12 +19,12 @@ import (
 	"github.com/agent-i/agent/internal/version"
 )
 
-// This file exists because SigNoz (and any other OTLP-native backend)
-// does NOT understand our internal Envelope JSON — it speaks OTLP, which
+// This file exists because an OTLP-native backend does NOT understand our
+// internal Envelope JSON — it speaks OTLP, which
 // has three distinct wire shapes (metrics/traces/logs), each with its own
 // endpoint (/v1/metrics, /v1/traces, /v1/logs) and schema. The plain
 // httpExporter in exporter.go sends our own format and would arrive at
-// SigNoz as bytes it can't parse. This exporter does the real conversion:
+// the backend as bytes it can't parse. This exporter does the real conversion:
 // one Envelope in, the correct OTLP shape out, routed to the matching
 // endpoint. Uses OTLP's JSON encoding (see traces.go's receiver-side
 // notes on why JSON rather than binary protobuf — same dependency
@@ -81,8 +81,8 @@ type otlpGauge struct {
 
 // otlpSum is required for system.cpu.time specifically — OTel defines it
 // as a monotonic cumulative counter (seconds spent in each CPU state
-// since boot), not a point-in-time value, and SigNoz's Infrastructure
-// page specifically checks for this metric in Sum form. Sending it as a
+// since boot), not a point-in-time value, and a backend's host-inventory
+// view looks for this metric in Sum form. Sending it as a
 // Gauge would be structurally wrong, not just a labeling difference.
 type otlpSum struct {
 	DataPoints             []otlpNumberDataPoint `json:"dataPoints"`
@@ -288,7 +288,7 @@ func (o *otlpHTTPExporter) hostName() string {
 // identity when re-exporting, or every distinct app on a host collapses
 // into one indistinguishable stream in the backend (this was a real bug,
 // caught from a live host: production spans from an app called
-// certi-backend were showing up in SigNoz labeled service.name=host-001,
+// certi-backend were showing up in the backend labeled service.name=host-001,
 // the agent's own ID, instead of the app that actually produced them).
 // Envelopes Agent-I generates itself (host metrics, tailed logs) carry
 // no such label, so those correctly fall back to the agent's identity.
@@ -306,7 +306,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	attrs := []otlpKeyValue{
 		stringAttr("service.name", serviceName),
 		stringAttr("host.name", o.hostName()),
-		// os.type is what SigNoz's Infrastructure Monitoring > Hosts page
+		// os.type is what a backend's host-inventory view
 		// reads to populate its "OS Type" filter. Without it every host
 		// this agent reports lands in an unnamed, unselectable bucket in
 		// that facet. runtime.GOOS already spells the OTel-defined values
@@ -324,7 +324,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 		stringAttr("telemetry.distro.name", "agent-i"),
 		stringAttr("telemetry.distro.version", version.Version),
 	}
-	// host.id is recommended (not required) by SigNoz's Infrastructure
+	// host.id is recommended (not required) by the OTel host resource
 	// Monitoring as a fallback identifier when hostnames collide (cloned
 	// VMs, ephemeral instances reusing a name) — included when available,
 	// omitted rather than faked when it isn't.
@@ -507,7 +507,7 @@ func (o *otlpHTTPExporter) sendLogs(envs []collector.Envelope) error {
 		if body == "" && e.Kind == collector.KindAPICall {
 			// api_call envelopes carry structured fields in Labels/Value
 			// rather than a Message — build a readable summary line so
-			// the log still shows something meaningful in SigNoz's log
+			// the log still shows something meaningful in the backend's log
 			// view, with the structured data available as attributes.
 			body = fmt.Sprintf("%s %s -> %s (%.1fms)", e.Labels["method"], e.Labels["path"], e.Labels["status"], e.Value)
 		}

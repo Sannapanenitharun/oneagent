@@ -74,7 +74,7 @@ func TestReadMemoryUsageStates_RealProcMeminfo(t *testing.T) {
 // TestInfraHostMetricsCollector_EndToEnd runs the actual collector for
 // real and confirms it emits both system.cpu.time (8 states) and
 // system.memory.usage (4 states) envelopes with the correct Source names
-// and Labels — the same shape SigNoz's Infrastructure page requires.
+// and Labels — the same shape a host-inventory view requires.
 func TestReadNetworkIOStates_RealProcNetDev(t *testing.T) {
 	samples, err := readNetworkIOStates()
 	if err != nil {

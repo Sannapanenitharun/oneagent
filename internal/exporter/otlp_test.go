@@ -164,9 +164,9 @@ func TestOTLPHTTPExporter_MetricsShapeAndEndpoint(t *testing.T) {
 	}
 	if len(rm.Resource.Attributes) < 2 || rm.Resource.Attributes[1].Key != "host.name" ||
 		rm.Resource.Attributes[1].Value.StringValue == nil || *rm.Resource.Attributes[1].Value.StringValue != "host-001" {
-		t.Errorf("resource host.name not set — SigNoz's Infrastructure/Hosts page needs this or it falls back to reverse-DNS: %+v", rm.Resource.Attributes)
+		t.Errorf("resource host.name not set — a backend's host-inventory view needs this or it falls back to reverse-DNS: %+v", rm.Resource.Attributes)
 	}
-	// os.type populates SigNoz's "OS Type" facet on the Hosts page; without
+	// os.type populates a backend's "OS Type" facet on its hosts view; without
 	// it hosts appear under a blank, unselectable filter entry. The distro
 	// pair identifies which build shipped the data, so a host running a
 	// stale binary is visible from the backend rather than only by SSHing
@@ -178,7 +178,7 @@ func TestOTLPHTTPExporter_MetricsShapeAndEndpoint(t *testing.T) {
 		}
 	}
 	if resAttrs["os.type"] != runtime.GOOS {
-		t.Errorf("resource os.type = %q, want %q — SigNoz's OS Type filter reads this", resAttrs["os.type"], runtime.GOOS)
+		t.Errorf("resource os.type = %q, want %q — the OS Type filter reads this", resAttrs["os.type"], runtime.GOOS)
 	}
 	if resAttrs["telemetry.distro.name"] != "agent-i" {
 		t.Errorf("resource telemetry.distro.name = %q, want agent-i", resAttrs["telemetry.distro.name"])
@@ -349,9 +349,9 @@ func TestOTLPHTTPExporter_TracesPreserveOriginServiceName(t *testing.T) {
 }
 
 func TestOTLPHTTPExporter_SystemCPUTimeUsesSumType(t *testing.T) {
-	// Regression/requirement test: SigNoz's Infrastructure Monitoring page
+	// Regression/requirement test: a backend's host-inventory view
 	// specifically requires system.cpu.time as a Sum (cumulative counter)
-	// metric, not a Gauge — confirmed against SigNoz's own docs. This
+	// metric, not a Gauge — per the OTel hostmetrics receiver spec. This
 	// verifies the actual JSON shape sent matches that requirement.
 	var got otlpMetricsRequest
 
@@ -386,7 +386,7 @@ func TestOTLPHTTPExporter_SystemCPUTimeUsesSumType(t *testing.T) {
 		t.Error("system.cpu.time was sent as Gauge — must be Sum")
 	}
 	if metric.Sum == nil {
-		t.Fatal("system.cpu.time has no Sum field — SigNoz's Infrastructure page requires this metric as a Sum")
+		t.Fatal("system.cpu.time has no Sum field — a host-inventory view requires this metric as a Sum")
 	}
 	if !metric.Sum.IsMonotonic {
 		t.Error("Sum.IsMonotonic = false, want true (cumulative counters only increase)")
@@ -536,7 +536,7 @@ func TestOTLPHTTPExporter_MixedKindsRouteToCorrectEndpoints(t *testing.T) {
 func TestOTLPHTTPExporter_SendsCustomHeaders(t *testing.T) {
 	var gotAuthHeader string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuthHeader = r.Header.Get("signoz-ingestion-key")
+		gotAuthHeader = r.Header.Get("x-ingestion-key")
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -547,7 +547,7 @@ func TestOTLPHTTPExporter_SendsCustomHeaders(t *testing.T) {
 		BatchSize:     1,
 		FlushInterval: time.Hour,
 		MaxRetries:    1,
-		Headers:       map[string]string{"signoz-ingestion-key": "secret-test-key"},
+		Headers:       map[string]string{"x-ingestion-key": "secret-test-key"},
 	})
 	if err != nil {
 		t.Fatalf("newOTLPHTTPExporter: %v", err)

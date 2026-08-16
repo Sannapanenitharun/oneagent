@@ -58,9 +58,9 @@ func New(cfg *config.Config) (*Daemon, error) {
 		// Additive, not a replacement — emits the standard OTel
 		// hostmetrics names (system.cpu.time, system.memory.usage)
 		// alongside our own host.cpu.used_pct/host.memory.used_pct.
-		// Required specifically for SigNoz's Infrastructure Monitoring
+		// Required for a backend's host-inventory view
 		// > Hosts page to recognize this host at all (confirmed against
-		// SigNoz's own docs — see infra_hostmetrics.go).
+		// the OTel hostmetrics receiver spec — see infra_hostmetrics.go).
 		collectors = append(collectors, collector.NewInfraHostMetricsCollector(cfg.AgentID, cfg.Interval))
 	}
 	// Every file-tailing collector shares one offset registry. Two registries

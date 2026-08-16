@@ -34,7 +34,7 @@ func readGzipBody(t *testing.T, r *http.Request) []byte {
 // The parent link has to reach the backend as a first-class OTLP field, not
 // merely as a span attribute — a backend reconstructs the call tree from
 // parentSpanId and ignores attributes for that purpose. Sending it only as an
-// attribute would leave SigNoz rendering a flat span list, which is what the
+// attribute would leave a backend rendering a flat span list, which is what the
 // agent was doing before.
 func TestOTLPHTTPExporter_SetsParentSpanIDField(t *testing.T) {
 	var got otlpTracesRequest

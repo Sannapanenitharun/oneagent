@@ -21,11 +21,11 @@ import (
 // since boot, not a point-in-time percentage, so it isn't a drop-in
 // substitute.
 //
-// This exists specifically because SigNoz's Infrastructure Monitoring
-// > Hosts page requires this exact schema to populate at all — confirmed
-// against SigNoz's own docs (signoz.io/docs/infrastructure-monitoring/
-// reference/telemetry-data-requirements/), not guessed. Our own
-// custom-named metrics, however correct, don't satisfy it.
+// This exists because a backend's host-inventory view matches on the
+// hostmetrics receiver's exact metric names, types and attributes, and
+// populates only when it finds them — confirmed against a backend's
+// documented data requirements, not guessed. Our own custom-named
+// metrics, however correct, don't satisfy that match.
 type InfraHostMetricsCollector struct {
 	agentID  string
 	interval time.Duration

@@ -70,7 +70,7 @@ aggregation:
 # A local web view of what this agent is collecting right now, served from
 # memory on loopback. Nothing is sent anywhere and no backend is involved —
 # it answers "is the agent actually collecting?" on the host, without
-# waiting for data to surface in SigNoz.
+# waiting for data to surface in a remote backend.
 #
 # Open http://127.0.0.1:8088 on the host (or forward it:
 # `ssh -N -L 8088:127.0.0.1:8088 user@host` and open it locally).
@@ -160,11 +160,11 @@ cloud:
   #   client_secret_env: "AZURE_CLIENT_SECRET"
 
 exporter:
-  type: "stdout"   # "stdout" | "file" | "http" (our own JSON format) | "otlp_http" (real OTLP — use this for SigNoz or any OTLP-native backend)
+  type: "stdout"   # "stdout" | "file" | "http" (our own JSON format) | "otlp_http" (real OTLP — use this for any OTLP-native backend)
   # path: "/var/log/agent-i/export.jsonl"                    # file exporter
   # endpoint: "http://169.58.93.233:4318"                           # otlp_http: base URL of the OTLP receiver — no trailing /v1/... path, that's added automatically per signal type
   # headers_env:                                                    # otlp_http/http: header name -> env var holding its value (never put the key directly in this file)
-  #   signoz-ingestion-key: "SIGNOZ_INGESTION_KEY"
+  #   x-ingestion-key: "OTLP_INGESTION_KEY"
   # batch_size: 100          # envelopes per POST before a size-triggered flush
   # flush_interval: 5s       # max time a partial batch waits before flushing
   # max_retries: 3           # retries on 5xx/network error; 4xx responses are never retried

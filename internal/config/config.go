@@ -225,13 +225,14 @@ type AWSCloudConfig struct {
 type ExporterConfig struct {
 	// "stdout" for local dev, "file" to append JSONL, "http" to push our
 	// own JSON envelope format, "otlp_http" to push real OTLP (metrics/
-	// traces/logs) to an OTLP-native backend like SigNoz
+	// traces/logs) to an OTLP-native backend
 	Type     string `yaml:"type"`
 	Path     string `yaml:"path"`
 	Endpoint string `yaml:"endpoint"`
 
 	// Headers are sent on every request from the http/otlp_http
-	// exporters — e.g. an ingestion API key (SigNoz Cloud: "signoz-ingestion-key").
+	// exporters — e.g. an ingestion API key, whose header name is whatever
+	// your backend documents.
 	// SECURITY: same rule as cloud provider credentials — put the actual
 	// key in an environment variable and reference it via headers_env
 	// below, not directly in this YAML file.

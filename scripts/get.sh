@@ -147,7 +147,7 @@ if [[ ! -f /etc/agent-i/env ]]; then
 # config references them by variable name only.
 #
 # Examples — uncomment and fill in the ones you need:
-# SIGNOZ_INGESTION_KEY=
+# OTLP_INGESTION_KEY=
 # AGENT_I_TRACE_TOKEN=
 # AWS_ACCESS_KEY_ID=
 # AWS_SECRET_ACCESS_KEY=
