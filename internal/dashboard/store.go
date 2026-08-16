@@ -72,13 +72,37 @@ type Span struct {
 }
 
 // Snapshot is the whole view, as served to the browser.
+// AdapterContract identifies the derivation semantics this payload is built
+// for: which fields exist, what they mean, and what a consumer is expected to
+// compute from them rather than read.
+//
+// The agent computes none of that. Percentiles, health thresholds, counter
+// rates and severity are all derived client-side in frontend/src/adapters.js,
+// deliberately, so changing one costs a page reload instead of a redeploy to
+// every host. That leaves a gap for any second consumer of this API: it
+// receives raw series and has no way to know which set of conventions the
+// numbers follow.
+//
+// This is the agent's half of that answer, and it is the only half the agent
+// can honestly give. It cannot report the version of a browser-side library it
+// has never loaded — that value would have to be hardcoded here and would drift
+// the first time only one side changed. So this versions the CONTRACT, and
+// adapters.js declares which contract it implements. A mismatch is the signal.
+//
+// Bump this when the payload's shape or the meaning of a field changes, not
+// when a threshold is retuned — a retuned threshold is exactly the kind of
+// change the client-side split exists to make cheap.
+const AdapterContract = "1"
+
 type Snapshot struct {
-	AgentID   string            `json:"agent_id"`
-	Version   string            `json:"version"`
-	StartedAt int64             `json:"started_at"`
-	Now       int64             `json:"now"`
-	RetainSec int               `json:"retain_sec"`
-	Counts    map[string]uint64 `json:"counts"`
+	AgentID string `json:"agent_id"`
+	Version string `json:"version"`
+	// AdapterContract is informational. Nothing in the agent branches on it.
+	AdapterContract string            `json:"adapter_contract"`
+	StartedAt       int64             `json:"started_at"`
+	Now             int64             `json:"now"`
+	RetainSec       int               `json:"retain_sec"`
+	Counts          map[string]uint64 `json:"counts"`
 	// SeriesDropped counts distinct series refused because the cap was
 	// already reached. A non-zero value here means the view is incomplete,
 	// and the UI says so rather than quietly showing a subset.
@@ -270,14 +294,15 @@ func (s *Store) Snapshot() Snapshot {
 	s.prune(now)
 
 	out := Snapshot{
-		AgentID:       s.agentID,
-		Version:       s.version,
-		StartedAt:     s.startedAt.UnixMilli(),
-		Now:           now.UnixMilli(),
-		RetainSec:     int(s.retain / time.Second),
-		Counts:        make(map[string]uint64, len(s.counts)),
-		SeriesDropped: s.dropped,
-		Series:        make([]Series, 0, len(s.series)),
+		AgentID:         s.agentID,
+		Version:         s.version,
+		AdapterContract: AdapterContract,
+		StartedAt:       s.startedAt.UnixMilli(),
+		Now:             now.UnixMilli(),
+		RetainSec:       int(s.retain / time.Second),
+		Counts:          make(map[string]uint64, len(s.counts)),
+		SeriesDropped:   s.dropped,
+		Series:          make([]Series, 0, len(s.series)),
 		// make, not append to a nil slice: appending nothing to nil yields nil,
 		// which marshals as JSON null rather than []. Series was already built
 		// with make and so always encoded as an array, leaving the payload

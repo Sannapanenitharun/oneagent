@@ -14,7 +14,7 @@ import {
   deriveInfra, deriveAllSeries, deriveLogs, deriveTraffic,
   globalStats, toRate, fmtRps,
   alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
-  parseLogBody, flattenFields,
+  parseLogBody, flattenFields, ADAPTER_VERSION, CONTRACT, contractMatches,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -160,6 +160,24 @@ console.log("log body parsing");
   check("raw timestamp retained", l.tms === T0);
   check("labels retained", l.labels.host === "test-1");
   check("structured body attached", l.structured.value.msg === "boom");
+}
+
+console.log("adapter versioning + severity provenance");
+check("adapter version is a non-empty string", typeof ADAPTER_VERSION === "string" && ADAPTER_VERSION.length > 0);
+check("contract is a non-empty string", typeof CONTRACT === "string" && CONTRACT.length > 0);
+check("matching contract accepted", contractMatches({ adapter_contract: CONTRACT }));
+// An agent older than the field is readable, just unlabelled — refusing it
+// would break the UI against every agent that has not been upgraded yet.
+check("absent contract is tolerated", contractMatches({}) && contractMatches(null));
+check("mismatched contract is reported", !contractMatches({ adapter_contract: "999" }));
+{
+  const logs = deriveLogs(SNAP);
+  check("every log line carries its severity provenance",
+    logs.length > 0 && logs.every((l) => l.lvlSource === `client:${ADAPTER_VERSION}`));
+  // Item 5 is metadata only: the classification itself must be untouched.
+  check("classification unchanged — ERROR still ERROR",
+    logs.find((l) => l.msg.includes("503")).lvl === "ERROR");
+  check("classification unchanged — lowercase warning still WARN", logs[0].lvl === "WARN");
 }
 
 console.log("host metric panels");

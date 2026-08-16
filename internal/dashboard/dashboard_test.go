@@ -463,3 +463,44 @@ func TestServer_TokenConfiguredRequiresBearer(t *testing.T) {
 		t.Errorf("GET /healthz = %d with a token configured, want 200 (deliberately unguarded)", hz.StatusCode)
 	}
 }
+
+// The payload declares which derivation contract it is built for, so a second
+// consumer of this API knows what conventions the raw numbers follow. The agent
+// computes none of those numbers — it cannot, since percentiles and thresholds
+// live client-side on purpose — so this is the only half of that answer the
+// agent can honestly give.
+func TestSnapshot_DeclaresTheAdapterContract(t *testing.T) {
+	s := NewStore("host-001", "v2.0.1", time.Minute, 100)
+	snap := s.Snapshot()
+
+	if snap.AdapterContract != AdapterContract {
+		t.Errorf("adapter contract = %q, want %q", snap.AdapterContract, AdapterContract)
+	}
+	if AdapterContract == "" {
+		t.Error("AdapterContract must not be empty — an unlabelled payload is what this exists to prevent")
+	}
+
+	// It must survive the wire, under the name a consumer will look for.
+	b, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got, ok := raw["adapter_contract"]
+	if !ok {
+		t.Fatalf("adapter_contract missing from the encoded payload: %s", b)
+	}
+	if string(got) != `"`+AdapterContract+`"` {
+		t.Errorf("encoded adapter_contract = %s, want %q", got, AdapterContract)
+	}
+
+	// Informational only: it must be independent of the agent's own version,
+	// or it becomes a second name for the release number and stops meaning
+	// anything about the payload.
+	if snap.AdapterContract == snap.Version {
+		t.Error("adapter contract tracks the payload's semantics, not the build — it must not equal Version by construction")
+	}
+}

@@ -9,6 +9,36 @@
 // rather than inventing a plausible value. A dashboard that fabricates is
 // worse than one that admits a gap.
 
+// ADAPTER_VERSION identifies the derivation semantics in this file — how a
+// percentile is taken, where a health threshold sits, how a counter becomes a
+// rate, how a log line's severity is decided.
+//
+// It is not the agent's version and cannot be: this file ships with the UI and
+// the agent ships separately, so the same agent can be read by two different
+// builds of these adapters. The agent's snapshot carries `adapter_contract`,
+// which is the contract this file is written against. They answer different
+// questions — the payload says what shape it is, this says how it was read —
+// and CONTRACT below is where the two meet.
+//
+// Bump this when a derived number's meaning changes, so a stored or exported
+// value can be traced back to the logic that produced it.
+export const ADAPTER_VERSION = "1";
+
+// The value of `adapter_contract` this file knows how to read. If a snapshot
+// declares something else, the agent and the UI disagree about the payload and
+// a consumer should treat derived values with suspicion.
+export const CONTRACT = "1";
+
+// Reports whether a snapshot's declared contract is one these adapters
+// understand. Informational: nothing here refuses to render on a mismatch,
+// because a UI that blanks itself on a version skew is less useful than one
+// that shows the data and says it might be reading it wrong.
+export function contractMatches(snap) {
+  const declared = snap?.adapter_contract;
+  // Absent means an agent older than the field — readable, just unlabelled.
+  return declared == null || declared === CONTRACT;
+}
+
 // ---------------------------------------------------------------------------
 // series helpers
 // ---------------------------------------------------------------------------
@@ -341,6 +371,16 @@ export function deriveLogs(snap) {
         // timestamp without re-deriving it from a formatted one.
         tms: l.t,
         lvl,
+        // Where lvl came from. The agent forwards log lines verbatim and parses
+        // no levels, so this value was guessed from the line's text by the
+        // regex above — not reported by the application that wrote it.
+        //
+        // Recording that matters because the guess is the part most likely to
+        // change: a line reading "ERROR handling retry" is INFO or ERROR
+        // depending on where the pattern anchors. Stamping the adapter version
+        // means a severity that later looks wrong can be traced to the
+        // classifier that produced it, instead of being assumed authoritative.
+        lvlSource: `client:${ADAPTER_VERSION}`,
         // Source is the file the line was tailed from; its basename is the
         // most useful short identifier available.
         svc: (l.source || "").split(/[\\/]/).pop() || "log",
