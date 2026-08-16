@@ -30,10 +30,12 @@ type InfraHostMetricsCollector struct {
 	agentID  string
 	interval time.Duration
 	stop     chan struct{}
+	gate     *sendGate
 }
 
 func NewInfraHostMetricsCollector(agentID string, interval time.Duration) *InfraHostMetricsCollector {
 	return &InfraHostMetricsCollector{
+		gate:     newSendGate("infra.hostmetrics"),
 		agentID:  agentID,
 		interval: interval,
 		stop:     make(chan struct{}),
@@ -53,7 +55,7 @@ func (h *InfraHostMetricsCollector) Start(ctx context.Context, out chan<- Envelo
 			case <-h.stop:
 				return
 			case <-ticker.C:
-				h.sample(out)
+				h.sample(ctx, out)
 			}
 		}
 	}()
@@ -65,7 +67,7 @@ func (h *InfraHostMetricsCollector) Stop() error {
 	return nil
 }
 
-func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
+func (h *InfraHostMetricsCollector) sample(ctx context.Context, out chan<- Envelope) {
 	now := time.Now().UTC()
 	bootTimeUnix := readBootTimeUnix() // "" if unavailable — handled downstream
 
@@ -80,27 +82,27 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 				// exporter strips it back out before sending.
 				labels["_boot_time_unix"] = bootTimeUnix
 			}
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind:      KindMetric,
 				AgentID:   h.agentID,
 				Source:    "system.cpu.time",
 				Timestamp: now,
 				Value:     seconds,
 				Labels:    labels,
-			}
+			})
 		}
 	}
 
 	if states, err := readMemoryUsageStates(); err == nil {
 		for state, bytes := range states {
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind:      KindMetric,
 				AgentID:   h.agentID,
 				Source:    "system.memory.usage",
 				Timestamp: now,
 				Value:     bytes,
 				Labels:    map[string]string{"state": state},
-			}
+			})
 		}
 	}
 
@@ -110,14 +112,14 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 			if bootTimeUnix != "" {
 				labels["_boot_time_unix"] = bootTimeUnix
 			}
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind:      KindMetric,
 				AgentID:   h.agentID,
 				Source:    "system.network.io",
 				Timestamp: now,
 				Value:     s.bytes,
 				Labels:    labels,
-			}
+			})
 		}
 	}
 
@@ -127,14 +129,14 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 			if bootTimeUnix != "" {
 				labels["_boot_time_unix"] = bootTimeUnix
 			}
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind:      KindMetric,
 				AgentID:   h.agentID,
 				Source:    "system.network.packets",
 				Timestamp: now,
 				Value:     s.packets,
 				Labels:    labels,
-			}
+			})
 		}
 	}
 
@@ -144,21 +146,21 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 			if bootTimeUnix != "" {
 				labels["_boot_time_unix"] = bootTimeUnix
 			}
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.network.errors", Timestamp: now, Value: s.errors, Labels: labels}
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.network.dropped", Timestamp: now, Value: s.dropped, Labels: mapCopy(labels)}
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.network.errors", Timestamp: now, Value: s.errors, Labels: labels})
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.network.dropped", Timestamp: now, Value: s.dropped, Labels: mapCopy(labels)})
 		}
 	}
 
 	if conns, err := readNetworkConnectionStates(); err == nil {
 		for state, count := range conns {
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind:      KindMetric,
 				AgentID:   h.agentID,
 				Source:    "system.network.connections",
 				Timestamp: now,
 				Value:     count,
 				Labels:    map[string]string{"protocol": "tcp", "state": state},
-			}
+			})
 		}
 	}
 
@@ -170,21 +172,21 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 				readLabels["_boot_time_unix"] = bootTimeUnix
 				writeLabels["_boot_time_unix"] = bootTimeUnix
 			}
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.io", Timestamp: now, Value: d.readBytes, Labels: readLabels}
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.io", Timestamp: now, Value: d.writeBytes, Labels: writeLabels}
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operations", Timestamp: now, Value: d.readOps, Labels: mapCopy(readLabels)}
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operations", Timestamp: now, Value: d.writeOps, Labels: mapCopy(writeLabels)}
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operation_time", Timestamp: now, Value: d.readTimeSec, Labels: mapCopy(readLabels)}
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operation_time", Timestamp: now, Value: d.writeTimeSec, Labels: mapCopy(writeLabels)}
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.io", Timestamp: now, Value: d.readBytes, Labels: readLabels})
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.io", Timestamp: now, Value: d.writeBytes, Labels: writeLabels})
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operations", Timestamp: now, Value: d.readOps, Labels: mapCopy(readLabels)})
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operations", Timestamp: now, Value: d.writeOps, Labels: mapCopy(writeLabels)})
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operation_time", Timestamp: now, Value: d.readTimeSec, Labels: mapCopy(readLabels)})
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.operation_time", Timestamp: now, Value: d.writeTimeSec, Labels: mapCopy(writeLabels)})
 			// pending_operations is a point-in-time queue depth, not
 			// cumulative — no direction split, no boot-time label needed.
-			out <- Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.pending_operations", Timestamp: now, Value: d.pendingOps, Labels: map[string]string{"device": d.device}}
+			h.gate.send(ctx, out, Envelope{Kind: KindMetric, AgentID: h.agentID, Source: "system.disk.pending_operations", Timestamp: now, Value: d.pendingOps, Labels: map[string]string{"device": d.device}})
 		}
 	}
 
 	if mounts, err := readFilesystemUsageStates(); err == nil {
 		for _, m := range mounts {
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind:      KindMetric,
 				AgentID:   h.agentID,
 				Source:    "system.filesystem.usage",
@@ -196,19 +198,19 @@ func (h *InfraHostMetricsCollector) sample(out chan<- Envelope) {
 					"device":     m.device,
 					"type":       m.fstype,
 				},
-			}
+			})
 		}
 	}
 
 	if load, err := readLoadAverage(); err == nil {
 		for window, val := range load {
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind:      KindMetric,
 				AgentID:   h.agentID,
 				Source:    "system.cpu.load_average." + window,
 				Timestamp: now,
 				Value:     val,
-			}
+			})
 		}
 	}
 }

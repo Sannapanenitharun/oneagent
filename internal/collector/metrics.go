@@ -20,6 +20,7 @@ type HostMetricsCollector struct {
 	interval time.Duration
 	metrics  map[string]bool // which of cpu/memory/disk are enabled
 	stop     chan struct{}
+	gate     *sendGate
 }
 
 func NewHostMetricsCollector(agentID string, interval time.Duration, enabled []string) *HostMetricsCollector {
@@ -28,6 +29,7 @@ func NewHostMetricsCollector(agentID string, interval time.Duration, enabled []s
 		m[e] = true
 	}
 	return &HostMetricsCollector{
+		gate:     newSendGate("host.metrics"),
 		agentID:  agentID,
 		interval: interval,
 		metrics:  m,
@@ -48,7 +50,7 @@ func (h *HostMetricsCollector) Start(ctx context.Context, out chan<- Envelope) e
 			case <-h.stop:
 				return
 			case <-ticker.C:
-				h.sample(out)
+				h.sample(ctx, out)
 			}
 		}
 	}()
@@ -60,24 +62,24 @@ func (h *HostMetricsCollector) Stop() error {
 	return nil
 }
 
-func (h *HostMetricsCollector) sample(out chan<- Envelope) {
+func (h *HostMetricsCollector) sample(ctx context.Context, out chan<- Envelope) {
 	now := time.Now().UTC()
 
 	if h.metrics["memory"] {
 		if used, total, err := readMemory(); err == nil && total > 0 {
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind: KindMetric, AgentID: h.agentID, Source: "host.memory.used_pct",
 				Timestamp: now, Value: (used / total) * 100,
-			}
+			})
 		}
 	}
 
 	if h.metrics["cpu"] {
 		if pct, err := readCPUPercent(); err == nil {
-			out <- Envelope{
+			h.gate.send(ctx, out, Envelope{
 				Kind: KindMetric, AgentID: h.agentID, Source: "host.cpu.used_pct",
 				Timestamp: now, Value: pct,
-			}
+			})
 		}
 	}
 }

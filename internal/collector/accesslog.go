@@ -184,6 +184,10 @@ func (a *AccessLogCollector) Start(ctx context.Context, out chan<- Envelope) err
 		if !ok {
 			return
 		}
+		// Deliberately blocking, like the log tailer: this reads from a file
+		// with a persisted read offset, so slowing down means lines arrive
+		// later, not that they are lost. A bounded drop here would discard a
+		// request record permanently in exchange for nothing.
 		select {
 		case out <- env:
 		case <-ctx.Done():

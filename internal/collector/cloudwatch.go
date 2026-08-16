@@ -40,6 +40,7 @@ type CloudWatchCollector struct {
 	interval  time.Duration
 	creds     awssig.Credentials
 	client    *http.Client
+	gate      *sendGate
 	stop      chan struct{}
 
 	// endpoint defaults to the real CloudWatch endpoint for the configured
@@ -86,6 +87,7 @@ func NewCloudWatchCollector(cfg CloudWatchConfig) *CloudWatchCollector {
 			SessionToken:    cfg.SessionToken,
 		},
 		client:   &http.Client{Timeout: 10 * time.Second},
+		gate:     newSendGate("cloud.cloudwatch"),
 		stop:     make(chan struct{}),
 		endpoint: fmt.Sprintf("https://monitoring.%s.amazonaws.com/", cfg.Region),
 	}
@@ -122,11 +124,11 @@ func (c *CloudWatchCollector) Start(ctx context.Context, out chan<- Envelope) er
 					continue
 				}
 				plog.ok()
-				select {
-				case out <- env:
-				case <-ctx.Done():
-					return
-				}
+				// A dropped sample here is re-polled on the next interval, so
+				// bounding the wait costs at most one data point; blocking
+				// forever would hold this goroutine open against a wedged
+				// pipeline for no gain.
+				c.gate.send(ctx, out, env)
 			}
 		}
 	}()
