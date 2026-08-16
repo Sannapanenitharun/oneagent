@@ -504,3 +504,85 @@ func TestSnapshot_DeclaresTheAdapterContract(t *testing.T) {
 		t.Error("adapter contract tracks the payload's semantics, not the build — it must not equal Version by construction")
 	}
 }
+
+// Reload-skipped settings were previously only logged, which is the one place
+// nobody looks: you edit the config, reload reports success, and the setting
+// silently is not in effect. Surfacing them here puts that answer on the same
+// surface that already answers "is the agent collecting".
+func TestStore_SurfacesReloadPendingRestart(t *testing.T) {
+	s := NewStore("host-001", "v1", time.Minute, 100)
+
+	// Before any reload the agent matches its config file by definition.
+	if got := s.Snapshot().ReloadPendingRestart; len(got) != 0 {
+		t.Errorf("fresh store reports %v pending, want none", got)
+	}
+
+	s.SetPendingRestart([]string{"agent_id", "exporter"})
+	got := s.Snapshot().ReloadPendingRestart
+	if len(got) != 2 || got[0] != "agent_id" || got[1] != "exporter" {
+		t.Fatalf("pending = %v, want [agent_id exporter]", got)
+	}
+
+	// Replaced, not accumulated — the field describes the LATEST attempt.
+	s.SetPendingRestart([]string{"interval"})
+	got = s.Snapshot().ReloadPendingRestart
+	if len(got) != 1 || got[0] != "interval" {
+		t.Errorf("pending = %v after a second reload, want [interval] only", got)
+	}
+
+	// A clean reload must clear it, or the UI keeps demanding a restart that
+	// is no longer owed.
+	s.SetPendingRestart(nil)
+	if got := s.Snapshot().ReloadPendingRestart; len(got) != 0 {
+		t.Errorf("pending = %v after a clean reload, want none", got)
+	}
+
+	// Empty must encode as [] like every other collection in this payload.
+	b, err := json.Marshal(s.Snapshot())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(raw["reload_pending_restart"]) != "[]" {
+		t.Errorf("empty reload_pending_restart encoded as %s, want []", raw["reload_pending_restart"])
+	}
+}
+
+// The caller builds the slice and may reuse its backing array. Sharing it would
+// let the daemon goroutine mutate what an HTTP handler is encoding.
+func TestStore_PendingRestartIsCopiedNotAliased(t *testing.T) {
+	s := NewStore("host-001", "v1", time.Minute, 100)
+	names := []string{"agent_id"}
+	s.SetPendingRestart(names)
+
+	names[0] = "mutated-by-the-caller"
+
+	if got := s.Snapshot().ReloadPendingRestart; got[0] != "agent_id" {
+		t.Errorf("store aliased the caller's slice: got %q", got[0])
+	}
+}
+
+// Record and SetPendingRestart are called from the daemon goroutine while
+// Snapshot runs on an HTTP handler goroutine. Run with -race.
+func TestStore_ConcurrentPendingRestartAndSnapshot(t *testing.T) {
+	s := NewStore("host-001", "v1", time.Minute, 200)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			s.SetPendingRestart([]string{"agent_id", "interval"})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			_ = s.Snapshot().ReloadPendingRestart
+		}
+	}()
+	wg.Wait()
+}

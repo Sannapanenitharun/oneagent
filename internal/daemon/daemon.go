@@ -436,8 +436,16 @@ func tickerInterval(d time.Duration) time.Duration {
 // applyConfig swaps in a new configuration. It runs on the drain loop, so it
 // can rebuild the processors without any synchronisation.
 func (d *Daemon) applyConfig(cfg *config.Config, aggTicker, spanTicker *time.Ticker) {
-	if blocked := restartRequired(d.cfg, cfg); len(blocked) > 0 {
+	blocked := restartRequired(d.cfg, cfg)
+	if len(blocked) > 0 {
 		log.Printf("reload: ignoring changes to %v — these need a restart to take effect", blocked)
+	}
+	// Published unconditionally, including the empty case: a reload that
+	// resolves everything must clear a set left by an earlier one, or the UI
+	// keeps reporting a restart that is no longer owed. Logging is unchanged —
+	// this is in addition to it, not instead of it.
+	if d.dash != nil {
+		d.dash.SetPendingRestart(blocked)
 	}
 
 	// Close out the current windows under the OLD settings before switching,

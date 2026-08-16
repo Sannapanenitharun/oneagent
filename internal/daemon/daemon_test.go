@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/agent-i/agent/internal/config"
+	"github.com/agent-i/agent/internal/dashboard"
 )
 
 func baseConfig() *config.Config {
@@ -119,4 +120,71 @@ func TestEqualStrings(t *testing.T) {
 			t.Errorf("equalStrings(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
 		}
 	}
+}
+
+// applyConfig must keep doing two things it already did — apply what it can,
+// log what it cannot — and now also publish the skipped set to the dashboard.
+// This exercises the wiring end to end rather than testing the store alone.
+func TestApplyConfig_PublishesSkippedSettingsAndStillAppliesTheRest(t *testing.T) {
+	old := baseConfig()
+	d := &Daemon{
+		cfg:  old,
+		dash: dashboard.NewStore("host-001", "v1", time.Minute, 100),
+	}
+	aggTicker := time.NewTicker(time.Hour)
+	defer aggTicker.Stop()
+	spanTicker := time.NewTicker(time.Hour)
+	defer spanTicker.Stop()
+
+	// One setting that cannot be applied live (agent_id) alongside one that
+	// can (logs.paths). The live one must still take effect.
+	next := baseConfig()
+	next.AgentID = "renamed-host"
+	next.Logs.Paths = []string{"/var/log/nginx/*.log"}
+
+	d.applyConfig(next, aggTicker, spanTicker)
+
+	pending := d.dash.Snapshot().ReloadPendingRestart
+	found := false
+	for _, p := range pending {
+		if p == "agent_id" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("agent_id missing from reload_pending_restart: %v", pending)
+	}
+	// logs.paths is applied live, so it must NOT be reported as needing one.
+	for _, p := range pending {
+		if p == "logs.paths" {
+			t.Errorf("logs.paths reported as restart-required, but it reloads live: %v", pending)
+		}
+	}
+	// The whole config is adopted regardless — a skipped setting must not
+	// block the reloadable ones from being applied.
+	if d.cfg.Logs.Paths[0] != "/var/log/nginx/*.log" {
+		t.Errorf("live-reloadable setting was not applied: %v", d.cfg.Logs.Paths)
+	}
+
+	// A subsequent clean reload clears the set.
+	clean := baseConfig()
+	clean.AgentID = "renamed-host"
+	clean.Logs.Paths = []string{"/var/log/nginx/*.log"}
+	d.applyConfig(clean, aggTicker, spanTicker)
+	if got := d.dash.Snapshot().ReloadPendingRestart; len(got) != 0 {
+		t.Errorf("pending = %v after a reload with no skipped settings, want none", got)
+	}
+}
+
+// The dashboard is optional. A reload on an agent without one must not panic.
+func TestApplyConfig_NoDashboardIsSafe(t *testing.T) {
+	d := &Daemon{cfg: baseConfig()} // dash is nil
+	aggTicker := time.NewTicker(time.Hour)
+	defer aggTicker.Stop()
+	spanTicker := time.NewTicker(time.Hour)
+	defer spanTicker.Stop()
+
+	next := baseConfig()
+	next.AgentID = "renamed-host"
+	d.applyConfig(next, aggTicker, spanTicker) // must not panic
 }

@@ -71,7 +71,6 @@ type Span struct {
 	Status   string  `json:"status,omitempty"`
 }
 
-// Snapshot is the whole view, as served to the browser.
 // AdapterContract identifies the derivation semantics this payload is built
 // for: which fields exist, what they mean, and what a consumer is expected to
 // compute from them rather than read.
@@ -94,6 +93,7 @@ type Span struct {
 // change the client-side split exists to make cheap.
 const AdapterContract = "1"
 
+// Snapshot is the whole view, as served to the browser.
 type Snapshot struct {
 	AgentID string `json:"agent_id"`
 	Version string `json:"version"`
@@ -110,6 +110,16 @@ type Snapshot struct {
 	Series        []Series  `json:"series"`
 	Logs          []LogLine `json:"logs"`
 	Spans         []Span    `json:"spans"`
+	// ReloadPendingRestart names settings that changed in the most recent
+	// reload but could not be applied to a running process. Empty means the
+	// running agent matches its config file.
+	//
+	// It was previously only logged, which put it in the one place you are not
+	// looking: the operator edits the config, reload reports success, and the
+	// setting silently is not in effect. This is the same surface that already
+	// answers "is the agent working", so it is where "is the agent running what
+	// you think it is" belongs too.
+	ReloadPendingRestart []string `json:"reload_pending_restart"`
 }
 
 type seriesBuf struct {
@@ -135,7 +145,11 @@ type Store struct {
 	spans   []Span
 	counts  map[string]uint64
 	dropped uint64
-	nowFn   func() time.Time // injectable for tests
+	// pendingRestart is written by the daemon goroutine on reload and read by
+	// HTTP handlers, so it lives behind the store's existing mutex rather than
+	// introducing a lock into the daemon, which owns its state without one.
+	pendingRestart []string
+	nowFn          func() time.Time // injectable for tests
 }
 
 func NewStore(agentID, version string, retain time.Duration, maxSeries int) *Store {
@@ -155,6 +169,19 @@ func NewStore(agentID, version string, retain time.Duration, maxSeries int) *Sto
 		counts:    make(map[string]uint64),
 		nowFn:     func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// SetPendingRestart records which settings the most recent reload could not
+// apply live. Called from the daemon goroutine; replaces the previous set
+// rather than accumulating, so a later clean reload clears it and the field
+// always describes the latest attempt.
+//
+// The slice is copied because the caller built it and may reuse the backing
+// array; sharing it would let the daemon mutate what a handler is encoding.
+func (s *Store) SetPendingRestart(names []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingRestart = append(make([]string, 0, len(names)), names...)
 }
 
 // Record files one envelope into the view. It never returns an error and
@@ -309,8 +336,9 @@ func (s *Store) Snapshot() Snapshot {
 		// inconsistent — a consumer reading .spans.length got a value on a busy
 		// agent and a TypeError on a quiet one. Empty is a list with no members,
 		// not the absence of a list.
-		Logs:  append(make([]LogLine, 0, len(s.logs)), s.logs...),
-		Spans: append(make([]Span, 0, len(s.spans)), s.spans...),
+		Logs:                 append(make([]LogLine, 0, len(s.logs)), s.logs...),
+		Spans:                append(make([]Span, 0, len(s.spans)), s.spans...),
+		ReloadPendingRestart: append(make([]string, 0, len(s.pendingRestart)), s.pendingRestart...),
 	}
 	for k, v := range s.counts {
 		out.Counts[k] = v

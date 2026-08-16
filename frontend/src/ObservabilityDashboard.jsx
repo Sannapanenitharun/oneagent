@@ -1188,6 +1188,32 @@ export default function ObservabilityDashboard() {
         </div>
       </div>
 
+      {/* A reload that could not apply everything used to be visible only in
+          the agent's log — the one place nobody looks after editing a config
+          and seeing "reload" succeed. The setting is silently not in effect
+          until someone restarts. */}
+      {snapshot?.reload_pending_restart?.length > 0 && (
+        <div
+          className="flex items-start gap-2 px-5 py-2.5 text-[11px] font-mono border-b"
+          style={{
+            background: "color-mix(in srgb, var(--warn) 8%, var(--surface))",
+            borderColor: "color-mix(in srgb, var(--warn) 25%, transparent)",
+            color: "var(--ink-2)",
+          }}
+          role="status"
+        >
+          <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" style={{ color: "var(--warn)" }} />
+          <span>
+            <span style={{ color: "var(--warn)" }}>restart required</span>
+            <span className="text-[var(--ink-3)]">
+              {" "}— the last reload could not apply{" "}
+              {snapshot.reload_pending_restart.join(", ")}. The running agent does
+              not match its config file until it is restarted.
+            </span>
+          </span>
+        </div>
+      )}
+
       {/* The diagnosis, not just the symptom. A connection failure here is
           almost never the agent — it is a stopped process or a closed tunnel
           one layer in front of it, and saying which saves the round trip of
