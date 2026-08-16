@@ -197,6 +197,47 @@ func TestStore_QuietCollectorAgesOutWithoutNewSamples(t *testing.T) {
 	}
 }
 
+// Empty is a list with no members, not the absence of a list. Appending
+// nothing to a nil slice yields nil, which marshals as null — so a consumer
+// reading .spans.length worked on a busy agent and threw on a quiet one.
+// Series was already built with make and always encoded as [], which is what
+// made the payload inconsistent rather than merely awkward.
+func TestStore_EmptyCollectionsEncodeAsArraysNotNull(t *testing.T) {
+	s := NewStore("host-001", "v1", time.Minute, 100)
+
+	assertArrays := func(t *testing.T, when string) {
+		t.Helper()
+		b, err := json.Marshal(s.Snapshot())
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(b, &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		for _, field := range []string{"series", "logs", "spans"} {
+			if got := string(raw[field]); got == "null" {
+				t.Errorf("%s: %q encoded as null, want []", when, field)
+			}
+		}
+	}
+
+	assertArrays(t, "fresh store")
+
+	// And after data has arrived and then aged out — the more common case now
+	// that the window is enforced on read.
+	now := time.Now().UTC()
+	s.nowFn = func() time.Time { return now }
+	s.Record(collector.Envelope{Kind: collector.KindLog, Source: "app.log", Timestamp: now, Message: "x"})
+	s.Record(collector.Envelope{
+		Kind: collector.KindTrace, Source: "otlp.span", Timestamp: now,
+		Labels: map[string]string{"span_id": "a"},
+	})
+	s.Record(metric("m", 1, now, nil))
+	now = now.Add(time.Hour)
+	assertArrays(t, "after everything aged out")
+}
+
 func TestStore_SpanFieldsAreMapped(t *testing.T) {
 	s := NewStore("host-001", "v1", time.Hour, 100)
 	s.Record(collector.Envelope{

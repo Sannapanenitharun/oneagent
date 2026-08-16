@@ -4,8 +4,8 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from "recharts";
 import {
-  Activity, AlertTriangle, CheckCircle2, XCircle, Server,
-  Cpu, MemoryStick, Gauge, Clock, Search, Bell, ChevronRight,
+  Activity, AlertTriangle, XCircle, Server,
+  Cpu, MemoryStick, Gauge, Search, Bell, ChevronRight,
   LayoutDashboard, ScrollText, Waypoints, HardDrive,
   Network, PlugZap, Pause, Play, Sun, Moon, Monitor,
   ChevronUp, ChevronDown, X, Braces,
@@ -14,7 +14,7 @@ import {
 import { useSnapshot } from "./api";
 import { useTheme } from "./useTheme";
 import {
-  deriveServices, deriveTraces, deriveEdges, layoutTopology,
+  deriveTraces, deriveEdges, layoutTopology,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
   fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields,
 } from "./adapters";
@@ -516,7 +516,16 @@ function LogDetail({ log, logs, index, onClose, onMove }) {
   // scanning down from the one that caught your eye.
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key === "Escape") return onClose();
+      // The filter box sits directly above this panel, so a global handler
+      // that ignores the focused element eats letters as you type: j and k
+      // would never reach the input, and "jenkins" would arrive as "enins".
+      const el = e.target;
+      const typing = el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+      if (e.key === "Escape") {
+        if (!typing) onClose();
+        return;
+      }
+      if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === "ArrowDown" || e.key === "j") { e.preventDefault(); onMove(1); }
       if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); onMove(-1); }
     };

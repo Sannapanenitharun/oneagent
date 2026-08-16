@@ -278,8 +278,14 @@ func (s *Store) Snapshot() Snapshot {
 		Counts:        make(map[string]uint64, len(s.counts)),
 		SeriesDropped: s.dropped,
 		Series:        make([]Series, 0, len(s.series)),
-		Logs:          append([]LogLine(nil), s.logs...),
-		Spans:         append([]Span(nil), s.spans...),
+		// make, not append to a nil slice: appending nothing to nil yields nil,
+		// which marshals as JSON null rather than []. Series was already built
+		// with make and so always encoded as an array, leaving the payload
+		// inconsistent — a consumer reading .spans.length got a value on a busy
+		// agent and a TypeError on a quiet one. Empty is a list with no members,
+		// not the absence of a list.
+		Logs:  append(make([]LogLine, 0, len(s.logs)), s.logs...),
+		Spans: append(make([]Span, 0, len(s.spans)), s.spans...),
 	}
 	for k, v := range s.counts {
 		out.Counts[k] = v
