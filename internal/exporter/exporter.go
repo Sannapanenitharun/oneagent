@@ -28,12 +28,23 @@ type Exporter interface {
 // New constructs the exporter named in the config. Returns an error for an
 // unknown type rather than silently defaulting — a typo'd config value
 // (e.g. "htpp") should fail fast at startup, not silently drop all data.
-func New(cfg config.ExporterConfig) (Exporter, error) {
+//
+// retire, if non-nil, is called once per envelope at the moment its fate is
+// settled: delivered, or deliberately discarded to make room. It is how a
+// tailed file learns that a line no longer needs to be re-read after a restart.
+// It is deliberately NOT called when a send fails, because a failed line is
+// exactly the one worth reading again. It may be called from the sender
+// goroutine, so it must be safe for concurrent use and must not block.
+func New(cfg config.ExporterConfig, retire func(collector.Envelope)) (Exporter, error) {
 	switch cfg.Type {
 	case "stdout", "":
-		return &stdoutExporter{}, nil
+		return withRetire(&stdoutExporter{}, retire), nil
 	case "file":
-		return newFileExporter(cfg.Path)
+		f, err := newFileExporter(cfg.Path)
+		if err != nil {
+			return nil, err
+		}
+		return withRetire(f, retire), nil
 	case "http":
 		// Network exporters are wrapped so delivery happens off the
 		// collectors' goroutines — see async.go for why that matters. stdout
@@ -43,17 +54,43 @@ func New(cfg config.ExporterConfig) (Exporter, error) {
 		if err != nil {
 			return nil, err
 		}
-		return newAsyncExporter(h, cfg.QueueSize, cfg.ShutdownTimeout), nil
+		return newAsyncExporter(h, cfg.QueueSize, cfg.ShutdownTimeout, retire), nil
 	case "otlp_http":
 		o, err := newOTLPHTTPExporter(cfg)
 		if err != nil {
 			return nil, err
 		}
-		return newAsyncExporter(o, cfg.QueueSize, cfg.ShutdownTimeout), nil
+		return newAsyncExporter(o, cfg.QueueSize, cfg.ShutdownTimeout, retire), nil
 	default:
 		return nil, fmt.Errorf("unknown exporter type %q", cfg.Type)
 	}
 }
+
+// retiringExporter reports the fate of an envelope for the synchronous sinks,
+// where "delivered" is simply "Export returned nil". The asynchronous path
+// cannot use this because its Export returns as soon as the envelope is queued,
+// which says nothing about whether it was sent.
+type retiringExporter struct {
+	inner  Exporter
+	retire func(collector.Envelope)
+}
+
+func withRetire(inner Exporter, retire func(collector.Envelope)) Exporter {
+	if retire == nil {
+		return inner
+	}
+	return &retiringExporter{inner: inner, retire: retire}
+}
+
+func (r *retiringExporter) Export(e collector.Envelope) error {
+	if err := r.inner.Export(e); err != nil {
+		return err
+	}
+	r.retire(e)
+	return nil
+}
+
+func (r *retiringExporter) Close() error { return r.inner.Close() }
 
 type stdoutExporter struct{}
 

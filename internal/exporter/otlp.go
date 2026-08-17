@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -71,9 +72,10 @@ type otlpScopeMetrics struct {
 	Metrics []otlpMetric `json:"metrics"`
 }
 type otlpMetric struct {
-	Name  string     `json:"name"`
-	Gauge *otlpGauge `json:"gauge,omitempty"`
-	Sum   *otlpSum   `json:"sum,omitempty"`
+	Name                 string                    `json:"name"`
+	Gauge                *otlpGauge                `json:"gauge,omitempty"`
+	Sum                  *otlpSum                  `json:"sum,omitempty"`
+	ExponentialHistogram *otlpExponentialHistogram `json:"exponentialHistogram,omitempty"`
 }
 type otlpGauge struct {
 	DataPoints []otlpNumberDataPoint `json:"dataPoints"`
@@ -94,6 +96,39 @@ type otlpNumberDataPoint struct {
 	TimeUnixNano      string         `json:"timeUnixNano"`
 	AsDouble          float64        `json:"asDouble"`
 	Attributes        []otlpKeyValue `json:"attributes,omitempty"`
+}
+
+// otlpExponentialHistogram carries whole distributions rather than
+// pre-computed percentiles.
+//
+// Temporality is DELTA (1), not CUMULATIVE: each point describes exactly one
+// flush window and the agent keeps no running total. That is what lets a
+// backend add windows together to answer for an hour, or add hosts together to
+// answer for a fleet — neither of which is possible from a p99, because
+// percentiles do not compose.
+type otlpExponentialHistogram struct {
+	DataPoints             []otlpExpHistogramDataPoint `json:"dataPoints"`
+	AggregationTemporality int                         `json:"aggregationTemporality"` // 1 = DELTA, per OTLP proto
+}
+
+type otlpExpHistogramDataPoint struct {
+	StartTimeUnixNano string         `json:"startTimeUnixNano,omitempty"`
+	TimeUnixNano      string         `json:"timeUnixNano"`
+	Count             uint64         `json:"count"`
+	Sum               float64        `json:"sum"`
+	Scale             int32          `json:"scale"`
+	ZeroCount         uint64         `json:"zeroCount"`
+	Positive          otlpExpBuckets `json:"positive"`
+	Min               float64        `json:"min"`
+	Max               float64        `json:"max"`
+	Attributes        []otlpKeyValue `json:"attributes,omitempty"`
+}
+
+// otlpExpBuckets is one side of the histogram. Only the positive side is ever
+// populated: everything measured here is a duration or a size.
+type otlpExpBuckets struct {
+	Offset       int32    `json:"offset"`
+	BucketCounts []uint64 `json:"bucketCounts"`
 }
 
 // --- traces ---
@@ -219,7 +254,9 @@ func (o *otlpHTTPExporter) Export(e collector.Envelope) error {
 	}
 	var full bool
 	switch e.Kind {
-	case collector.KindMetric:
+	case collector.KindMetric, collector.KindHistogram:
+		// A distribution is a metric — it travels in the same OTLP request and
+		// differs only in which data-point shape it produces.
 		o.metricsBuf = append(o.metricsBuf, e)
 		full = len(o.metricsBuf) >= o.batchSize
 	case collector.KindTrace:
@@ -402,6 +439,37 @@ func startTimeFor(e collector.Envelope) string {
 	return strconv.FormatInt(secs*1e9, 10)
 }
 
+// expHistogramPoint converts an envelope's carried distribution into an OTLP
+// data point. An envelope tagged as a histogram but carrying nothing usable is
+// skipped rather than emitted as an empty distribution, which would read as
+// "zero requests" instead of "no data".
+func expHistogramPoint(e collector.Envelope) (otlpExpHistogramDataPoint, bool) {
+	raw, ok := e.Payload[collector.HistogramPointKey]
+	if !ok {
+		return otlpExpHistogramDataPoint{}, false
+	}
+	h, ok := raw.(collector.HistogramPoint)
+	if !ok || h.Count == 0 {
+		return otlpExpHistogramDataPoint{}, false
+	}
+	return otlpExpHistogramDataPoint{
+		TimeUnixNano: strconv.FormatInt(e.Timestamp.UnixNano(), 10),
+		Count:        h.Count,
+		Sum:          h.Sum,
+		Scale:        h.Scale,
+		ZeroCount:    h.ZeroCount,
+		Min:          h.Min,
+		Max:          h.Max,
+		Positive: otlpExpBuckets{
+			Offset: h.Offset,
+			// make, not a nil slice: an absent bucket list and an empty one
+			// marshal differently, and null is not a valid bucketCounts.
+			BucketCounts: append(make([]uint64, 0, len(h.BucketCounts)), h.BucketCounts...),
+		},
+		Attributes: envelopeAttrs(e),
+	}, true
+}
+
 func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 	// Group data points under one metric entry per name instead of emitting a
 	// separate metric object per envelope. A host sampling ~70 series repeated
@@ -412,6 +480,30 @@ func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 	byName := make(map[string]*otlpMetric, 16)
 
 	for _, e := range envs {
+		if e.Kind == collector.KindHistogram {
+			m, ok := byName[e.Source]
+			if !ok {
+				m = &otlpMetric{
+					Name:                 e.Source,
+					ExponentialHistogram: &otlpExponentialHistogram{AggregationTemporality: 1}, // DELTA
+				}
+				byName[e.Source] = m
+				order = append(order, e.Source)
+			}
+			if m.ExponentialHistogram == nil {
+				// A name used for both a scalar and a distribution would produce
+				// a metric that is two things at once, which no backend accepts.
+				// Skipping the point and saying so beats emitting a payload that
+				// is rejected wholesale, taking every other metric with it.
+				log.Printf("otlp: metric %q was emitted as both a scalar and a histogram — dropping the histogram point", e.Source)
+				continue
+			}
+			if dp, ok := expHistogramPoint(e); ok {
+				m.ExponentialHistogram.DataPoints = append(m.ExponentialHistogram.DataPoints, dp)
+			}
+			continue
+		}
+
 		cumulative := cumulativeMetrics[e.Source]
 
 		m, ok := byName[e.Source]

@@ -50,6 +50,13 @@ type Daemon struct {
 	dash    *dashboard.Store
 	dashSrv *dashboard.Server
 
+	// tailRegistry is nil unless a file-tailing collector is enabled. It is the
+	// one piece of daemon-adjacent state deliberately not owned by the drain
+	// loop: it already had its own lock because several tailer goroutines share
+	// it, and the exporter's sender goroutine now reports into it too. The
+	// daemon's own state stays lock-free.
+	tailRegistry *collector.OffsetRegistry
+
 	// reloadCh carries a new configuration into the drain loop. Reload is
 	// applied there rather than by the signal handler so that everything the
 	// daemon owns continues to be touched from exactly one goroutine, which is
@@ -58,9 +65,19 @@ type Daemon struct {
 }
 
 func New(cfg *config.Config) (*Daemon, error) {
-	exp, err := exporter.New(resolveExporterHeaders(cfg.Exporter))
-	if err != nil {
-		return nil, fmt.Errorf("initializing exporter: %w", err)
+	d := &Daemon{
+		cfg:      cfg,
+		reloadCh: make(chan *config.Config, 1),
+	}
+
+	// Latency is no longer stored as a sample, so there is no sample count to
+	// cap. Said out loud rather than ignored silently: a setting that quietly
+	// stopped doing anything is worse than one that was removed, because the
+	// operator goes on believing it is in effect.
+	if cfg.Aggregation.MaxSamples > 0 || cfg.Traces.Stats.MaxSamples > 0 {
+		log.Printf("config: max_samples_per_context is set but no longer does anything — " +
+			"percentiles now come from a bucketed histogram whose memory is bounded by its bucket " +
+			"count, not by a sample cap. The setting is ignored and can be deleted.")
 	}
 
 	var collectors []collector.Collector
@@ -89,10 +106,25 @@ func New(cfg *config.Config) (*Daemon, error) {
 			MaxLineBytes: cfg.Tailing.MaxLineBytes,
 			Registry:     reg,
 		}
+		d.tailRegistry = reg
 	}
 
 	if cfg.Logs.Enabled {
-		collectors = append(collectors, collector.NewLogTailCollector(cfg.AgentID, cfg.Logs.Paths, tailOpts))
+		lc, err := collector.NewLogTailCollector(cfg.AgentID, cfg.Logs.Paths, tailOpts,
+			collector.MultilineOptions{
+				StartPattern: cfg.Logs.Multiline.StartPattern,
+				MaxLines:     cfg.Logs.Multiline.MaxLines,
+				Timeout:      cfg.Logs.Multiline.Timeout,
+			},
+			cfg.Logs.Multiline.Enabled,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("config: %w", err)
+		}
+		collectors = append(collectors, lc)
+		if cfg.Logs.Multiline.Enabled {
+			log.Printf("multiline log assembly enabled: records start at /%s/", cfg.Logs.Multiline.StartPattern)
+		}
 	}
 	if cfg.AccessLogs.Enabled {
 		format := collector.FormatCombined
@@ -135,19 +167,23 @@ func New(cfg *config.Config) (*Daemon, error) {
 		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, access_logs.enabled, traces.enabled, cloud.aws.enabled")
 	}
 
-	d := &Daemon{
-		cfg:        cfg,
-		collectors: collectors,
-		exp:        exp,
-		reloadCh:   make(chan *config.Config, 1),
+	// Built after the registry so the exporter can report which lines are
+	// settled. Constructing it here rather than first is the whole change:
+	// the offset used to be written the moment a line was read, which meant a
+	// line sitting in the export queue when the process died was recorded as
+	// handled and never read again.
+	exp, err := exporter.New(resolveExporterHeaders(cfg.Exporter), d.retire)
+	if err != nil {
+		return nil, fmt.Errorf("initializing exporter: %w", err)
 	}
+	d.collectors = collectors
+	d.exp = exp
 
 	if cfg.Aggregation.Enabled {
 		d.agg = aggregate.New(cfg.AgentID, aggregate.Config{
 			Enabled:       true,
 			Interval:      cfg.Aggregation.Interval,
 			MaxContexts:   cfg.Aggregation.MaxContexts,
-			MaxSamples:    cfg.Aggregation.MaxSamples,
 			KeepRawEvents: cfg.Aggregation.KeepRawEvents,
 		})
 		log.Printf("aggregation enabled: access log requests summarised every %s", d.agg.Interval())
@@ -161,7 +197,6 @@ func New(cfg *config.Config) (*Daemon, error) {
 		SlowThresholdMs: cfg.Traces.Sampling.SlowThresholdMs,
 		Interval:        cfg.Traces.Stats.Interval,
 		MaxContexts:     cfg.Traces.Stats.MaxContexts,
-		MaxSamples:      cfg.Traces.Stats.MaxSamples,
 	})
 	if sp.Enabled() {
 		d.spans = sp
@@ -347,10 +382,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// Absorbed envelopes are replaced by the summaries emitted at the
 			// next flush; everything else passes straight through.
 			if d.agg != nil && d.agg.Add(env) {
+				// Absorbed is settled: the request has been counted into a
+				// summary that will be exported. Without this, aggregated access
+				// logs would never advance their file offset and every restart
+				// would re-read them from the beginning.
+				d.retire(env)
 				continue
 			}
 			// Spans are always counted, then possibly dropped by sampling.
 			if d.spans != nil && !d.spans.Process(env) {
+				d.retire(env)
 				continue
 			}
 			d.export(env)
@@ -372,6 +413,20 @@ func (d *Daemon) export(env collector.Envelope) {
 		// collection with it.
 		log.Printf("export error (source=%s): %v", env.Source, err)
 	}
+}
+
+// retire records that an envelope has been accounted for, so a tailed file no
+// longer needs to re-read the line it came from. Safe to call for any envelope:
+// anything that did not come from a file carries no position and is ignored.
+//
+// Called from the drain loop and from the exporter's sender goroutine. The
+// registry is the synchronisation point, which is why the daemon can keep
+// owning its own state without a lock.
+func (d *Daemon) retire(env collector.Envelope) {
+	if d.tailRegistry == nil {
+		return
+	}
+	collector.CommitTailOffset(d.tailRegistry, env)
 }
 
 func (d *Daemon) flushAggregated() {
@@ -477,7 +532,6 @@ func (d *Daemon) applyConfig(cfg *config.Config, aggTicker, spanTicker *time.Tic
 			Enabled:       true,
 			Interval:      cfg.Aggregation.Interval,
 			MaxContexts:   cfg.Aggregation.MaxContexts,
-			MaxSamples:    cfg.Aggregation.MaxSamples,
 			KeepRawEvents: cfg.Aggregation.KeepRawEvents,
 		})
 	} else {
@@ -492,7 +546,6 @@ func (d *Daemon) applyConfig(cfg *config.Config, aggTicker, spanTicker *time.Tic
 		SlowThresholdMs: cfg.Traces.Sampling.SlowThresholdMs,
 		Interval:        cfg.Traces.Stats.Interval,
 		MaxContexts:     cfg.Traces.Stats.MaxContexts,
-		MaxSamples:      cfg.Traces.Stats.MaxSamples,
 	})
 	if sp.Enabled() {
 		d.spans = sp
@@ -526,6 +579,10 @@ func restartRequired(old, new *config.Config) []string {
 	add("metrics.enabled", old.Metrics.Enabled != new.Metrics.Enabled)
 	add("metrics.collect", !equalStrings(old.Metrics.Collect, new.Metrics.Collect))
 	add("logs.enabled", old.Logs.Enabled != new.Logs.Enabled)
+	// The assembler is built once, with a compiled pattern and per-file state
+	// mid-record. Swapping it live would mean deciding what happens to records
+	// already in progress, for a setting nobody changes at runtime.
+	add("logs.multiline", old.Logs.Multiline != new.Logs.Multiline)
 	add("access_logs.enabled", old.AccessLogs.Enabled != new.AccessLogs.Enabled)
 	add("access_logs.format", old.AccessLogs.Format != new.AccessLogs.Format)
 	add("tailing", old.Tailing != new.Tailing)

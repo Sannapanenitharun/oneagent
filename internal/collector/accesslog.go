@@ -179,11 +179,15 @@ func NewAccessLogCollector(agentID string, globs []string, format AccessLogForma
 func (a *AccessLogCollector) Name() string { return "http.access_log" }
 
 func (a *AccessLogCollector) Start(ctx context.Context, out chan<- Envelope) error {
-	a.mgr.opts.handle = func(path, line string, at time.Time) {
-		env, ok := a.parse(path, line)
+	a.mgr.opts.handle = func(ln tailLine) {
+		env, ok := a.parse(ln.Path, ln.Line)
 		if !ok {
+			// Unparseable lines commit nothing. They need no special handling:
+			// the next line that does parse carries an offset past them, so the
+			// skipped bytes are covered without being separately tracked.
 			return
 		}
+		env.Labels = withTailProvenance(env.Labels, ln)
 		// Deliberately blocking, like the log tailer: this reads from a file
 		// with a persisted read offset, so slowing down means lines arrive
 		// later, not that they are lost. A bounded drop here would discard a

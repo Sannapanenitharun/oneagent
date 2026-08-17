@@ -18,6 +18,44 @@ logs:
   paths:
     - "/var/log/app/*.log"
 
+  # Join continuation lines onto the record they belong to.
+  #
+  # Without this, one exception produces one log record per frame: a Java stack
+  # trace arrives as thirty unrelated entries, in timestamp order but with no
+  # way to tell which belong together. That is the single most common complaint
+  # about naive log tailing, and it is worth turning on for any file written by
+  # an application runtime.
+  #
+  # Changing any of this needs a restart — the pattern is compiled once and
+  # records may be mid-assembly. The agent tells you when a reload could not be
+  # applied.
+  multiline:
+    enabled: false
+    # A regular expression matching the FIRST line of a record. Anything that
+    # does not match continues the record before it.
+    #
+    # Match the start, not the continuation: what a record begins with is
+    # predictable (a timestamp, a level), whereas what a stack trace looks like
+    # varies by language, framework and locale. Anchor it with ^.
+    #
+    #   ISO timestamp   ^\d{4}-\d{2}-\d{2}
+    #   syslog          ^[A-Z][a-z]{2} [ 0-9]\d \d{2}:\d{2}:\d{2}
+    #   bare level      ^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\b
+    #
+    # If this pattern never matches, every line becomes its own record and a
+    # warning is logged — silence would make a typo here indistinguishable from
+    # a file that simply has no exceptions in it.
+    start_pattern: '^\d{4}-\d{2}-\d{2}'
+    # Backstop against a pattern that does not match this file at all. On
+    # reaching it the record is emitted marked "...RECORD TRUNCATED..." rather
+    # than being discarded, and the rest is skipped until the next start line.
+    max_lines: 500
+    # How long an unfinished record waits for more lines before being emitted
+    # anyway. Without this the last record in a quiet file is held forever,
+    # waiting for a successor that never comes — which is exactly the stack
+    # trace you were looking for.
+    timeout: 2s
+
 access_logs:
   enabled: false
   paths:
@@ -42,10 +80,24 @@ tailing:
   # matched by a glob) would otherwise buffer without bound; over-long lines
   # are cut and marked with a ...TRUNCATED... suffix.
   max_line_bytes: 262144
-  # Per-file read offsets, so a restart resumes where it left off instead of
-  # skipping everything written while the agent was down. Keyed by inode, so
-  # it survives rotation. The directory must be writable by the agent user —
-  # the installers create it and the systemd unit allows it.
+  # Per-file offsets, so a restart resumes where it left off instead of
+  # skipping everything written while the agent was down. The directory must be
+  # writable by the agent user — the installers create it and the systemd unit
+  # allows it.
+  #
+  # Two details worth knowing, because they decide what a restart replays:
+  #
+  #  - An offset is recorded when a line has been ACCOUNTED FOR — delivered to
+  #    the exporter's backend, absorbed into an aggregated summary, or
+  #    deliberately shed because the export queue was full — not when it was
+  #    read off disk. A line still queued when the process dies is therefore
+  #    read again next time instead of being lost. The replay window is bounded
+  #    by the export queue, not by how long a backend was down.
+  #
+  #  - Entries are keyed by device+inode and verified against a checksum of the
+  #    file's first 1 KiB. Inodes get recycled, and without that check a new
+  #    file handed a dead one's inode would be resumed at the old file's offset,
+  #    silently skipping its opening lines.
   registry_path: "/var/lib/agent-i/registry.json"
 
 # Summarise access log requests into per-interval metrics instead of shipping
@@ -64,7 +116,12 @@ aggregation:
   enabled: false
   interval: 60s                  # summary window
   max_contexts: 2000             # distinct (method, path, status) per window before overflow
-  max_samples_per_context: 2048  # latency samples retained for percentiles
+  # DEPRECATED and ignored since latency stopped being stored as a sample.
+  # Percentiles now come from a bucketed histogram whose memory is bounded by
+  # its bucket count, not by a sample cap, so there is nothing for this to cap.
+  # Left here so existing config files keep loading; the agent logs once at
+  # startup if it is set. Safe to delete.
+  # max_samples_per_context: 2048
   keep_raw_events: false         # also forward the per-request records (removes the volume benefit)
 
 # A local web view of what this agent is collecting right now, served from
@@ -120,7 +177,8 @@ traces:
     enabled: false
     interval: 60s
     max_contexts: 2000             # distinct (service, operation, status) per window
-    max_samples_per_context: 2048
+    # DEPRECATED and ignored — see the note under aggregation above.
+    # max_samples_per_context: 2048
 
   # Reduce how many spans are forwarded. The decision is derived from the
   # trace ID, so a trace is kept or dropped as a whole — sampling spans

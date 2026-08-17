@@ -39,9 +39,6 @@ type Config struct {
 	// does not recognise; beyond it, everything collapses into one overflow
 	// context rather than growing without bound.
 	MaxContexts int
-	// MaxSamples caps retained latency samples per context. Percentiles come
-	// from a reservoir of this size rather than every observation.
-	MaxSamples int
 	// KeepRawEvents forwards the original per-request envelopes as well as the
 	// summaries. Off by default — forwarding both defeats the purpose — but
 	// available when per-request detail is genuinely needed.
@@ -51,7 +48,6 @@ type Config struct {
 const (
 	defaultInterval    = 60 * time.Second
 	defaultMaxContexts = 2000
-	defaultMaxSamples  = 2048
 
 	// overflowPath is the label used once MaxContexts is reached. It is
 	// deliberately visible in the output: silently dropping data is worse than
@@ -72,13 +68,15 @@ type bucket struct {
 	min    float64
 	max    float64
 
-	// lat holds a bounded sample of latencies for percentiles. Counts above
-	// are exact regardless of what the reservoir retains.
-	lat *Reservoir
+	// lat holds the latency distribution. It is a bucketed histogram rather
+	// than a sample: percentiles taken from a sample cannot be merged across
+	// hosts or windows, and this one is emitted alongside them so a backend can.
+	// Counts above are exact regardless.
+	lat *Histogram
 }
 
-func newBucket(maxSamples int) *bucket {
-	return &bucket{lat: NewReservoir(maxSamples)}
+func newBucket() *bucket {
+	return &bucket{lat: NewHistogram()}
 }
 
 func (b *bucket) observe(durationMs float64, isError bool) {
@@ -120,9 +118,6 @@ func New(agentID string, cfg Config) *Aggregator {
 	if cfg.MaxContexts <= 0 {
 		cfg.MaxContexts = defaultMaxContexts
 	}
-	if cfg.MaxSamples <= 0 {
-		cfg.MaxSamples = defaultMaxSamples
-	}
 	return &Aggregator{
 		cfg:      cfg,
 		agentID:  agentID,
@@ -152,7 +147,7 @@ func (a *Aggregator) Add(e collector.Envelope) bool {
 		if len(a.contexts) >= a.cfg.MaxContexts {
 			b = a.overflowBucket()
 		} else {
-			b = newBucket(a.cfg.MaxSamples)
+			b = newBucket()
 			a.contexts[key] = b
 		}
 	}
@@ -166,7 +161,7 @@ func (a *Aggregator) Add(e collector.Envelope) bool {
 
 func (a *Aggregator) overflowBucket() *bucket {
 	if a.overflow == nil {
-		a.overflow = newBucket(a.cfg.MaxSamples)
+		a.overflow = newBucket()
 	}
 	if !a.overflowLogged {
 		a.overflowLogged = true
@@ -215,8 +210,6 @@ func (a *Aggregator) summarize(key contextKey, b *bucket, now time.Time) []colle
 		"status": key.status,
 	}
 
-	sorted := b.lat.Sorted()
-
 	series := []struct {
 		name  string
 		value float64
@@ -224,13 +217,13 @@ func (a *Aggregator) summarize(key contextKey, b *bucket, now time.Time) []colle
 		{"http.server.requests", float64(b.count)},
 		{"http.server.errors", float64(b.errors)},
 		{"http.server.duration.avg", b.sum / float64(b.count)},
-		{"http.server.duration.p50", Percentile(sorted, 0.50)},
-		{"http.server.duration.p95", Percentile(sorted, 0.95)},
-		{"http.server.duration.p99", Percentile(sorted, 0.99)},
+		{"http.server.duration.p50", b.lat.Quantile(0.50)},
+		{"http.server.duration.p95", b.lat.Quantile(0.95)},
+		{"http.server.duration.p99", b.lat.Quantile(0.99)},
 		{"http.server.duration.max", b.max},
 	}
 
-	out := make([]collector.Envelope, 0, len(series))
+	out := make([]collector.Envelope, 0, len(series)+1)
 	for _, s := range series {
 		out = append(out, collector.Envelope{
 			Kind:      collector.KindMetric,
@@ -241,6 +234,20 @@ func (a *Aggregator) summarize(key contextKey, b *bucket, now time.Time) []colle
 			Value:     s.value,
 		})
 	}
+
+	// The distribution itself, in addition to the percentiles above. The
+	// percentiles keep every existing consumer working unchanged; this is what
+	// lets a backend answer a question nobody picked in advance — a different
+	// quantile, or one host's window added to another's.
+	out = append(out, collector.Envelope{
+		Kind:      collector.KindHistogram,
+		AgentID:   a.agentID,
+		Source:    "http.server.duration",
+		Timestamp: now,
+		Labels:    copyLabels(labels),
+		Value:     b.sum / float64(b.count),
+		Payload:   map[string]any{collector.HistogramPointKey: b.lat.Point()},
+	})
 	return out
 }
 

@@ -68,8 +68,13 @@ func startTestTail(t *testing.T, ctx context.Context, globs []string, regPath st
 		pollInterval: 25 * time.Millisecond,
 		maxLineBytes: 1024,
 		registry:     reg,
-		handle: func(_, line string, _ time.Time) {
-			lines <- line
+		handle: func(ln tailLine) {
+			// Stands in for the daemon: a position is committed once the line
+			// has been accounted for downstream, never merely because it was
+			// read. Tests that assert on resume-after-restart depend on this
+			// being the only thing that advances the registry.
+			reg.Commit(ln.FileID, ln.Path, ln.EndOffset, ln.Fingerprint)
+			lines <- ln.Line
 		},
 	})
 	m.Start(ctx)

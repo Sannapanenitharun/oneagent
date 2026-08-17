@@ -2,6 +2,7 @@ package spans
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -182,16 +183,33 @@ func TestProcessor_LatencyPercentiles(t *testing.T) {
 	}
 
 	m := bySource(p.Flush(time.Now()))
-	checks := map[string]float64{
+
+	// Counts, mean and max are tracked exactly and stay exact.
+	exact := map[string]float64{
 		"trace.spans":        10,
 		"trace.duration.avg": 5.5,
-		"trace.duration.p50": 5,
-		"trace.duration.p95": 10,
 		"trace.duration.max": 10,
 	}
-	for name, want := range checks {
+	for name, want := range exact {
 		if got := m[name].Value; got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+
+	// Percentiles now come from a bucketed histogram, so they carry a bounded
+	// relative error instead of being exact. That is the deliberate trade: a
+	// sample gives exact answers for one host and one window and cannot be
+	// merged with any other, while buckets give an answer within a known
+	// tolerance that a backend can combine across hosts and windows.
+	const tolerance = 0.011 // ~1.1% at the default scale
+	approx := map[string]float64{
+		"trace.duration.p50": 5,
+		"trace.duration.p95": 10,
+	}
+	for name, want := range approx {
+		got := m[name].Value
+		if rel := math.Abs(got-want) / want; rel > tolerance {
+			t.Errorf("%s = %v, want %v within %.1f%% (relative error %.4f)", name, got, want, tolerance*100, rel)
 		}
 	}
 }

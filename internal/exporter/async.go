@@ -33,6 +33,16 @@ type asyncExporter struct {
 	dropped      atomic.Uint64
 	failed       atomic.Uint64
 	drainTimeout time.Duration
+
+	// breaker is touched only by the sender goroutine (run, deliver, drain),
+	// so it needs no lock. Export runs on the daemon goroutine and deliberately
+	// does not consult it: enqueueing must stay non-blocking whatever the
+	// endpoint is doing, and the queue's own shed-oldest policy is what decides
+	// which envelopes survive an outage.
+	breaker *breaker
+
+	// retire reports that an envelope's fate is settled. See New.
+	retire func(collector.Envelope)
 }
 
 const (
@@ -41,7 +51,7 @@ const (
 	dropReportInterval  = 30 * time.Second
 )
 
-func newAsyncExporter(inner Exporter, queueSize int, drainTimeout time.Duration) *asyncExporter {
+func newAsyncExporter(inner Exporter, queueSize int, drainTimeout time.Duration, retire func(collector.Envelope)) *asyncExporter {
 	if queueSize <= 0 {
 		queueSize = defaultQueueSize
 	}
@@ -53,6 +63,8 @@ func newAsyncExporter(inner Exporter, queueSize int, drainTimeout time.Duration)
 		queue:        make(chan collector.Envelope, queueSize),
 		stopCh:       make(chan struct{}),
 		drainTimeout: drainTimeout,
+		breaker:      newBreaker(),
+		retire:       retire,
 	}
 	a.wg.Add(1)
 	go a.run()
@@ -71,8 +83,13 @@ func (a *asyncExporter) Export(e collector.Envelope) error {
 
 	// Queue is full: make room by discarding the oldest envelope.
 	select {
-	case <-a.queue:
+	case old := <-a.queue:
 		a.dropped.Add(1)
+		// A shed envelope is settled, just unhappily. Reporting it keeps a
+		// tailed file moving forward: if deliberate drops blocked the offset,
+		// a backend outage would leave the agent re-reading the same bytes
+		// after every restart and never making progress.
+		a.reportRetired(old)
 	default:
 	}
 	select {
@@ -80,8 +97,15 @@ func (a *asyncExporter) Export(e collector.Envelope) error {
 	default:
 		// Lost the race with the sender refilling the queue; drop this one.
 		a.dropped.Add(1)
+		a.reportRetired(e)
 	}
 	return nil
+}
+
+func (a *asyncExporter) reportRetired(e collector.Envelope) {
+	if a.retire != nil {
+		a.retire(e)
+	}
 }
 
 func (a *asyncExporter) run() {
@@ -91,6 +115,26 @@ func (a *asyncExporter) run() {
 	defer report.Stop()
 
 	for {
+		// Consulted BEFORE dequeuing, not after. Taking an envelope off the
+		// queue and then discarding it because the endpoint is down would empty
+		// the queue at full speed during an outage and leave nothing to send on
+		// recovery; leaving it queued lets the normal shed-oldest policy keep
+		// the freshest data instead.
+		if ok, wait := a.breaker.allow(time.Now()); !ok {
+			t := time.NewTimer(wait)
+			select {
+			case <-t.C:
+			case <-report.C:
+				a.report()
+			case <-a.stopCh:
+				t.Stop()
+				a.drain()
+				return
+			}
+			t.Stop()
+			continue
+		}
+
 		select {
 		case e := <-a.queue:
 			a.deliver(e)
@@ -104,10 +148,28 @@ func (a *asyncExporter) run() {
 }
 
 func (a *asyncExporter) deliver(e collector.Envelope) {
-	if err := a.inner.Export(e); err != nil {
+	was := a.breaker.tripped()
+	now := time.Now()
+
+	err := a.inner.Export(e)
+	if err != nil {
 		a.failed.Add(1)
+		a.breaker.failure(now)
+		if !was && a.breaker.tripped() {
+			// Logged only on the transition. An endpoint that is down produces
+			// one line here, not one per envelope — the per-envelope detail is
+			// already on the line below and the periodic drop report.
+			log.Printf("exporter: circuit breaker opened after %v — pausing delivery, queued envelopes are retained (newest first)", err)
+		}
 		log.Printf("export error (source=%s): %v", e.Source, err)
+		return
 	}
+
+	a.breaker.success(now)
+	if was && !a.breaker.tripped() {
+		log.Printf("exporter: endpoint recovered, resuming normal delivery")
+	}
+	a.reportRetired(e)
 }
 
 // report surfaces queue pressure. Silence here is meaningful: if these lines
@@ -128,6 +190,16 @@ func (a *asyncExporter) report() {
 func (a *asyncExporter) drain() {
 	deadline := time.After(a.drainTimeout)
 	for {
+		// An open breaker at shutdown means we already know the endpoint is not
+		// answering. Spending the drain budget re-confirming that just delays
+		// the process exit — and on a systemd stop, a slow exit is what turns a
+		// restart into an outage.
+		if ok, _ := a.breaker.allow(time.Now()); !ok {
+			if n := len(a.queue); n > 0 {
+				log.Printf("exporter: endpoint is down at shutdown, %d envelopes not sent", n)
+			}
+			return
+		}
 		select {
 		case e := <-a.queue:
 			a.deliver(e)

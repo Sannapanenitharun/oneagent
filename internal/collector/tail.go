@@ -32,8 +32,26 @@ import (
 // that the byte offset we persist is exactly the offset we have emitted, with
 // no hidden buffering in between.
 
-// lineFunc receives one complete line (newline and any trailing CR removed).
-type lineFunc func(path, line string, at time.Time)
+// tailLine is one complete line (newline and any trailing CR removed) plus the
+// provenance needed to commit its position once it has been accounted for.
+//
+// EndOffset is the byte offset of the first byte AFTER this line, so committing
+// it means "everything up to here is dealt with". It covers any bytes skipped
+// between the previous line and this one — blank lines, the discarded remainder
+// of an over-long line — which is why skipped content needs no separate
+// bookkeeping: the next real line's offset carries it.
+type tailLine struct {
+	Path string
+	Line string
+	At   time.Time
+
+	FileID      string
+	EndOffset   int64
+	Fingerprint uint64
+}
+
+// lineFunc receives one complete line.
+type lineFunc func(tailLine)
 
 // tailOptions configures a tailManager.
 type tailOptions struct {
@@ -43,6 +61,15 @@ type tailOptions struct {
 	maxLineBytes int           // safety cap on a single line
 	registry     *OffsetRegistry
 	handle       lineFunc
+	// onTick runs after every poll, on the manager's own goroutine. It exists
+	// so a stage that needs a periodic nudge — multiline assembly waiting on an
+	// idle timeout — gets one without starting a goroutine of its own and
+	// needing a lock to talk to the read path.
+	onTick func()
+	// onFileClosed runs when a tailer is dropped (rotation, or the path stopped
+	// matching), so per-file state elsewhere can be released promptly instead of
+	// waiting for a timeout on a file that no longer exists.
+	onFileClosed func(fileID string)
 }
 
 // TailingOptions carries the tunables shared by every file-tailing collector.
@@ -160,6 +187,9 @@ func (m *tailManager) run(ctx context.Context) {
 			return
 		case <-pollTicker.C:
 			m.poll(ctx)
+			if m.opts.onTick != nil {
+				m.opts.onTick()
+			}
 		case <-scanTicker.C:
 			m.scan(ctx, false)
 		case globs := <-m.globsCh:
@@ -185,6 +215,7 @@ func (m *tailManager) run(ctx context.Context) {
 func (m *tailManager) shutdown() {
 	for path, t := range m.tailers {
 		t.close()
+		m.fileClosed(t.id)
 		delete(m.tailers, path)
 	}
 	if err := m.opts.registry.Flush(); err != nil {
@@ -248,6 +279,7 @@ func (m *tailManager) scan(ctx context.Context, first bool) {
 			// the glob). Drain what is left on the descriptor before dropping.
 			t.readAvailable(ctx)
 			t.close()
+			m.fileClosed(t.id)
 			delete(m.tailers, p)
 			log.Printf("tail: stopped following %s", p)
 		}
@@ -265,6 +297,7 @@ func (m *tailManager) poll(ctx context.Context) {
 		// worth saying so out loud.
 		t.reportMissed()
 		t.close()
+		m.fileClosed(t.id)
 		delete(m.tailers, path)
 
 		// Reopen immediately at the start of the new file rather than waiting
@@ -298,9 +331,23 @@ func (m *tailManager) open(path string, atStartup bool) (*fileTailer, error) {
 		handle:  m.opts.handle,
 		buf:     make([]byte, 32*1024),
 	}
+	t.fp, _ = fileFingerprint(f)
 
-	offset, known := m.reg().Get(t.id)
+	offset, storedFP, known := m.reg().Lookup(t.id)
 	switch {
+	case known && storedFP != 0 && t.fp != 0 && storedFP != t.fp:
+		// Same device+inode, different content at the head of the file. The
+		// inode was recycled: the file we recorded that offset for is gone and
+		// this is a different one wearing its number. Resuming would seek past
+		// this file's opening lines and never report them.
+		log.Printf("tail: %s reuses a known inode but its contents differ — treating it as a new file and reading from the start", path)
+		offset = 0
+	case known && storedFP != 0 && t.fp == 0 && fi.Size() < fingerprintBytes:
+		// We fingerprinted this inode when it was at least fingerprintBytes
+		// long, and it is now shorter. It cannot be the same content, so the
+		// stored offset does not apply.
+		log.Printf("tail: %s is shorter than when it was last seen — reading from the start", path)
+		offset = 0
 	case known && offset <= fi.Size():
 		// Resume where the previous run left off.
 	case known:
@@ -323,6 +370,12 @@ func (m *tailManager) open(path string, atStartup bool) (*fileTailer, error) {
 
 func (m *tailManager) reg() *OffsetRegistry { return m.opts.registry }
 
+func (m *tailManager) fileClosed(fileID string) {
+	if m.opts.onFileClosed != nil && fileID != "" {
+		m.opts.onFileClosed(fileID)
+	}
+}
+
 // fileTailer follows a single open file.
 type fileTailer struct {
 	path    string
@@ -332,6 +385,9 @@ type fileTailer struct {
 	maxLine int
 	reg     *OffsetRegistry
 	handle  lineFunc
+	// fp identifies the file's contents independently of its inode. Zero until
+	// the file is long enough to fingerprint; refreshed once it is.
+	fp uint64
 
 	buf     []byte
 	partial []byte
@@ -348,11 +404,18 @@ type fileTailer struct {
 // holding back any trailing partial line for the next call.
 func (t *fileTailer) readAvailable(ctx context.Context) {
 	for {
+		base := t.offset
 		n, err := t.f.Read(t.buf)
 		if n > 0 {
 			t.offset += int64(n)
-			t.consume(ctx, t.buf[:n])
-			t.reg.Set(t.id, t.path, t.offset)
+			t.consume(ctx, t.buf[:n], base)
+			// A file too short to fingerprint when it was opened becomes
+			// identifiable as soon as it grows. Picking the value up here means
+			// a freshly-created log file gains inode-reuse protection within
+			// moments instead of only after the next agent restart.
+			if t.fp == 0 && t.offset >= fingerprintBytes {
+				t.fp, _ = fileFingerprint(t.f)
+			}
 		}
 		if err != nil || n == 0 {
 			// io.EOF is the normal case: we have caught up and will look again
@@ -367,13 +430,19 @@ func (t *fileTailer) readAvailable(ctx context.Context) {
 	}
 }
 
-func (t *fileTailer) consume(ctx context.Context, b []byte) {
+// consume splits b into lines. base is the absolute file offset of b[0], which
+// is what lets every emitted line carry the exact position just past its own
+// newline rather than the position of the whole read.
+func (t *fileTailer) consume(ctx context.Context, b []byte, base int64) {
+	end := base + int64(len(b)) // absolute offset just past this read
 	for len(b) > 0 {
+		// Absolute offset of b[0] as the slice is walked forward.
+		pos := end - int64(len(b))
 		i := bytes.IndexByte(b, '\n')
 		if i < 0 {
 			t.partial = append(t.partial, b...)
 			if len(t.partial) > t.maxLine {
-				t.emit(ctx, string(t.partial[:t.maxLine])+truncatedSuffix)
+				t.emit(ctx, string(t.partial[:t.maxLine])+truncatedSuffix, end)
 				t.partial = t.partial[:0]
 				t.skipToNewline = true
 			}
@@ -386,6 +455,7 @@ func (t *fileTailer) consume(ctx context.Context, b []byte) {
 		line := string(bytes.TrimRight(full, "\r"))
 		// Reuse the grown buffer rather than the original backing array.
 		t.partial = full[:0]
+		lineEnd := pos + int64(i) + 1 // just past the newline
 		b = b[i+1:]
 
 		if t.skipToNewline {
@@ -399,12 +469,12 @@ func (t *fileTailer) consume(ctx context.Context, b []byte) {
 			line = line[:t.maxLine] + truncatedSuffix
 		}
 		if line != "" {
-			t.emit(ctx, line)
+			t.emit(ctx, line, lineEnd)
 		}
 	}
 }
 
-func (t *fileTailer) emit(ctx context.Context, line string) {
+func (t *fileTailer) emit(ctx context.Context, line string, endOffset int64) {
 	// handle ultimately sends on the daemon's envelope channel, which can
 	// block under backpressure; ctx makes that interruptible so shutdown never
 	// waits on a stalled exporter.
@@ -413,7 +483,14 @@ func (t *fileTailer) emit(ctx context.Context, line string) {
 		return
 	default:
 	}
-	t.handle(t.path, line, time.Now().UTC())
+	t.handle(tailLine{
+		Path:        t.path,
+		Line:        line,
+		At:          time.Now().UTC(),
+		FileID:      t.id,
+		EndOffset:   endOffset,
+		Fingerprint: t.fp,
+	})
 }
 
 // rotated reports whether the file we hold open is no longer the file at our
@@ -441,7 +518,13 @@ func (t *fileTailer) rotated() bool {
 			t.offset = 0
 			t.partial = t.partial[:0]
 			t.skipToNewline = false
-			t.reg.Set(t.id, t.path, 0)
+			// Reset rather than Commit: this is the one case where the position
+			// must move backwards, and the fingerprint has to go with it — the
+			// file now holds different content under the same inode, so keeping
+			// the old checksum would make the next open mistake this file for a
+			// recycled inode.
+			t.reg.Reset(t.id, t.path)
+			t.fp = 0
 			log.Printf("tail: %s was truncated, restarting from the beginning", t.path)
 		}
 		return false
@@ -467,9 +550,17 @@ func (t *fileTailer) reportMissed() {
 func (t *fileTailer) close() {
 	if len(t.partial) > 0 {
 		// A file that ends without a trailing newline still has a last line.
-		t.handle(t.path, string(bytes.TrimRight(t.partial, "\r")), time.Now().UTC())
+		t.handle(tailLine{
+			Path:        t.path,
+			Line:        string(bytes.TrimRight(t.partial, "\r")),
+			At:          time.Now().UTC(),
+			FileID:      t.id,
+			EndOffset:   t.offset,
+			Fingerprint: t.fp,
+		})
 		t.partial = t.partial[:0]
 	}
-	t.reg.Set(t.id, t.path, t.offset)
+	// No offset write here. The position is committed when a line is actually
+	// accounted for downstream, not when it is read — see OffsetRegistry.Commit.
 	t.f.Close()
 }

@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/agent-i/agent/internal/collector"
 	"github.com/agent-i/agent/internal/config"
 	"github.com/agent-i/agent/internal/dashboard"
 )
@@ -187,4 +189,46 @@ func TestApplyConfig_NoDashboardIsSafe(t *testing.T) {
 	next := baseConfig()
 	next.AgentID = "renamed-host"
 	d.applyConfig(next, aggTicker, spanTicker) // must not panic
+}
+
+// A tailed line is only committed once something downstream has accounted for
+// it. The daemon is one of the two places that happens — the aggregator absorbs
+// access-log requests into summaries, and those envelopes never reach the
+// exporter, so without this they would never advance their file offset and
+// every restart would re-read them.
+func TestRetire_CommitsTailedEnvelopes(t *testing.T) {
+	reg, err := collector.NewOffsetRegistry(filepath.Join(t.TempDir(), "reg.json"))
+	if err != nil {
+		t.Fatalf("NewOffsetRegistry: %v", err)
+	}
+	d := &Daemon{cfg: baseConfig(), tailRegistry: reg}
+
+	d.retire(collector.Envelope{
+		Kind:   collector.KindAPICall,
+		Source: "/var/log/nginx/access.log",
+		Labels: map[string]string{
+			collector.LabelTailID:  "dev:42",
+			collector.LabelTailEnd: "2048",
+		},
+	})
+
+	offset, _, ok := reg.Lookup("dev:42")
+	if !ok {
+		t.Fatal("absorbed envelope did not advance the registry")
+	}
+	if offset != 2048 {
+		t.Errorf("offset = %d, want 2048", offset)
+	}
+}
+
+func TestRetire_IsSafeWithoutATailRegistry(t *testing.T) {
+	// Metrics-only agents never construct a registry; retire still runs on
+	// every absorbed and exported envelope.
+	d := &Daemon{cfg: baseConfig()} // tailRegistry is nil
+	d.retire(collector.Envelope{Kind: collector.KindMetric, Source: "host.cpu.used_pct"})
+	d.retire(collector.Envelope{
+		Kind:   collector.KindLog,
+		Source: "/a.log",
+		Labels: map[string]string{collector.LabelTailID: "dev:1", collector.LabelTailEnd: "10"},
+	})
 }

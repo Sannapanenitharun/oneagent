@@ -41,13 +41,11 @@ type Config struct {
 
 	Interval    time.Duration
 	MaxContexts int
-	MaxSamples  int
 }
 
 const (
 	defaultInterval    = 60 * time.Second
 	defaultMaxContexts = 2000
-	defaultMaxSamples  = 2048
 
 	// statusCodeError is OTLP's STATUS_CODE_ERROR.
 	statusCodeError = "2"
@@ -71,7 +69,10 @@ type bucket struct {
 	errors int64
 	sum    float64
 	max    float64
-	lat    *aggregate.Reservoir
+	// lat is a bucketed histogram, not a sample: a p99 computed from a sample
+	// cannot be merged with another host's p99, and this one is emitted
+	// alongside the percentiles so a backend can do exactly that.
+	lat *aggregate.Histogram
 }
 
 func (b *bucket) observe(durationMs float64, isErr bool) {
@@ -106,9 +107,6 @@ func New(agentID string, cfg Config) *Processor {
 	}
 	if cfg.MaxContexts <= 0 {
 		cfg.MaxContexts = defaultMaxContexts
-	}
-	if cfg.MaxSamples <= 0 {
-		cfg.MaxSamples = defaultMaxSamples
 	}
 	return &Processor{
 		cfg:      cfg,
@@ -162,7 +160,7 @@ func (p *Processor) record(e collector.Envelope, isErr bool) {
 		if len(p.contexts) >= p.cfg.MaxContexts {
 			b = p.overflowBucket()
 		} else {
-			b = &bucket{lat: aggregate.NewReservoir(p.cfg.MaxSamples)}
+			b = &bucket{lat: aggregate.NewHistogram()}
 			p.contexts[key] = b
 		}
 	}
@@ -172,7 +170,7 @@ func (p *Processor) record(e collector.Envelope, isErr bool) {
 
 func (p *Processor) overflowBucket() *bucket {
 	if p.overflow == nil {
-		p.overflow = &bucket{lat: aggregate.NewReservoir(p.cfg.MaxSamples)}
+		p.overflow = &bucket{lat: aggregate.NewHistogram()}
 	}
 	if !p.overflowLogged {
 		p.overflowLogged = true
@@ -261,8 +259,6 @@ func (p *Processor) summarize(key contextKey, b *bucket, now time.Time) []collec
 		"operation": key.name,
 		"status":    key.status,
 	}
-	sorted := b.lat.Sorted()
-
 	series := []struct {
 		name  string
 		value float64
@@ -270,16 +266,24 @@ func (p *Processor) summarize(key contextKey, b *bucket, now time.Time) []collec
 		{"trace.spans", float64(b.count)},
 		{"trace.errors", float64(b.errors)},
 		{"trace.duration.avg", b.sum / float64(b.count)},
-		{"trace.duration.p50", aggregate.Percentile(sorted, 0.50)},
-		{"trace.duration.p95", aggregate.Percentile(sorted, 0.95)},
-		{"trace.duration.p99", aggregate.Percentile(sorted, 0.99)},
+		{"trace.duration.p50", b.lat.Quantile(0.50)},
+		{"trace.duration.p95", b.lat.Quantile(0.95)},
+		{"trace.duration.p99", b.lat.Quantile(0.99)},
 		{"trace.duration.max", b.max},
 	}
 
-	out := make([]collector.Envelope, 0, len(series))
+	out := make([]collector.Envelope, 0, len(series)+1)
 	for _, s := range series {
 		out = append(out, p.metric(s.name, labels, s.value, now))
 	}
+
+	// The distribution itself. RED metrics are only useful across a fleet, and
+	// three fixed percentiles per host cannot be combined into a fleet answer —
+	// bucket counts can.
+	hist := p.metric("trace.duration", labels, b.sum/float64(b.count), now)
+	hist.Kind = collector.KindHistogram
+	hist.Payload = map[string]any{collector.HistogramPointKey: b.lat.Point()}
+	out = append(out, hist)
 	return out
 }
 

@@ -18,7 +18,34 @@ const (
 	KindLog     Kind = "log"
 	KindTrace   Kind = "trace"
 	KindAPICall Kind = "api_call" // a parsed HTTP request from an access log — structured (method/path/status/duration), unlike a raw KindLog line
+	// KindHistogram carries a whole distribution rather than a single number.
+	// It exists because percentiles do not compose: three metrics named p50,
+	// p95 and p99 cannot be merged across hosts or re-cut into a different
+	// quantile later, whereas the bucket counts they were derived from can.
+	// The point rides in Payload — see HistogramPoint.
+	KindHistogram Kind = "histogram"
 )
+
+// HistogramPointKey is where a KindHistogram envelope carries its distribution.
+const HistogramPointKey = "histogram"
+
+// HistogramPoint is a base-2 exponential histogram, in the shape OpenTelemetry
+// defines: bucket k covers (base^(k-1), base^k] with base = 2^(2^-Scale).
+//
+// It is defined here rather than in the package that builds it so the exporter
+// can consume it without importing the aggregation code — the same reason
+// Envelope itself lives in this package.
+type HistogramPoint struct {
+	Count     uint64
+	Sum       float64
+	Min       float64
+	Max       float64
+	Scale     int32
+	ZeroCount uint64
+	// Offset is the bucket index of BucketCounts[0].
+	Offset       int32
+	BucketCounts []uint64
+}
 
 // Envelope is the single normalized shape for every signal the agent emits.
 // Fields are deliberately generic (Value as float64, Payload as map) so new

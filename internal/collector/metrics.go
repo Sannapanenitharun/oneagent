@@ -21,6 +21,13 @@ type HostMetricsCollector struct {
 	metrics  map[string]bool // which of cpu/memory/disk are enabled
 	stop     chan struct{}
 	gate     *sendGate
+
+	// prevCPU is the previous /proc/stat reading. CPU utilisation is a
+	// difference between two points in time, and holding the previous one lets
+	// that difference span the whole interval — see sampleCPU. Touched only by
+	// the collector's own goroutine, so no lock.
+	prevCPU     cpuStat
+	havePrevCPU bool
 }
 
 func NewHostMetricsCollector(agentID string, interval time.Duration, enabled []string) *HostMetricsCollector {
@@ -75,13 +82,71 @@ func (h *HostMetricsCollector) sample(ctx context.Context, out chan<- Envelope) 
 	}
 
 	if h.metrics["cpu"] {
-		if pct, err := readCPUPercent(); err == nil {
+		if pct, ok := h.sampleCPU(); ok {
 			h.gate.send(ctx, out, Envelope{
 				Kind: KindMetric, AgentID: h.agentID, Source: "host.cpu.used_pct",
 				Timestamp: now, Value: pct,
 			})
 		}
 	}
+}
+
+// sampleCPU returns utilisation across the whole interval since the previous
+// sample, and whether a value is available yet.
+//
+// It used to take two readings 100ms apart and report the difference between
+// them. That measured 100ms out of every interval — at the default 15s, 0.67%
+// of elapsed time — so a workload that spiked between samples was invisible and
+// the number was noisy even when nothing was wrong. It also parked the
+// collector's goroutine in a sleep on every tick.
+//
+// Differencing against the previous tick instead covers 100% of the elapsed
+// time, which is both the accurate answer and the one consistent with
+// system.cpu.time, the cumulative counter this collector's sibling already
+// emits from the same /proc/stat fields.
+//
+// The cost is that the very first tick after startup has nothing to difference
+// against and reports nothing. That is the honest result: no time has elapsed
+// under observation yet, and inventing a 100ms stand-in for it was the old
+// behaviour's whole problem.
+func (h *HostMetricsCollector) sampleCPU() (float64, bool) {
+	cur, err := readCPUStat()
+	if err != nil {
+		return 0, false
+	}
+	return h.deltaCPU(cur)
+}
+
+// deltaCPU is sampleCPU's arithmetic, split out so it can be exercised without
+// a /proc/stat to read.
+func (h *HostMetricsCollector) deltaCPU(cur cpuStat) (float64, bool) {
+	prev := h.prevCPU
+	had := h.havePrevCPU
+	h.prevCPU = cur
+	h.havePrevCPU = true
+
+	if !had {
+		return 0, false
+	}
+
+	idleDelta := cur.idle - prev.idle
+	totalDelta := cur.total - prev.total
+	if totalDelta <= 0 {
+		// Counters did not move: either two reads landed inside the same clock
+		// tick, or the file went backwards after a suspend. Either way there is
+		// no interval to report on.
+		return 0, false
+	}
+	pct := (1 - idleDelta/totalDelta) * 100
+	// Clamp rather than emit an impossible reading. Deltas can go slightly out
+	// of range across a suspend/resume or a CPU hotplug event.
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return pct, true
 }
 
 // readMemory returns (used, total) in KB from /proc/meminfo.
@@ -113,27 +178,6 @@ func readMemory() (used, total float64, err error) {
 	}
 	used = total - available
 	return used, total, nil
-}
-
-// readCPUPercent does a short (100ms) two-sample delta against
-// /proc/stat's aggregate cpu line to compute instantaneous utilization.
-func readCPUPercent() (float64, error) {
-	s1, err := readCPUStat()
-	if err != nil {
-		return 0, err
-	}
-	time.Sleep(100 * time.Millisecond)
-	s2, err := readCPUStat()
-	if err != nil {
-		return 0, err
-	}
-
-	idleDelta := s2.idle - s1.idle
-	totalDelta := s2.total - s1.total
-	if totalDelta <= 0 {
-		return 0, nil
-	}
-	return (1 - idleDelta/totalDelta) * 100, nil
 }
 
 type cpuStat struct{ idle, total float64 }

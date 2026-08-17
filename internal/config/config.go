@@ -99,6 +99,38 @@ type LogsConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// Paths to tail, e.g. /var/log/app/*.log
 	Paths []string `yaml:"paths"`
+	// Multiline joins continuation lines onto the record they belong to.
+	Multiline MultilineConfig `yaml:"multiline"`
+}
+
+// MultilineConfig controls whether a log record may span several physical
+// lines. Without it a Java stack trace or a Python traceback arrives as dozens
+// of unrelated records with no way to reassemble them, which is the single most
+// common complaint about naive log tailing.
+type MultilineConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	// StartPattern is a regular expression matching the FIRST line of a record.
+	// Anything that does not match is treated as a continuation of the record
+	// before it. Anchor it with ^ — a timestamp or log level at the start of the
+	// line is the usual choice, e.g. `^\d{4}-\d{2}-\d{2}` or `^(INFO|WARN|ERROR)`.
+	//
+	// Matching the start rather than the continuation is deliberate: what a
+	// record begins with is predictable, whereas what a stack trace looks like
+	// varies by language, framework and locale.
+	StartPattern string `yaml:"start_pattern"`
+
+	// MaxLines caps how many physical lines one record may absorb. A pattern
+	// that never matches would otherwise let a single record grow without
+	// bound. Reaching the cap emits what has accumulated, marked as truncated,
+	// rather than discarding it.
+	MaxLines int `yaml:"max_lines"`
+
+	// Timeout is how long an unfinished record waits for more lines before
+	// being emitted anyway. Without it the last record in a quiet file is held
+	// forever, waiting for a successor that never comes — which is exactly the
+	// stack trace you were looking for.
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // AccessLogConfig configures parsing of incoming HTTP requests from an

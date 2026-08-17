@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -104,14 +105,15 @@ func TestAggregator_SummarizesRequests(t *testing.T) {
 	}
 
 	out := a.Flush(time.Now())
-	if len(out) != 7 {
-		t.Fatalf("expected 7 series for one context, got %d: %+v", len(out), out)
+	// Seven scalar series plus the distribution they were derived from.
+	if len(out) != 8 {
+		t.Fatalf("expected 7 series + 1 histogram for one context, got %d: %+v", len(out), out)
 	}
 
 	m := bySource(t, out)
 	for _, e := range out {
-		if e.Kind != collector.KindMetric {
-			t.Errorf("%s: kind = %q, want metric", e.Source, e.Kind)
+		if e.Kind != collector.KindMetric && e.Kind != collector.KindHistogram {
+			t.Errorf("%s: kind = %q, want metric or histogram", e.Source, e.Kind)
 		}
 		if e.Labels["path"] != "/api/orders/{id}" {
 			t.Errorf("%s: path = %q, want normalized /api/orders/{id}", e.Source, e.Labels["path"])
@@ -121,16 +123,14 @@ func TestAggregator_SummarizesRequests(t *testing.T) {
 		}
 	}
 
-	checks := map[string]float64{
+	// Counts, mean and max are tracked exactly.
+	exact := map[string]float64{
 		"http.server.requests":     10,
 		"http.server.errors":       0,
 		"http.server.duration.avg": 5.5,
-		"http.server.duration.p50": 5, // nearest-rank over 1..10
-		"http.server.duration.p95": 10,
-		"http.server.duration.p99": 10,
 		"http.server.duration.max": 10,
 	}
-	for name, want := range checks {
+	for name, want := range exact {
 		e, ok := m[name]
 		if !ok {
 			t.Errorf("missing series %s", name)
@@ -138,6 +138,26 @@ func TestAggregator_SummarizesRequests(t *testing.T) {
 		}
 		if e.Value != want {
 			t.Errorf("%s = %v, want %v", name, e.Value, want)
+		}
+	}
+
+	// Percentiles come from a bucketed histogram, so they carry a bounded
+	// relative error rather than being exact — the deliberate trade that makes
+	// them mergeable across hosts and windows.
+	const tolerance = 0.011
+	approx := map[string]float64{
+		"http.server.duration.p50": 5, // nearest-rank over 1..10
+		"http.server.duration.p95": 10,
+		"http.server.duration.p99": 10,
+	}
+	for name, want := range approx {
+		e, ok := m[name]
+		if !ok {
+			t.Errorf("missing series %s", name)
+			continue
+		}
+		if rel := math.Abs(e.Value-want) / want; rel > tolerance {
+			t.Errorf("%s = %v, want %v within %.1f%%", name, e.Value, want, tolerance*100)
 		}
 	}
 }
@@ -214,28 +234,36 @@ func TestAggregator_FlushResetsWindow(t *testing.T) {
 	a := testAggregator(Config{})
 	a.Add(apiCall("GET", "/api/x", "200", 1))
 
-	if got := len(a.Flush(time.Now())); got != 7 {
-		t.Fatalf("first flush returned %d series, want 7", got)
+	if got := len(a.Flush(time.Now())); got != 8 {
+		t.Fatalf("first flush returned %d series, want 8 (7 scalars + the distribution)", got)
 	}
 	if got := a.Flush(time.Now()); got != nil {
 		t.Errorf("second flush returned %d series, want none", len(got))
 	}
 }
 
-// TestAggregator_ReservoirBoundsMemory: far more requests than MaxSamples must
-// not grow the retained sample set, while counts stay exact.
-func TestAggregator_ReservoirBoundsMemory(t *testing.T) {
-	a := testAggregator(Config{MaxSamples: 100})
+// TestAggregator_HistogramBoundsMemory: far more requests than any sample cap
+// must not grow the per-context footprint, while counts stay exact.
+//
+// This replaced a reservoir. The bound is now the bucket count rather than a
+// sample count, and it is a better bound: a reservoir's error grows the further
+// into the tail you look, because fewer and fewer retained samples support the
+// answer. Bucket error is relative and constant wherever you look.
+func TestAggregator_HistogramBoundsMemory(t *testing.T) {
+	a := testAggregator(Config{})
 	for i := 0; i < 10000; i++ {
 		a.Add(apiCall("GET", "/api/x", "200", float64(i%50)))
 	}
 
 	for key, b := range a.contexts {
-		if b.lat.Len() != 100 {
-			t.Errorf("context %+v retained %d samples, want the 100 cap", key, b.lat.Len())
+		if got := len(b.lat.counts); got > b.lat.maxBuckets {
+			t.Errorf("context %+v grew to %d buckets, cap is %d", key, got, b.lat.maxBuckets)
 		}
 		if b.count != 10000 {
-			t.Errorf("context %+v counted %d requests, want 10000 — the count must stay exact even though samples are capped", key, b.count)
+			t.Errorf("context %+v counted %d requests, want 10000 — the count must stay exact regardless of how the distribution is stored", key, b.count)
+		}
+		if b.lat.Count() != 10000 {
+			t.Errorf("context %+v histogram saw %d observations, want 10000 — bounding memory must never discard one", key, b.lat.Count())
 		}
 	}
 }
@@ -250,4 +278,59 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+// The percentiles keep every existing consumer working; the distribution is
+// what makes the numbers useful across more than one host. Both must be
+// emitted, and the distribution must actually carry its buckets.
+func TestAggregator_EmitsTheDistributionAlongsideThePercentiles(t *testing.T) {
+	a := testAggregator(Config{})
+	for i := 1; i <= 200; i++ {
+		a.Add(apiCall("GET", "/api/x", "200", float64(i)))
+	}
+
+	var hist *collector.Envelope
+	seenPercentiles := 0
+	for _, e := range a.Flush(time.Now()) {
+		switch {
+		case e.Kind == collector.KindHistogram:
+			cp := e
+			hist = &cp
+		case e.Source == "http.server.duration.p50",
+			e.Source == "http.server.duration.p95",
+			e.Source == "http.server.duration.p99":
+			seenPercentiles++
+		}
+	}
+
+	if seenPercentiles != 3 {
+		t.Errorf("emitted %d percentile series, want 3 — existing consumers must not break", seenPercentiles)
+	}
+	if hist == nil {
+		t.Fatal("no histogram envelope was emitted; percentiles alone cannot be merged across hosts")
+	}
+	if hist.Source != "http.server.duration" {
+		t.Errorf("histogram source = %q, want http.server.duration", hist.Source)
+	}
+	raw, ok := hist.Payload[collector.HistogramPointKey]
+	if !ok {
+		t.Fatal("histogram envelope carries no distribution")
+	}
+	pt, ok := raw.(collector.HistogramPoint)
+	if !ok {
+		t.Fatalf("payload is %T, want collector.HistogramPoint", raw)
+	}
+	if pt.Count != 200 {
+		t.Errorf("distribution count = %d, want 200", pt.Count)
+	}
+	var bucketed uint64
+	for _, c := range pt.BucketCounts {
+		bucketed += c
+	}
+	if bucketed+pt.ZeroCount != pt.Count {
+		t.Errorf("bucket counts total %d + %d zeros != %d observations", bucketed, pt.ZeroCount, pt.Count)
+	}
+	if hist.Labels["path"] == "" {
+		t.Error("the distribution lost the labels that say which endpoint it describes")
+	}
 }
