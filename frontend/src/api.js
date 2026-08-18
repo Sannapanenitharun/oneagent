@@ -168,6 +168,60 @@ export function useSnapshot(intervalMs = 5000, hostIndex = 0) {
   return { snapshot, error, loading, paused, setPaused };
 }
 
+// useAllSnapshots polls every configured host, for the fleet view.
+//
+// `enabled` is not an optimisation detail, it is the point: this multiplies
+// transfer by the host count, and each snapshot is the agent's whole retention
+// window. Polling all hosts while you are looking at one host's traces would
+// be paying that cost for nothing, so the caller passes false whenever the
+// fleet view is not on screen.
+//
+// Slower than the single-host poll for the same reason. A fleet overview is
+// read at a glance; it does not need the cadence of a view you are watching.
+//
+// One host failing must not blank the others — each result carries its own
+// error, and Promise.all over already-caught promises never rejects.
+export function useAllSnapshots(intervalMs = 10000, enabled = true) {
+  const [results, setResults] = useState(() => HOSTS.map(() => ({ snapshot: null, error: null })));
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    async function tick() {
+      const next = await Promise.all(
+        HOSTS.map(async (_, i) => {
+          try {
+            return { snapshot: await fetchSnapshot(controller.signal, i), error: null };
+          } catch (err) {
+            if (err.name === "AbortError") return null;
+            return {
+              snapshot: null,
+              error: { kind: err.kind || "unreachable", message: err.message, detail: err.detail || "" },
+            };
+          }
+        })
+      );
+      if (cancelled || next.some((r) => r === null)) return;
+      setResults(next);
+      setLoading(false);
+    }
+
+    tick();
+    const id = setInterval(tick, intervalMs);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(id);
+    };
+  }, [intervalMs, enabled]);
+
+  return { results, loading };
+}
+
 // useHostHealth reports reachability for EVERY configured host, so the picker
 // can show which are up before you switch to one.
 //

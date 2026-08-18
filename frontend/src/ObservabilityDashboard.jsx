@@ -11,7 +11,7 @@ import {
   ChevronUp, ChevronDown, X, Braces,
 } from "lucide-react";
 
-import { useSnapshot, useHostHealth, HOSTS } from "./api";
+import { useSnapshot, useHostHealth, useAllSnapshots, HOSTS } from "./api";
 import { useTheme } from "./useTheme";
 import {
   deriveTraces, deriveEdges, layoutTopology,
@@ -1064,6 +1064,9 @@ function Fact({ label, children }) {
 
 const NAV_GROUPS = [
   { label: "Monitor", items: [
+    // Only meaningful with more than one agent configured, and hidden
+    // otherwise — a "Fleet" of one is a worse Overview.
+    ...(HOSTS.length > 1 ? [{ id: "fleet", label: "Fleet", icon: Server }] : []),
     { id: "overview", label: "Overview", icon: LayoutDashboard },
     { id: "topology", label: "Service Topology", icon: Network },
   ]},
@@ -1125,6 +1128,151 @@ function Sidebar({ view, setView, snap }) {
   );
 }
 
+// latestValue pulls one scalar out of a snapshot without running the full
+// adapter pipeline. The fleet view needs two numbers per host; deriving every
+// panel for N hosts to read them would cost N times a job sized for one.
+function latestValue(snap, name) {
+  const s = snap?.series?.find((x) => x.name === name);
+  const pts = s?.points;
+  return pts && pts.length ? pts[pts.length - 1].v : null;
+}
+
+// sparkPoints returns the tail of a series in the shape recharts wants.
+function sparkPoints(snap, name, n = 40) {
+  const s = snap?.series?.find((x) => x.name === name);
+  if (!s?.points?.length) return [];
+  return s.points.slice(-n).map((p) => ({ v: p.v }));
+}
+
+function fmtUptime(snap) {
+  if (!snap?.now || !snap?.started_at) return "—";
+  const sec = Math.max(0, (snap.now - snap.started_at) / 1000);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+// HostCard is one agent's line in the fleet view.
+//
+// Deliberately shows the same handful of facts for every host so they can be
+// compared down a column, rather than whatever each host happens to have most
+// of. An unreachable host keeps its card and states why — dropping it from
+// the grid would make a dead agent look like one you never configured.
+function HostCard({ host, index, snapshot, error, onOpen }) {
+  const cpu = latestValue(snapshot, "host.cpu.used_pct");
+  const mem = latestValue(snapshot, "host.memory.used_pct");
+  const cpuSpark = sparkPoints(snapshot, "host.cpu.used_pct");
+  const memSpark = sparkPoints(snapshot, "host.memory.used_pct");
+  const label = host.name || snapshot?.agent_id || host.url.replace(/^https?:\/\//, "");
+  const up = !!snapshot && !error;
+
+  // max_series defaults to 500 and the agent REFUSES new series past it
+  // rather than evicting, so approaching the cap is worth surfacing before
+  // the view silently goes incomplete.
+  const seriesCount = snapshot?.series?.length ?? 0;
+  const nearCap = seriesCount >= 400;
+
+  const stat = (k, v, tone) => (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[9.5px] font-mono uppercase tracking-wider text-[var(--ink-5)]">{k}</span>
+      <span className="text-[12.5px] font-mono" style={tone ? { color: tone } : undefined}>{v}</span>
+    </div>
+  );
+
+  return (
+    <button
+      onClick={() => onOpen(index)}
+      className="text-left rounded border border-[var(--n3)] bg-[var(--surface)] p-3.5 flex flex-col gap-3 hover:border-[var(--n5)] transition-colors"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: up ? "var(--good)" : "var(--crit)" }} />
+          <span className="font-mono text-[13px] truncate">{label}</span>
+        </div>
+        <span className="text-[10px] font-mono text-[var(--ink-5)] shrink-0">{snapshot?.version || ""}</span>
+      </div>
+
+      {!up ? (
+        <p className="text-[11px] font-mono" style={{ color: "var(--crit)" }}>
+          {error?.message || "not reachable"}
+          <span className="block text-[10px] text-[var(--ink-5)] mt-1 font-normal">{host.url}</span>
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-3">
+            {[
+              { k: "CPU", v: cpu, spark: cpuSpark, suffix: "%" },
+              { k: "MEM", v: mem, spark: memSpark, suffix: "%" },
+            ].map(({ k, v, spark, suffix }) => (
+              <div key={k} className="flex flex-col gap-1">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-[9.5px] font-mono uppercase tracking-wider text-[var(--ink-5)]">{k}</span>
+                  <span className="text-[13px] font-mono tabular-nums">
+                    {v == null ? "—" : `${v.toFixed(1)}${suffix}`}
+                  </span>
+                </div>
+                <div style={{ height: 26 }}>
+                  {spark.length > 1 && (
+                    <ResponsiveContainer width="100%" height={26}>
+                      <AreaChart data={spark} margin={{ top: 2, right: 0, left: 0, bottom: 0 }}>
+                        <Area
+                          type="monotone" dataKey="v" stroke="var(--accent)" strokeWidth={1.5}
+                          fill="var(--accent)" fillOpacity={0.12} isAnimationActive={false} dot={false}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-4 gap-2 pt-1 border-t border-[var(--n2)]">
+            {stat("series", seriesCount, nearCap ? "var(--warn)" : undefined)}
+            {stat("logs", snapshot?.logs?.length ?? 0)}
+            {stat("spans", snapshot?.spans?.length ?? 0)}
+            {stat("dropped", snapshot?.series_dropped ?? 0,
+              (snapshot?.series_dropped ?? 0) > 0 ? "var(--crit)" : undefined)}
+          </div>
+
+          <div className="flex items-center justify-between text-[10px] font-mono text-[var(--ink-5)]">
+            <span>up {fmtUptime(snapshot)}</span>
+            {snapshot?.reload_pending_restart?.length > 0 && (
+              <span style={{ color: "var(--warn)" }}>restart pending</span>
+            )}
+          </div>
+        </>
+      )}
+    </button>
+  );
+}
+
+function FleetView({ results, loading, onOpen }) {
+  if (loading) {
+    return <p className="text-[12px] font-mono text-[var(--ink-3)]">polling {HOSTS.length} hosts…</p>;
+  }
+  const reachable = results.filter((r) => r.snapshot && !r.error).length;
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="text-[11px] font-mono text-[var(--ink-3)]">
+        {reachable} of {HOSTS.length} hosts reachable · select a host to open its dashboard
+      </p>
+      <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(19rem, 1fr))" }}>
+        {HOSTS.map((host, i) => (
+          <HostCard
+            key={host.url}
+            host={host}
+            index={i}
+            snapshot={results[i]?.snapshot}
+            error={results[i]?.error}
+            onOpen={onOpen}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // HostPicker switches which agent the dashboard is reading.
 //
 // A native <select> rather than a custom dropdown: it is keyboard accessible
@@ -1180,6 +1328,8 @@ export default function ObservabilityDashboard() {
   const [hostIndex, setHostIndex] = useState(0);
   const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000, hostIndex);
   const hostHealth = useHostHealth();
+  // Only polls while the fleet view is on screen — see useAllSnapshots.
+  const { results: fleet, loading: fleetLoading } = useAllSnapshots(10000, view === "fleet");
   // Charts need no re-render on theme change: their colours are var()
   // references that CSS re-resolves at paint time.
   const { theme, setTheme } = useTheme();
@@ -1315,6 +1465,16 @@ export default function ObservabilityDashboard() {
               openService={(id) => { setSelected(id); setView("topology"); }}
               openHost={() => setView("infra")}
               openLogs={() => setView("logs")}
+            />
+          )}
+          {view === "fleet" && (
+            <FleetView
+              results={fleet}
+              loading={fleetLoading}
+              onOpen={(i) => {
+                setHostIndex(i);
+                setView("overview");
+              }}
             />
           )}
           {view === "topology" && <TopologyView d={d} selected={selected} setSelected={setSelected} />}
