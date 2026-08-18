@@ -16,7 +16,7 @@ import { useTheme } from "./useTheme";
 import {
   deriveTraces, deriveEdges, layoutTopology,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
-  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields,
+  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -1128,147 +1128,175 @@ function Sidebar({ view, setView, snap }) {
   );
 }
 
-// latestValue pulls one scalar out of a snapshot without running the full
-// adapter pipeline. The fleet view needs two numbers per host; deriving every
-// panel for N hosts to read them would cost N times a job sized for one.
-function latestValue(snap, name) {
-  const s = snap?.series?.find((x) => x.name === name);
-  const pts = s?.points;
-  return pts && pts.length ? pts[pts.length - 1].v : null;
-}
-
-// sparkPoints returns the tail of a series in the shape recharts wants.
-function sparkPoints(snap, name, n = 40) {
-  const s = snap?.series?.find((x) => x.name === name);
-  if (!s?.points?.length) return [];
-  return s.points.slice(-n).map((p) => ({ v: p.v }));
-}
-
-function fmtUptime(snap) {
-  if (!snap?.now || !snap?.started_at) return "—";
-  const sec = Math.max(0, (snap.now - snap.started_at) / 1000);
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-
-// HostCard is one agent's line in the fleet view.
+// UsageBar is the list's colour-coded progress bar.
 //
-// Deliberately shows the same handful of facts for every host so they can be
-// compared down a column, rather than whatever each host happens to have most
-// of. An unreachable host keeps its card and states why — dropping it from
-// the grid would make a dead agent look like one you never configured.
-function HostCard({ host, index, snapshot, error, onOpen }) {
-  const cpu = latestValue(snapshot, "host.cpu.used_pct");
-  const mem = latestValue(snapshot, "host.memory.used_pct");
-  const cpuSpark = sparkPoints(snapshot, "host.cpu.used_pct");
-  const memSpark = sparkPoints(snapshot, "host.memory.used_pct");
-  const label = host.name || snapshot?.agent_id || host.url.replace(/^https?:\/\//, "");
-  const up = !!snapshot && !error;
-
-  // max_series defaults to 500 and the agent REFUSES new series past it
-  // rather than evicting, so approaching the cap is worth surfacing before
-  // the view silently goes incomplete.
-  const seriesCount = snapshot?.series?.length ?? 0;
-  const nearCap = seriesCount >= 400;
-
-  const stat = (k, v, tone) => (
-    <div className="flex flex-col gap-0.5">
-      <span className="text-[9.5px] font-mono uppercase tracking-wider text-[var(--ink-5)]">{k}</span>
-      <span className="text-[12.5px] font-mono" style={tone ? { color: tone } : undefined}>{v}</span>
+// Colour is a redundant encoding, never the only one: the number is always
+// printed beside it, so the column still reads correctly for anyone who cannot
+// distinguish the fill colours.
+function UsageBar({ value }) {
+  const v = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+  const tone = v >= 90 ? "var(--crit)" : v >= 75 ? "var(--warn)" : "var(--good)";
+  return (
+    <div className="flex items-center gap-2 min-w-0">
+      <div className="h-1.5 rounded-full bg-[var(--n3)] flex-1 min-w-[3rem] overflow-hidden">
+        <div className="h-full rounded-full" style={{ width: `${v}%`, background: tone }} />
+      </div>
+      <span className="text-[11px] font-mono tabular-nums w-[3.2rem] text-right shrink-0">
+        {Number.isFinite(value) ? `${v.toFixed(0)}%` : "—"}
+      </span>
     </div>
   );
-
-  return (
-    <button
-      onClick={() => onOpen(index)}
-      className="text-left rounded border border-[var(--n3)] bg-[var(--surface)] p-3.5 flex flex-col gap-3 hover:border-[var(--n5)] transition-colors"
-    >
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: up ? "var(--good)" : "var(--crit)" }} />
-          <span className="font-mono text-[13px] truncate">{label}</span>
-        </div>
-        <span className="text-[10px] font-mono text-[var(--ink-5)] shrink-0">{snapshot?.version || ""}</span>
-      </div>
-
-      {!up ? (
-        <p className="text-[11px] font-mono" style={{ color: "var(--crit)" }}>
-          {error?.message || "not reachable"}
-          <span className="block text-[10px] text-[var(--ink-5)] mt-1 font-normal">{host.url}</span>
-        </p>
-      ) : (
-        <>
-          <div className="grid grid-cols-2 gap-3">
-            {[
-              { k: "CPU", v: cpu, spark: cpuSpark, suffix: "%" },
-              { k: "MEM", v: mem, spark: memSpark, suffix: "%" },
-            ].map(({ k, v, spark, suffix }) => (
-              <div key={k} className="flex flex-col gap-1">
-                <div className="flex items-baseline justify-between">
-                  <span className="text-[9.5px] font-mono uppercase tracking-wider text-[var(--ink-5)]">{k}</span>
-                  <span className="text-[13px] font-mono tabular-nums">
-                    {v == null ? "—" : `${v.toFixed(1)}${suffix}`}
-                  </span>
-                </div>
-                <div style={{ height: 26 }}>
-                  {spark.length > 1 && (
-                    <ResponsiveContainer width="100%" height={26}>
-                      <AreaChart data={spark} margin={{ top: 2, right: 0, left: 0, bottom: 0 }}>
-                        <Area
-                          type="monotone" dataKey="v" stroke="var(--accent)" strokeWidth={1.5}
-                          fill="var(--accent)" fillOpacity={0.12} isAnimationActive={false} dot={false}
-                        />
-                      </AreaChart>
-                    </ResponsiveContainer>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <div className="grid grid-cols-4 gap-2 pt-1 border-t border-[var(--n2)]">
-            {stat("series", seriesCount, nearCap ? "var(--warn)" : undefined)}
-            {stat("logs", snapshot?.logs?.length ?? 0)}
-            {stat("spans", snapshot?.spans?.length ?? 0)}
-            {stat("dropped", snapshot?.series_dropped ?? 0,
-              (snapshot?.series_dropped ?? 0) > 0 ? "var(--crit)" : undefined)}
-          </div>
-
-          <div className="flex items-center justify-between text-[10px] font-mono text-[var(--ink-5)]">
-            <span>up {fmtUptime(snapshot)}</span>
-            {snapshot?.reload_pending_restart?.length > 0 && (
-              <span style={{ color: "var(--warn)" }}>restart pending</span>
-            )}
-          </div>
-        </>
-      )}
-    </button>
-  );
 }
 
+// The host list's columns. `get` pulls the sort key so sorting never has to
+// know how a cell is rendered.
+const HOST_COLUMNS = [
+  { id: "host", label: "Hostname", get: (r) => r.host, align: "left" },
+  { id: "status", label: "Status", get: (r) => (r.active ? 1 : 0), align: "left" },
+  { id: "cpu", label: "CPU Usage", get: (r) => r.cpu, align: "left", bar: true },
+  { id: "mem", label: "Memory Usage", get: (r) => r.mem, align: "left", bar: true },
+  { id: "iowait", label: "IOWait", get: (r) => r.iowait, align: "right" },
+  { id: "disk", label: "Disk Usage", get: (r) => r.disk, align: "left", bar: true },
+  { id: "load15", label: "Load Avg", get: (r) => r.load15, align: "right" },
+];
+
 function FleetView({ results, loading, onOpen }) {
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState({ col: "host", dir: "asc" });
+
+  // One derivation per host per poll, not per render.
+  const rows = useMemo(
+    () =>
+      HOSTS.map((host, i) => {
+        const snap = results[i]?.snapshot;
+        const row = snap ? hostRow(snap) : null;
+        return {
+          index: i,
+          url: host.url,
+          error: results[i]?.error,
+          // A host that never answered still gets a row: its configured name
+          // is all we know about it, and omitting it would hide the outage.
+          row: row || {
+            host: host.name || host.url.replace(/^https?:\/\//, ""),
+            active: false, os: "—", version: "",
+            cpu: NaN, mem: NaN, iowait: NaN, disk: NaN, load15: NaN,
+          },
+        };
+      }),
+    [results]
+  );
+
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const filtered = q ? rows.filter((r) => r.row.host.toLowerCase().includes(q)) : rows;
+    const col = HOST_COLUMNS.find((c) => c.id === sort.col) || HOST_COLUMNS[0];
+    const sign = sort.dir === "asc" ? 1 : -1;
+    return [...filtered].sort((a, b) => {
+      const x = col.get(a.row);
+      const y = col.get(b.row);
+      if (typeof x === "string") return sign * x.localeCompare(y);
+      // Unreachable hosts have NaN metrics; they sort last either way rather
+      // than landing at the top of an ascending numeric sort.
+      const nx = Number.isFinite(x) ? x : -Infinity;
+      const ny = Number.isFinite(y) ? y : -Infinity;
+      return sign * (nx - ny);
+    });
+  }, [rows, query, sort]);
+
   if (loading) {
     return <p className="text-[12px] font-mono text-[var(--ink-3)]">polling {HOSTS.length} hosts…</p>;
   }
-  const reachable = results.filter((r) => r.snapshot && !r.error).length;
+
+  const toggle = (id) =>
+    setSort((s) => ({ col: id, dir: s.col === id && s.dir === "asc" ? "desc" : "asc" }));
+  const active = rows.filter((r) => r.row.active).length;
+
   return (
-    <div className="flex flex-col gap-4">
-      <p className="text-[11px] font-mono text-[var(--ink-3)]">
-        {reachable} of {HOSTS.length} hosts reachable · select a host to open its dashboard
-      </p>
-      <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(19rem, 1fr))" }}>
-        {HOSTS.map((host, i) => (
-          <HostCard
-            key={host.url}
-            host={host}
-            index={i}
-            snapshot={results[i]?.snapshot}
-            error={results[i]?.error}
-            onOpen={onOpen}
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="relative">
+          <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--ink-5)]" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="filter by hostname"
+            aria-label="Filter hosts by name"
+            className="text-[11.5px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded pl-7 pr-2.5 py-1.5 text-[var(--ink)] w-[16rem]"
           />
-        ))}
+        </div>
+        <span className="text-[11px] font-mono text-[var(--ink-4)]">
+          Showing {visible.length} of {rows.length} hosts · {active} active
+        </span>
       </div>
+
+      <div className="border border-[var(--n3)] rounded overflow-x-auto">
+        <table className="w-full min-w-[52rem] border-collapse">
+          <thead>
+            <tr className="bg-[var(--surface)]">
+              {HOST_COLUMNS.map((c) => (
+                <th
+                  key={c.id}
+                  onClick={() => toggle(c.id)}
+                  className="text-left px-3 py-2 border-b border-[var(--n3)] cursor-pointer select-none"
+                  aria-sort={sort.col === c.id ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}
+                >
+                  <span className="inline-flex items-center gap-1 text-[9.5px] font-mono uppercase tracking-widest text-[var(--ink-5)]">
+                    {c.label}
+                    {sort.col === c.id &&
+                      (sort.dir === "asc" ? <ChevronUp size={10} /> : <ChevronDown size={10} />)}
+                  </span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {visible.map(({ index, row, error, url }) => (
+              <tr
+                key={url}
+                onClick={() => onOpen(index)}
+                className="cursor-pointer hover:bg-[var(--surface)] border-b border-[var(--n2)] last:border-b-0"
+              >
+                <td className="px-3 py-2.5">
+                  <span className="font-mono text-[12.5px] text-[var(--accent)]">{row.host}</span>
+                  {row.version && (
+                    <span className="block text-[10px] font-mono text-[var(--ink-5)]">{row.version}</span>
+                  )}
+                </td>
+                <td className="px-3 py-2.5">
+                  <span className="inline-flex items-center gap-1.5 text-[10.5px] font-mono">
+                    <span
+                      className="w-1.5 h-1.5 rounded-full"
+                      style={{ background: row.active ? "var(--good)" : "var(--crit)" }}
+                    />
+                    <span style={{ color: row.active ? "var(--ink-3)" : "var(--crit)" }}>
+                      {row.active ? "ACTIVE" : "INACTIVE"}
+                    </span>
+                  </span>
+                  {error && (
+                    <span className="block text-[10px] font-mono text-[var(--ink-5)] mt-0.5">
+                      {error.message}
+                    </span>
+                  )}
+                </td>
+                <td className="px-3 py-2.5 w-[14%]"><UsageBar value={row.cpu} /></td>
+                <td className="px-3 py-2.5 w-[14%]"><UsageBar value={row.mem} /></td>
+                <td className="px-3 py-2.5 text-right font-mono text-[11.5px] tabular-nums">
+                  {Number.isFinite(row.iowait) ? `${row.iowait.toFixed(2)}%` : "—"}
+                </td>
+                <td className="px-3 py-2.5 w-[14%]"><UsageBar value={row.disk} /></td>
+                <td className="px-3 py-2.5 text-right font-mono text-[11.5px] tabular-nums">
+                  {Number.isFinite(row.load15) ? row.load15.toFixed(2) : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="text-[10.5px] font-mono text-[var(--ink-5)]">
+        Select a host to open its infrastructure detail. Status is ACTIVE when a metric
+        arrived in the last 10 minutes.
+      </p>
     </div>
   );
 }
@@ -1473,7 +1501,8 @@ export default function ObservabilityDashboard() {
               loading={fleetLoading}
               onOpen={(i) => {
                 setHostIndex(i);
-                setView("overview");
+                // SigNoz opens the host's detail, not a generic overview.
+                setView("infra");
               }}
             />
           )}

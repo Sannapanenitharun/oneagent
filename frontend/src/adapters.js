@@ -464,6 +464,66 @@ export function deriveInfra(snap) {
   ];
 }
 
+// hostRow reduces one agent's snapshot to the columns a host list shows.
+//
+// The column set follows the one SigNoz's host monitoring settles on —
+// hostname, status, CPU, memory, IOWait, disk, load average — because those
+// are the seven facts that decide whether a host needs attention, and they
+// happen to be derivable from metrics this agent already emits. That is not a
+// coincidence: both read the OpenTelemetry hostmetrics conventions, so
+// system.cpu.time / system.memory.usage / system.filesystem.usage /
+// system.cpu.load_average.15m mean the same thing on both sides.
+//
+// IOWait earns its column despite looking like a CPU detail. A host pinned on
+// iowait is not busy, it is BLOCKED — the CPU is idle waiting for a disk that
+// cannot keep up. Read from CPU usage alone that host looks fine.
+export function hostRow(snap) {
+  const base = deriveInfra(snap)[0];
+  if (!base) return null;
+
+  // IOWait as a share of total CPU time, from the same rates the CPU column
+  // uses, so the two columns cannot disagree.
+  const cpuStates = pick(snap, "system.cpu.time").map((s) => ({
+    state: s.labels?.state,
+    points: prepare(s),
+  }));
+  let iowait = NaN;
+  if (cpuStates.length) {
+    const total = cpuStates.reduce((a, s) => a + latest(s.points), 0);
+    const wait = latest(cpuStates.find((s) => s.state === "iowait")?.points || []);
+    if (total > 0) iowait = (wait / total) * 100;
+  }
+
+  // SigNoz calls a host ACTIVE when any metric arrived in the last 10 minutes.
+  // Worth having as its own column rather than inferring from the numbers: a
+  // host that stopped reporting keeps its last values, so stale data reads as
+  // healthy right up until someone notices the timestamps.
+  const newest = (snap.series || []).reduce((max, s) => {
+    const p = s.points;
+    return p && p.length ? Math.max(max, p[p.length - 1].t) : max;
+  }, 0);
+  const ageSec = newest && snap.now ? (snap.now - newest) / 1000 : Infinity;
+
+  return {
+    host: base.host,
+    version: snap.version || "",
+    os: "linux", // the agent reads /proc and builds only for Linux
+    active: ageSec <= 600,
+    ageSec,
+    cpu: base.cpu,
+    mem: base.mem,
+    iowait: Number.isFinite(iowait) ? Math.round(iowait * 100) / 100 : 0,
+    disk: base.disk,
+    load15: Math.round((latest(pick(snap, "system.cpu.load_average.15m")[0]?.points || []) || 0) * 100) / 100,
+    mounts: base.mounts,
+    seriesCount: snap.series?.length || 0,
+    logsCount: snap.logs?.length || 0,
+    spansCount: snap.spans?.length || 0,
+    dropped: snap.series_dropped || 0,
+    pending: snap.reload_pending_restart || [],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // overview charts
 // ---------------------------------------------------------------------------
