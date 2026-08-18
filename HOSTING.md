@@ -24,7 +24,7 @@ automatically attaching `scripts/get.sh` itself as a release asset too.
 Then the real one-liner for anyone to run is:
 
 ```bash
-curl -fsSL https://github.com/Sannapanenitharun/agent-i/releases/latest/download/get.sh \
+curl -fsSL https://github.com/Sannapanenitharun/oneagent/releases/latest/download/get.sh \
   | sudo bash
 ```
 

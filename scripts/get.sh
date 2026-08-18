@@ -5,7 +5,7 @@
 #   curl -fsSL https://<your-host>/get.sh | sudo bash
 #
 # Optional environment overrides:
-#   AGENT_I_REPO=Sannapanenitharun/agent-i   # GitHub "owner/repo" to fetch releases from
+#   AGENT_I_REPO=owner/repo                # GitHub repo to fetch releases from, if you forked
 #   AGENT_I_VERSION=v1.2.0                 # defaults to the latest release
 #
 # What it does, in order:
