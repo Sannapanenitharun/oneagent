@@ -11,7 +11,7 @@ import {
   ChevronUp, ChevronDown, X, Braces,
 } from "lucide-react";
 
-import { useSnapshot } from "./api";
+import { useSnapshot, useHostHealth, HOSTS } from "./api";
 import { useTheme } from "./useTheme";
 import {
   deriveTraces, deriveEdges, layoutTopology,
@@ -1125,11 +1125,61 @@ function Sidebar({ view, setView, snap }) {
   );
 }
 
+// HostPicker switches which agent the dashboard is reading.
+//
+// A native <select> rather than a custom dropdown: it is keyboard accessible
+// and screen-reader correct for free, and closes on outside click without any
+// of the listener bookkeeping a div-based menu needs. At fleet sizes this UI
+// is meant for — a handful of hosts you have tunnels open to — there is
+// nothing a custom menu would add.
+//
+// The dot is the host's own reachability, not the selected host's. Its whole
+// purpose is to tell you a host is unreachable BEFORE you switch to it and
+// wonder why the dashboard went blank.
+function HostPicker({ hostIndex, setHostIndex, health, agentID }) {
+  const dot = (state) =>
+    state === "up" ? "var(--good)" : state === "down" ? "var(--crit)" : "var(--ink-3)";
+
+  // A configured name always wins: it is the only label available for a host
+  // whose tunnel is down, since an unreachable agent reports no agent_id.
+  // The live agent_id is a fallback for entries given as a bare URL.
+  const labelFor = (host, i) => {
+    if (host.name) return host.name;
+    if (i === hostIndex && agentID) return agentID;
+    return host.url.replace(/^https?:\/\//, "");
+  };
+
+  return (
+    <div className="flex items-center gap-2 pl-3 ml-1 border-l border-[var(--n2)]">
+      <span
+        className="w-2 h-2 rounded-full shrink-0"
+        style={{ background: dot(health[hostIndex]) }}
+        aria-hidden="true"
+      />
+      <select
+        aria-label="Select host"
+        value={hostIndex}
+        onChange={(e) => setHostIndex(Number(e.target.value))}
+        className="text-[11px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded px-2 py-1 text-[var(--ink)] cursor-pointer max-w-[14rem]"
+      >
+        {HOSTS.map((host, i) => (
+          <option key={host.url} value={i}>
+            {health[i] === "down" ? "○ " : "● "}
+            {labelFor(host, i)}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 export default function ObservabilityDashboard() {
   const [view, setView] = useState("overview");
   const [selected, setSelected] = useState(null);
   const [now, setNow] = useState(new Date());
-  const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000);
+  const [hostIndex, setHostIndex] = useState(0);
+  const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000, hostIndex);
+  const hostHealth = useHostHealth();
   // Charts need no re-render on theme change: their colours are var()
   // references that CSS re-resolves at paint time.
   const { theme, setTheme } = useTheme();
@@ -1167,9 +1217,20 @@ export default function ObservabilityDashboard() {
           <div>
             <h1 className="font-mono text-sm tracking-wide">AGENT-I</h1>
             <p className="text-[10px] text-[var(--ink-3)] font-mono">
-              {snapshot?.agent_id || "—"} · {now.toLocaleTimeString()}
+              {HOSTS.length > 1 ? `${HOSTS.length} hosts` : snapshot?.agent_id || "—"} ·{" "}
+              {now.toLocaleTimeString()}
             </p>
           </div>
+          {/* Only rendered for a genuine fleet. A picker with one entry is
+              chrome that implies a choice you do not have. */}
+          {HOSTS.length > 1 && (
+            <HostPicker
+              hostIndex={hostIndex}
+              setHostIndex={setHostIndex}
+              health={hostHealth}
+              agentID={snapshot?.agent_id}
+            />
+          )}
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-[11px] font-mono">
