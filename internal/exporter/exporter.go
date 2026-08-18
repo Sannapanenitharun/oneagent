@@ -145,13 +145,18 @@ type httpExporter struct {
 	headers       map[string]string
 	client        *http.Client
 	batchSize     int
+	maxBatchBytes int
 	flushInterval time.Duration
 	maxRetries    int
 
-	mu      sync.Mutex
-	buf     []collector.Envelope
-	stopCh  chan struct{}
-	flushWg sync.WaitGroup
+	mu sync.Mutex
+	// bufBytes is the running size estimate for buf, kept on append so the
+	// flush decision is free. See batch.go for why the count limit alone is
+	// not enough.
+	buf      []collector.Envelope
+	bufBytes int
+	stopCh   chan struct{}
+	flushWg  sync.WaitGroup
 }
 
 func newHTTPExporter(cfg config.ExporterConfig) (*httpExporter, error) {
@@ -176,6 +181,7 @@ func newHTTPExporter(cfg config.ExporterConfig) (*httpExporter, error) {
 		headers:       cfg.Headers,
 		client:        &http.Client{Timeout: 10 * time.Second},
 		batchSize:     batchSize,
+		maxBatchBytes: resolveMaxBatchBytes(cfg.MaxBatchBytes),
 		flushInterval: flushInterval,
 		maxRetries:    maxRetries,
 		stopCh:        make(chan struct{}),
@@ -207,7 +213,10 @@ func (h *httpExporter) flushLoop() {
 func (h *httpExporter) Export(e collector.Envelope) error {
 	h.mu.Lock()
 	h.buf = append(h.buf, e)
-	shouldFlush := len(h.buf) >= h.batchSize
+	h.bufBytes += envelopeBytes(e)
+	// Either limit fills the batch. An envelope bigger than the cap on its own
+	// flushes alone rather than being dropped — a record cannot be split.
+	shouldFlush := len(h.buf) >= h.batchSize || h.bufBytes >= h.maxBatchBytes
 	h.mu.Unlock()
 
 	if shouldFlush {
@@ -224,6 +233,7 @@ func (h *httpExporter) flush() error {
 	}
 	batch := h.buf
 	h.buf = nil
+	h.bufBytes = 0
 	h.mu.Unlock()
 
 	payload, err := json.Marshal(batch)

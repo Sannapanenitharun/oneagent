@@ -228,9 +228,24 @@ exporter:
   # endpoint: "http://169.58.93.233:4318"                           # otlp_http: base URL of the OTLP receiver — no trailing /v1/... path, that's added automatically per signal type
   # headers_env:                                                    # otlp_http/http: header name -> env var holding its value (never put the key directly in this file)
   #   x-ingestion-key: "OTLP_INGESTION_KEY"
-  # batch_size: 100          # envelopes per POST before a size-triggered flush
+  # batch_size: 100          # envelopes per POST before a count-triggered flush
   # flush_interval: 5s       # max time a partial batch waits before flushing
   # max_retries: 3           # retries on 5xx/network error; 4xx responses are never retried
+  #
+  # Cap on the estimated encoded size of one POST. A batch is sent as soon as
+  # EITHER limit is reached, because batch_size bounds the record count and
+  # says nothing about the bytes: 100 syslog lines are ~20 KB, while 100
+  # multi-line records — each holding up to logs.multiline.max_lines lines —
+  # are orders of magnitude larger.
+  #
+  # This is the limit that matters, because exceeding it is unrecoverable. A
+  # backend rejects an oversized request outright and retrying cannot help, so
+  # the whole batch is lost; a batch that is merely too numerous still arrives.
+  #
+  # The default is 4 MiB, matching traces.max_request_bytes — what this agent's
+  # own OTLP receiver accepts. Raise it only if your backend documents a larger
+  # limit, and lower it if it documents a smaller one.
+  # max_batch_bytes: 4194304
   #
   # The http and otlp_http exporters deliver on their own goroutine so a slow
   # backend cannot stall collection. These bound that buffer:

@@ -276,6 +276,13 @@ type ExporterConfig struct {
 	BatchSize     int           `yaml:"batch_size"`     // envelopes per POST before a size-triggered flush
 	FlushInterval time.Duration `yaml:"flush_interval"` // max time a partial batch waits before flushing
 	MaxRetries    int           `yaml:"max_retries"`    // retry attempts on 5xx/network error, not on 4xx
+	// MaxBatchBytes caps the estimated encoded size of one POST. BatchSize
+	// alone bounds the record COUNT, which says nothing about the bytes: 100
+	// syslog lines and 100 joined stack traces are three orders of magnitude
+	// apart. Without this an oversized request is rejected by the backend and
+	// no retry can succeed, so the whole batch is lost. Defaults to 4 MiB —
+	// the same limit this agent's own OTLP receiver enforces inbound.
+	MaxBatchBytes int `yaml:"max_batch_bytes"`
 
 	// QueueSize bounds the envelopes buffered between collection and delivery
 	// for the network exporters. When it fills, the oldest are dropped and

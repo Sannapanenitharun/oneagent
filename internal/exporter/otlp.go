@@ -188,6 +188,7 @@ type otlpHTTPExporter struct {
 	headers       map[string]string
 	client        *http.Client
 	batchSize     int
+	maxBatchBytes int
 	flushInterval time.Duration
 	maxRetries    int
 
@@ -195,8 +196,13 @@ type otlpHTTPExporter struct {
 	metricsBuf []collector.Envelope
 	tracesBuf  []collector.Envelope
 	logsBuf    []collector.Envelope
-	stopCh     chan struct{}
-	flushWg    sync.WaitGroup
+	// Running size estimates for the buffers above, maintained on append so a
+	// flush decision costs nothing. Reset together with the buffers.
+	metricsBytes int
+	tracesBytes  int
+	logsBytes    int
+	stopCh       chan struct{}
+	flushWg      sync.WaitGroup
 
 	hostIDOnce sync.Once
 	hostIDVal  string
@@ -224,6 +230,7 @@ func newOTLPHTTPExporter(cfg config.ExporterConfig) (*otlpHTTPExporter, error) {
 		headers:       cfg.Headers,
 		client:        &http.Client{Timeout: 10 * time.Second},
 		batchSize:     batchSize,
+		maxBatchBytes: resolveMaxBatchBytes(cfg.MaxBatchBytes),
 		flushInterval: flushInterval,
 		maxRetries:    maxRetries,
 		stopCh:        make(chan struct{}),
@@ -252,19 +259,31 @@ func (o *otlpHTTPExporter) Export(e collector.Envelope) error {
 	if o.agentIDLabel == "" {
 		o.agentIDLabel = e.AgentID
 	}
+	// A batch is full on EITHER limit. Count bounds how many records a backend
+	// has to parse; bytes bound how large the request is. Neither implies the
+	// other, and only the second one is fatal when exceeded — an oversized
+	// request is rejected outright and retrying cannot help.
+	//
+	// A single envelope larger than the cap still flushes here, alone, rather
+	// than being dropped: one record cannot be split, and sending it is the
+	// only way it can possibly arrive.
+	size := envelopeBytes(e)
 	var full bool
 	switch e.Kind {
 	case collector.KindMetric, collector.KindHistogram:
 		// A distribution is a metric — it travels in the same OTLP request and
 		// differs only in which data-point shape it produces.
 		o.metricsBuf = append(o.metricsBuf, e)
-		full = len(o.metricsBuf) >= o.batchSize
+		o.metricsBytes += size
+		full = len(o.metricsBuf) >= o.batchSize || o.metricsBytes >= o.maxBatchBytes
 	case collector.KindTrace:
 		o.tracesBuf = append(o.tracesBuf, e)
-		full = len(o.tracesBuf) >= o.batchSize
+		o.tracesBytes += size
+		full = len(o.tracesBuf) >= o.batchSize || o.tracesBytes >= o.maxBatchBytes
 	default: // KindLog, KindAPICall — both exported as OTLP logs
 		o.logsBuf = append(o.logsBuf, e)
-		full = len(o.logsBuf) >= o.batchSize
+		o.logsBytes += size
+		full = len(o.logsBuf) >= o.batchSize || o.logsBytes >= o.maxBatchBytes
 	}
 	o.mu.Unlock()
 
@@ -278,6 +297,7 @@ func (o *otlpHTTPExporter) flushAll() error {
 	o.mu.Lock()
 	metrics, traces, logs := o.metricsBuf, o.tracesBuf, o.logsBuf
 	o.metricsBuf, o.tracesBuf, o.logsBuf = nil, nil, nil
+	o.metricsBytes, o.tracesBytes, o.logsBytes = 0, 0, 0
 	o.mu.Unlock()
 
 	var errs []error
