@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -206,6 +207,10 @@ type otlpHTTPExporter struct {
 
 	hostIDOnce sync.Once
 	hostIDVal  string
+
+	// resourceAttrs are runtime-discovered attributes describing the host
+	// (EC2 instance identity). Fixed for the life of the process.
+	resourceAttrs map[string]string
 }
 
 func newOTLPHTTPExporter(cfg config.ExporterConfig) (*otlpHTTPExporter, error) {
@@ -233,6 +238,7 @@ func newOTLPHTTPExporter(cfg config.ExporterConfig) (*otlpHTTPExporter, error) {
 		maxBatchBytes: resolveMaxBatchBytes(cfg.MaxBatchBytes),
 		flushInterval: flushInterval,
 		maxRetries:    maxRetries,
+		resourceAttrs: cfg.ResourceAttributes,
 		stopCh:        make(chan struct{}),
 	}
 	o.flushWg.Add(1)
@@ -385,8 +391,28 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	// Monitoring as a fallback identifier when hostnames collide (cloned
 	// VMs, ephemeral instances reusing a name) — included when available,
 	// omitted rather than faked when it isn't.
-	if id := o.hostID(); id != "" {
-		attrs = append(attrs, stringAttr("host.id", id))
+	//
+	// A discovered host.id takes precedence: on EC2 the semantic conventions
+	// define host.id as the instance id, and that is what links this telemetry
+	// to the instance in a backend. machine-id remains the fallback everywhere
+	// else.
+	if _, discovered := o.resourceAttrs["host.id"]; !discovered {
+		if id := o.hostID(); id != "" {
+			attrs = append(attrs, stringAttr("host.id", id))
+		}
+	}
+
+	// Emitted in sorted order so a resource is byte-identical between flushes
+	// and between processes, which keeps diffs and tests stable.
+	if len(o.resourceAttrs) > 0 {
+		keys := make([]string, 0, len(o.resourceAttrs))
+		for k := range o.resourceAttrs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			attrs = append(attrs, stringAttr(k, o.resourceAttrs[k]))
+		}
 	}
 	return otlpResource{Attributes: attrs}
 }

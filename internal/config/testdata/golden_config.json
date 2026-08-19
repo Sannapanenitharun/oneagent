@@ -64,6 +64,7 @@
     "Endpoint": "",
     "Headers": null,
     "HeadersEnv": null,
+    "ResourceAttributes": null,
     "BatchSize": 0,
     "FlushInterval": 0,
     "MaxRetries": 0,
@@ -83,5 +84,9 @@
     "ListenAddr": "127.0.0.1:8088",
     "Retain": 900000000000,
     "MaxSeries": 500
+  },
+  "EC2Metadata": {
+    "Enabled": true,
+    "Timeout": 1000000000
   }
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/agent-i/agent/internal/collector"
 	"github.com/agent-i/agent/internal/config"
 	"github.com/agent-i/agent/internal/dashboard"
+	"github.com/agent-i/agent/internal/ec2meta"
 	"github.com/agent-i/agent/internal/exporter"
 	"github.com/agent-i/agent/internal/spans"
 	"github.com/agent-i/agent/internal/version"
@@ -166,7 +167,10 @@ func New(cfg *config.Config) (*Daemon, error) {
 	// the offset used to be written the moment a line was read, which meant a
 	// line sitting in the export queue when the process died was recorded as
 	// handled and never read again.
-	exp, err := exporter.New(resolveExporterHeaders(cfg.Exporter), d.retire)
+	expCfg := resolveExporterHeaders(cfg.Exporter)
+	expCfg.ResourceAttributes = detectHostAttributes(cfg)
+
+	exp, err := exporter.New(expCfg, d.retire)
 	if err != nil {
 		return nil, fmt.Errorf("initializing exporter: %w", err)
 	}
@@ -219,6 +223,33 @@ func New(cfg *config.Config) (*Daemon, error) {
 	}
 
 	return d, nil
+}
+
+// detectHostAttributes discovers resource attributes that describe the machine
+// rather than the configuration — currently the EC2 instance identity.
+//
+// Failure is the expected outcome on anything that is not an EC2 instance, so
+// it is reported at info level and the agent continues: telemetry without
+// instance attributes is a smaller loss than an agent that refuses to start on
+// a laptop. The probe is bounded by its own timeout so a blackholed link-local
+// address cannot stall startup.
+//
+// The instance id, type and region are logged because they are what an operator
+// checks when a host shows up unlabelled. The account id deliberately is not.
+func detectHostAttributes(cfg *config.Config) map[string]string {
+	if !cfg.EC2Metadata.DetectionEnabled() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.EC2Metadata.Timeout)
+	defer cancel()
+
+	md, err := ec2meta.NewDetector(cfg.EC2Metadata.Timeout).Detect(ctx)
+	if err != nil {
+		log.Printf("ec2 metadata: no instance identity available (%v) — continuing without EC2 attributes", err)
+		return nil
+	}
+	log.Printf("ec2 metadata: instance %s (%s) in %s", md.InstanceID, md.InstanceType, md.Region)
+	return md.ResourceAttributes()
 }
 
 // resolveExporterHeaders merges headers_env (env var references) into
@@ -514,6 +545,10 @@ func restartRequired(old, new *config.Config) []string {
 	add("traces.listen_addr", old.Traces.ListenAddr != new.Traces.ListenAddr)
 	add("traces.max_request_bytes", old.Traces.MaxRequestBytes != new.Traces.MaxRequestBytes)
 	add("traces.auth_token_env", old.Traces.AuthTokenEnv != new.Traces.AuthTokenEnv)
+	// Detection runs once at startup, so a change here cannot take effect on a
+	// running agent — say so rather than letting it look applied.
+	add("ec2_metadata", old.EC2Metadata.DetectionEnabled() != new.EC2Metadata.DetectionEnabled() ||
+		old.EC2Metadata.Timeout != new.EC2Metadata.Timeout)
 	add("exporter", old.Exporter.Type != new.Exporter.Type ||
 		old.Exporter.Endpoint != new.Exporter.Endpoint ||
 		old.Exporter.Path != new.Exporter.Path)

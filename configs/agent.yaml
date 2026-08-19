@@ -9,6 +9,27 @@
 agent_id: "host-001"
 interval: 15s
 
+# Label telemetry with the EC2 instance it came from, so a backend shows this
+# host as a specific instance rather than an anonymous Linux box. Adds the
+# standard OTel attributes: cloud.provider, cloud.platform, cloud.account.id,
+# cloud.region, cloud.availability_zone, host.type, host.image.id.
+#
+# This needs NO AWS credentials and no IAM permission. It reads the Instance
+# Metadata Service at 169.254.169.254 — a link-local address reachable only
+# from the instance itself, which answers only about that instance. It is not
+# an AWS API integration; nothing is polled and no account is queried.
+#
+# On anything that is not an EC2 instance the probe fails fast and the agent
+# carries on without these attributes, so it is safe to leave on everywhere.
+#
+# NOTE: on EC2 this sets host.id to the instance id, which the OTel conventions
+# specify and which is what links the telemetry to the instance. Elsewhere
+# host.id stays /etc/machine-id. A host already being monitored will therefore
+# appear under a new identity the first time it reports with this enabled.
+ec2_metadata:
+  enabled: true
+  timeout: 1s        # bounds the probe; a non-AWS host may blackhole the address
+
 metrics:
   enabled: true
   collect: ["cpu", "memory"]

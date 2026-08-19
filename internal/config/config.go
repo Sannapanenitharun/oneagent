@@ -24,6 +24,31 @@ type Config struct {
 
 	Aggregation AggregationConfig `yaml:"aggregation"`
 	Dashboard   DashboardConfig   `yaml:"dashboard"`
+	EC2Metadata EC2MetadataConfig `yaml:"ec2_metadata"`
+}
+
+// EC2MetadataConfig controls the Instance Metadata Service probe that labels
+// telemetry with the EC2 instance it came from.
+//
+// This is host self-description, not a cloud API integration: IMDS is a
+// link-local address reachable only from the instance itself, it answers only
+// about that instance, and it needs no credentials and no IAM permission. There
+// is nothing to configure beyond whether to ask.
+type EC2MetadataConfig struct {
+	// Enabled is a pointer so that an absent block means on. Detection is
+	// harmless off EC2 — it fails fast and the agent carries on — and having
+	// it default off would mean every EC2 user has to discover the setting
+	// before their hosts are identifiable.
+	Enabled *bool `yaml:"enabled"`
+	// Timeout bounds the whole probe. Kept short because it runs at startup on
+	// every host, and a non-AWS machine may blackhole the link-local address
+	// rather than refusing.
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// DetectionEnabled reports whether to probe, treating an unset value as true.
+func (c EC2MetadataConfig) DetectionEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 // DashboardConfig controls the agent's built-in local web view. It serves
@@ -216,6 +241,12 @@ type ExporterConfig struct {
 	Headers    map[string]string `yaml:"headers"`
 	HeadersEnv map[string]string `yaml:"headers_env"` // header name -> env var name holding its value
 
+	// ResourceAttributes are extra OTel resource attributes discovered at
+	// runtime rather than configured — currently the EC2 instance identity.
+	// Populated by the daemon before the exporter is built; never read from
+	// YAML, which is why it is tagged "-".
+	ResourceAttributes map[string]string `yaml:"-"`
+
 	// HTTP exporter tuning — all optional, sensible defaults applied in
 	// the exporter package if left zero.
 	BatchSize     int           `yaml:"batch_size"`     // envelopes per POST before a size-triggered flush
@@ -265,6 +296,10 @@ func Load(path string) (*Config, error) {
 	// Tailing defaults. These are applied here rather than at the point of use
 	// so that every collector sees identical values and the effective config is
 	// visible in one place.
+	if cfg.EC2Metadata.Timeout <= 0 {
+		cfg.EC2Metadata.Timeout = time.Second
+	}
+
 	if cfg.Tailing.ScanInterval <= 0 {
 		cfg.Tailing.ScanInterval = 30 * time.Second
 	}
