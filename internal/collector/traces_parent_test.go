@@ -3,8 +3,7 @@ package collector
 import (
 	"testing"
 
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
-	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"github.com/agent-i/agent/internal/otlpwire"
 )
 
 // The parent link is what makes a set of spans a trace rather than a bag of
@@ -13,15 +12,15 @@ import (
 // to find the root. These pin both decode paths.
 
 func TestSpanToEnvelopeProto_CarriesParentSpanID(t *testing.T) {
-	sp := &tracepb.Span{
-		TraceId:           []byte{0x5b, 0x8a, 0xa5, 0xa2, 0xd2, 0xc8, 0x72, 0xe8, 0x32, 0x1c, 0xf3, 0x73, 0x08, 0xd6, 0x9d, 0xf2},
-		SpanId:            []byte{0x05, 0x15, 0x81, 0xbf, 0x3c, 0xb5, 0x5c, 0x13},
-		ParentSpanId:      []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11},
+	sp := &otlpwire.Span{
+		TraceID:           []byte{0x5b, 0x8a, 0xa5, 0xa2, 0xd2, 0xc8, 0x72, 0xe8, 0x32, 0x1c, 0xf3, 0x73, 0x08, 0xd6, 0x9d, 0xf2},
+		SpanID:            []byte{0x05, 0x15, 0x81, 0xbf, 0x3c, 0xb5, 0x5c, 0x13},
+		ParentSpanID:      []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11},
 		Name:              "childOp",
 		StartTimeUnixNano: 1735689600000000000,
 		EndTimeUnixNano:   1735689600050000000,
-		Attributes: []*commonpb.KeyValue{
-			{Key: "k", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "v"}}},
+		Attributes: []*otlpwire.KeyValue{
+			{Key: "k", Value: &otlpwire.AnyValue{Kind: otlpwire.ValueString, Str: "v"}},
 		},
 	}
 
@@ -38,9 +37,9 @@ func TestSpanToEnvelopeProto_CarriesParentSpanID(t *testing.T) {
 // Emitting an empty string would make every root look parented to nothing,
 // which is a different claim than "this is the root".
 func TestSpanToEnvelopeProto_RootSpanHasNoParentLabel(t *testing.T) {
-	sp := &tracepb.Span{
-		TraceId:           []byte{0x01},
-		SpanId:            []byte{0x02},
+	sp := &otlpwire.Span{
+		TraceID:           []byte{0x01},
+		SpanID:            []byte{0x02},
 		Name:              "rootOp",
 		StartTimeUnixNano: 1735689600000000000,
 		EndTimeUnixNano:   1735689600010000000,

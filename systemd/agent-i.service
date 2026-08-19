@@ -15,8 +15,8 @@ RestartSec=5s
 # the agent keeps running on its current settings.
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Secrets are read from the environment, never from agent.yaml (see the
-# SECURITY note on config.CloudConfig). This is the supported place to put
+# Secrets are read from the environment, never from agent.yaml (the config
+# holds only the NAME of the env var to read). This is the supported place to put
 # them: root-owned, mode 0600, and not part of the config file that gets
 # committed or copied around. The leading '-' means the unit still starts
 # when the file is absent, which is the common case.

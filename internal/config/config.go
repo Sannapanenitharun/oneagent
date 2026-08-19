@@ -1,5 +1,5 @@
 // Package config loads the agent's YAML configuration. Kept dependency-light
-// (one third-party lib: yaml.v3) so the binary stays small and auditable.
+// (no third-party libraries at all) so the binary stays small and auditable.
 package config
 
 import (
@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/agent-i/agent/internal/yamlmin"
 )
 
 // Config is the root configuration for the agent daemon.
@@ -20,7 +20,6 @@ type Config struct {
 	AccessLogs AccessLogConfig `yaml:"access_logs"`
 	Tailing    TailingConfig   `yaml:"tailing"`
 	Traces     TracesConfig    `yaml:"traces"`
-	Cloud      CloudConfig     `yaml:"cloud"`
 	Exporter   ExporterConfig  `yaml:"exporter"`
 
 	Aggregation AggregationConfig `yaml:"aggregation"`
@@ -200,60 +199,6 @@ type TraceStatsConfig struct {
 	MaxSamples  int           `yaml:"max_samples_per_context"`
 }
 
-// CloudConfig configures the pull-based cloud provider metric adapters.
-//
-// AWS is the only supported provider. GCP and Azure adapters existed
-// previously but were never exercised against a live account, and unverified
-// code that ships in the binary and appears in the config file is a liability
-// rather than a feature.
-//
-// SECURITY: secrets (access keys, session tokens) are never held directly in
-// this struct or the YAML file — every secret field below is the NAME of an
-// environment variable to read at startup, not the secret itself. A config
-// file is often committed, backed up, or shared more casually than the process
-// environment; keeping secrets out of it is a cheap, meaningful reduction in
-// exposure surface.
-type CloudConfig struct {
-	AWS AWSCloudConfig `yaml:"aws"`
-
-	// GCP   GCPCloudConfig   `yaml:"gcp"`
-	// Azure AzureCloudConfig `yaml:"azure"`
-}
-
-type AWSCloudConfig struct {
-	Enabled            bool   `yaml:"enabled"`
-	Region             string `yaml:"region"`
-	Namespace          string `yaml:"namespace"`   // e.g. "AWS/EC2"
-	MetricName         string `yaml:"metric_name"` // e.g. "CPUUtilization"
-	Statistic          string `yaml:"statistic"`   // "Average" (default), "Maximum", "Sum", "Minimum"
-	DimensionName      string `yaml:"dimension_name"`
-	DimensionValue     string `yaml:"dimension_value"`
-	AccessKeyIDEnv     string `yaml:"access_key_id_env"`     // env var holding the AWS access key ID
-	SecretAccessKeyEnv string `yaml:"secret_access_key_env"` // env var holding the AWS secret access key
-	SessionTokenEnv    string `yaml:"session_token_env"`     // optional: env var for a temporary/STS session token
-}
-
-// Disabled along with their collectors — see the build tag at the top of
-// internal/collector/gcpmonitoring.go and azuremonitor.go. Kept here so
-// re-enabling is uncommenting rather than rewriting.
-//
-// type GCPCloudConfig struct {
-// 	Enabled               bool   `yaml:"enabled"`
-// 	ProjectID             string `yaml:"project_id"`
-// 	MetricType            string `yaml:"metric_type"`              // e.g. "compute.googleapis.com/instance/cpu/utilization"
-// 	ServiceAccountKeyPath string `yaml:"service_account_key_path"` // path to the downloaded JSON key file (the file's permissions, not this config, protect the key)
-// }
-//
-// type AzureCloudConfig struct {
-// 	Enabled         bool   `yaml:"enabled"`
-// 	TenantID        string `yaml:"tenant_id"`
-// 	ClientID        string `yaml:"client_id"`
-// 	SubscriptionID  string `yaml:"subscription_id"`
-// 	ResourceID      string `yaml:"resource_id"`       // full ARM resource ID to poll metrics for
-// 	MetricName      string `yaml:"metric_name"`       // e.g. "Percentage CPU"
-// 	ClientSecretEnv string `yaml:"client_secret_env"` // env var holding the AAD app's client secret
-// }
-
 type ExporterConfig struct {
 	// "stdout" for local dev, "file" to append JSONL, "http" to push our
 	// own JSON envelope format, "otlp_http" to push real OTLP (metrics/
@@ -265,7 +210,7 @@ type ExporterConfig struct {
 	// Headers are sent on every request from the http/otlp_http
 	// exporters — e.g. an ingestion API key, whose header name is whatever
 	// your backend documents.
-	// SECURITY: same rule as cloud provider credentials — put the actual
+	// SECURITY: put the actual
 	// key in an environment variable and reference it via headers_env
 	// below, not directly in this YAML file.
 	Headers    map[string]string `yaml:"headers"`
@@ -303,7 +248,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	if err := yamlmin.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 

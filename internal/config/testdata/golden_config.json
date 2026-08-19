@@ -1,0 +1,87 @@
+{
+  "AgentID": "host-001",
+  "Interval": 15000000000,
+  "Metrics": {
+    "Enabled": true,
+    "Collect": [
+      "cpu",
+      "memory"
+    ]
+  },
+  "Logs": {
+    "Enabled": true,
+    "Paths": [
+      "/var/log/app/*.log"
+    ],
+    "Multiline": {
+      "Enabled": false,
+      "StartPattern": "^\\d{4}-\\d{2}-\\d{2}",
+      "MaxLines": 500,
+      "Timeout": 2000000000
+    }
+  },
+  "AccessLogs": {
+    "Enabled": false,
+    "Paths": [
+      "/var/log/nginx/access.log"
+    ],
+    "Format": "combined",
+    "JSONFields": {
+      "Method": "",
+      "Path": "",
+      "Status": "",
+      "DurationMs": "",
+      "RemoteAddr": ""
+    }
+  },
+  "Tailing": {
+    "ScanInterval": 30000000000,
+    "PollInterval": 500000000,
+    "MaxLineBytes": 262144,
+    "RegistryPath": "/var/lib/agent-i/registry.json"
+  },
+  "Traces": {
+    "Enabled": true,
+    "ListenAddr": "127.0.0.1:4319",
+    "MaxRequestBytes": 4194304,
+    "AuthTokenEnv": "",
+    "Sampling": {
+      "Enabled": false,
+      "Rate": 1,
+      "KeepErrors": true,
+      "SlowThresholdMs": 0
+    },
+    "Stats": {
+      "Enabled": false,
+      "Interval": 60000000000,
+      "MaxContexts": 2000,
+      "MaxSamples": 0
+    }
+  },
+  "Exporter": {
+    "Type": "stdout",
+    "Path": "",
+    "Endpoint": "",
+    "Headers": null,
+    "HeadersEnv": null,
+    "BatchSize": 0,
+    "FlushInterval": 0,
+    "MaxRetries": 0,
+    "MaxBatchBytes": 0,
+    "QueueSize": 0,
+    "ShutdownTimeout": 0
+  },
+  "Aggregation": {
+    "Enabled": false,
+    "Interval": 60000000000,
+    "MaxContexts": 2000,
+    "MaxSamples": 0,
+    "KeepRawEvents": false
+  },
+  "Dashboard": {
+    "Enabled": true,
+    "ListenAddr": "127.0.0.1:8088",
+    "Retain": 900000000000,
+    "MaxSeries": 500
+  }
+}

@@ -7,11 +7,7 @@ import (
 	"testing"
 	"time"
 
-	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
-	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
-	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
-	"google.golang.org/protobuf/proto"
+	"encoding/hex"
 )
 
 // TestOTLPTraceReceiver_AcceptsRealBinaryProtobuf builds an actual
@@ -23,38 +19,15 @@ import (
 // test proves the fix against the real binary wire format, not a JSON
 // stand-in for it.
 func TestOTLPTraceReceiver_AcceptsRealBinaryProtobuf(t *testing.T) {
-	req := &collectortracepb.ExportTraceServiceRequest{
-		ResourceSpans: []*tracepb.ResourceSpans{
-			{
-				Resource: &resourcepb.Resource{
-					Attributes: []*commonpb.KeyValue{
-						{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "checkout-service"}}},
-					},
-				},
-				ScopeSpans: []*tracepb.ScopeSpans{
-					{
-						Scope: &commonpb.InstrumentationScope{Name: "manual-test-scope"},
-						Spans: []*tracepb.Span{
-							{
-								TraceId:           []byte{0x5b, 0x8a, 0xa5, 0xa2, 0xd2, 0xc8, 0x72, 0xe8, 0x32, 0x1c, 0xf3, 0x73, 0x08, 0xd6, 0x9d, 0xf2},
-								SpanId:            []byte{0x05, 0x15, 0x81, 0xbf, 0x3c, 0xb5, 0x5c, 0x13},
-								Name:              "processPayment",
-								StartTimeUnixNano: 1735689600000000000,
-								EndTimeUnixNano:   1735689600123000000, // 123ms duration
-								Attributes: []*commonpb.KeyValue{
-									{Key: "http.status_code", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 200}}},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	body, err := proto.Marshal(req)
+	// These are the exact bytes google.golang.org/protobuf produced for this
+	// message while it was still vendored — i.e. the same encoding a real OTel
+	// SDK's otlptracehttp exporter puts on the wire. Freezing them, rather than
+	// re-encoding with whatever library is current, is what keeps this an
+	// end-to-end test of the decoder against the reference format instead of a
+	// round-trip of our own encoder.
+	body, err := hex.DecodeString(goldenBasicRequest)
 	if err != nil {
-		t.Fatalf("marshaling test request: %v", err)
+		t.Fatalf("decoding golden request: %v", err)
 	}
 
 	coll := NewOTLPTraceReceiverCollector("test-agent", "127.0.0.1:14329", 4<<20, "")
@@ -131,8 +104,8 @@ func TestOTLPTraceReceiver_RejectsInvalidProtobuf(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// Garbage bytes might not always fail proto.Unmarshal (protobuf's
-	// wire format is permissive), so this isn't a strict assertion on
+	// Garbage bytes might not always fail to decode (the protobuf wire
+	// format is permissive), so this isn't a strict assertion on
 	// status code — the important property is that the server doesn't
 	// crash and responds with SOME valid HTTP response either way.
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
@@ -173,3 +146,9 @@ func TestOTLPTraceReceiver_JSONStillWorksAlongsideProtobuf(t *testing.T) {
 		t.Fatal("timed out waiting for JSON-decoded span")
 	}
 }
+
+// goldenBasicRequest mirrors internal/otlpwire's fixture of the same name: one
+// ResourceSpans carrying service.name=checkout-service, scope
+// manual-test-scope, and a single 123ms processPayment span with an
+// http.status_code=200 attribute.
+const goldenBasicRequest = "0a96010a240a220a0c736572766963652e6e616d6512120a10636865636b6f75742d73657276696365126e0a130a116d616e75616c2d746573742d73636f706512570a105b8aa5a2d2c872e8321cf37308d69df21208051581bf3cb55c132a0e70726f636573735061796d656e7439000057c07e68161841c0d4abc77e6816184a170a10687474702e7374617475735f636f6465120318c801"

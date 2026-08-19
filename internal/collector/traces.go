@@ -14,27 +14,24 @@ import (
 	"strings"
 	"time"
 
-	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
-	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
-	"google.golang.org/protobuf/proto"
+	"github.com/agent-i/agent/internal/otlpwire"
 )
 
 // This file implements the OTLP/HTTP receiver at the spec-mandated path
 // POST /v1/traces, supporting BOTH of OTLP's wire encodings:
 //   - application/x-protobuf — binary protobuf, the default for most
 //     OTel SDK exporters (Go/Python/Java's otlptracehttp with default
-//     settings). Uses the vendored google.golang.org/protobuf runtime
-//     and go.opentelemetry.io/proto/otlp generated types (see
-//     third_party/ — these were pulled from source on GitHub and
-//     vendored locally since this sandbox has no path to the Go module
-//     proxy; the protobuf round-trip was verified independently before
-//     wiring it in here — see the session notes, not just this comment).
+//     settings). Decoded by internal/otlpwire, this agent's own reader
+//     for the subset of the protobuf wire format the OTLP trace messages
+//     use. It replaced the vendored google.golang.org/protobuf runtime
+//     and go.opentelemetry.io/proto generated types, which together came
+//     to ~61k lines to serve this one decode; the replacement is checked
+//     against wire bytes captured from that runtime before it was
+//     removed, so the format contract is pinned to the reference
+//     implementation's real output rather than to our reading of it.
 //   - application/json — OTLP's JSON encoding, handled by the
-//     hand-written otlpExportTraceRequest types below (kept rather than
-//     replaced by the vendored types' JSON support, since protojson's
-//     full reflection-based marshaling is unnecessary weight for a
-//     simple, already-working JSON path).
+//     hand-written otlpExportTraceRequest types below. This path never
+//     depended on the protobuf runtime and is unchanged.
 //
 // Content-Type on the request selects which decoder runs; unset or
 // unrecognized Content-Type falls back to JSON (matches this receiver's
@@ -305,8 +302,8 @@ func (t *OTLPTraceReceiverCollector) handleProtobuf(w http.ResponseWriter, r *ht
 		return
 	}
 
-	var req collectortracepb.ExportTraceServiceRequest
-	if err := proto.Unmarshal(body, &req); err != nil {
+	req, err := otlpwire.UnmarshalExportTraceServiceRequest(body)
+	if err != nil {
 		http.Error(w, "invalid OTLP protobuf payload", http.StatusBadRequest)
 		return
 	}
@@ -316,7 +313,7 @@ func (t *OTLPTraceReceiverCollector) handleProtobuf(w http.ResponseWriter, r *ht
 		if rs.Resource != nil {
 			for _, a := range rs.Resource.Attributes {
 				if a.Key == "service.name" {
-					serviceName = anyValueToString(a.Value)
+					serviceName = a.Value.String()
 				}
 			}
 		}
@@ -331,11 +328,7 @@ func (t *OTLPTraceReceiverCollector) handleProtobuf(w http.ResponseWriter, r *ht
 		}
 	}
 
-	respBody, err := proto.Marshal(&collectortracepb.ExportTraceServiceResponse{})
-	if err != nil {
-		http.Error(w, "error building response", http.StatusInternalServerError)
-		return
-	}
+	respBody := otlpwire.MarshalEmptyExportTraceServiceResponse()
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(respBody)
@@ -343,18 +336,18 @@ func (t *OTLPTraceReceiverCollector) handleProtobuf(w http.ResponseWriter, r *ht
 
 // spanToEnvelopeProto is the protobuf-decoding equivalent of
 // spanToEnvelopeJSON below — same output shape (an Envelope), different
-// input type (protobuf-generated *tracepb.Span with []byte trace/span
+// input type (a wire-decoded *otlpwire.Span with []byte trace/span
 // IDs and uint64 nanosecond timestamps, vs. the JSON path's hex-string
 // IDs and string-encoded int64 timestamps). Keeping both conversion
 // functions separate rather than unifying through a shared intermediate
 // type — the two input shapes are different enough that a shared type
 // would just move the conversion complexity rather than remove it.
-func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *tracepb.Span) Envelope {
+func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *otlpwire.Span) Envelope {
 	durationMs := float64(sp.EndTimeUnixNano-sp.StartTimeUnixNano) / 1e6
 
 	labels := map[string]string{
-		"trace_id": hex.EncodeToString(sp.TraceId),
-		"span_id":  hex.EncodeToString(sp.SpanId),
+		"trace_id": hex.EncodeToString(sp.TraceID),
+		"span_id":  hex.EncodeToString(sp.SpanID),
 		"name":     sp.Name,
 	}
 	// The parent link is what makes a set of spans a trace rather than a bag
@@ -362,8 +355,8 @@ func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *tracepb.Spa
 	// out which service called which, or find the root. It was being parsed
 	// off the wire and then dropped, so every trace we re-exported arrived
 	// flat. Empty on a root span, which is the correct absence.
-	if len(sp.ParentSpanId) > 0 {
-		labels["parent_span_id"] = hex.EncodeToString(sp.ParentSpanId)
+	if len(sp.ParentSpanID) > 0 {
+		labels["parent_span_id"] = hex.EncodeToString(sp.ParentSpanID)
 	}
 	if serviceName != "" {
 		labels["service.name"] = serviceName
@@ -384,7 +377,7 @@ func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *tracepb.Spa
 
 	attrs := make(map[string]any, len(sp.Attributes))
 	for _, a := range sp.Attributes {
-		attrs[a.Key] = anyValueToString(a.Value)
+		attrs[a.Key] = a.Value.String()
 	}
 
 	return Envelope{
@@ -395,26 +388,6 @@ func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *tracepb.Spa
 		Labels:    labels,
 		Value:     durationMs,
 		Payload:   map[string]any{"attributes": attrs},
-	}
-}
-
-// anyValueToString extracts a display string from a protobuf AnyValue oneof.
-// Mirrors otlpAnyValue.toString() above, for the protobuf-typed equivalent.
-func anyValueToString(v *commonpb.AnyValue) string {
-	if v == nil {
-		return ""
-	}
-	switch x := v.Value.(type) {
-	case *commonpb.AnyValue_StringValue:
-		return x.StringValue
-	case *commonpb.AnyValue_IntValue:
-		return strconv.FormatInt(x.IntValue, 10)
-	case *commonpb.AnyValue_DoubleValue:
-		return strconv.FormatFloat(x.DoubleValue, 'f', -1, 64)
-	case *commonpb.AnyValue_BoolValue:
-		return strconv.FormatBool(x.BoolValue)
-	default:
-		return ""
 	}
 }
 

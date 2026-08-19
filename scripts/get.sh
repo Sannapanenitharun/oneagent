@@ -151,11 +151,8 @@ if [[ ! -f /etc/agent-i/env ]]; then
 #                               # 'Authorization: Bearer <token>'. Unset means no auth.
 # OTLP_INGESTION_KEY=
 # AGENT_I_TRACE_TOKEN=
-# AWS_ACCESS_KEY_ID=
-# AWS_SECRET_ACCESS_KEY=
-# AWS_SESSION_TOKEN=
 ENVEOF
-  echo "    created /etc/agent-i/env — put ingestion keys and cloud credentials there"
+  echo "    created /etc/agent-i/env — put ingestion keys there"
 else
   echo "    /etc/agent-i/env already exists — leaving it in place"
 fi

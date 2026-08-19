@@ -189,39 +189,6 @@ traces:
     keep_errors: true              # forward error spans regardless of rate
     slow_threshold_ms: 0           # forward spans at least this slow regardless of rate (0 = off)
 
-cloud:
-  aws:
-    enabled: false
-    region: "us-east-1"
-    namespace: "AWS/EC2"
-    metric_name: "CPUUtilization"
-    statistic: "Average"
-    dimension_name: "InstanceId"
-    dimension_value: "i-0123456789abcdef0"
-    access_key_id_env: "AWS_ACCESS_KEY_ID"         # name of the env var holding the key — not the key itself
-    secret_access_key_env: "AWS_SECRET_ACCESS_KEY"
-    # session_token_env: "AWS_SESSION_TOKEN"       # optional, for temporary/STS credentials
-
-  # GCP and Azure are disabled in this build — the collectors are still in the
-  # tree but excluded from compilation (see internal/collector/gcpmonitoring.go
-  # and azuremonitor.go). Uncommenting these blocks alone will not enable them;
-  # the build tag and the commented structs in internal/config/config.go and
-  # internal/daemon/daemon.go have to be restored too.
-  #
-  # gcp:
-  #   enabled: false
-  #   project_id: "my-gcp-project"
-  #   metric_type: "compute.googleapis.com/instance/cpu/utilization"
-  #   service_account_key_path: "/etc/agent-i/gcp-sa.json"
-  # azure:
-  #   enabled: false
-  #   tenant_id: "00000000-0000-0000-0000-000000000000"
-  #   client_id: "00000000-0000-0000-0000-000000000000"
-  #   subscription_id: "00000000-0000-0000-0000-000000000000"
-  #   resource_id: "/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/virtualMachines/vm1"
-  #   metric_name: "Percentage CPU"
-  #   client_secret_env: "AZURE_CLIENT_SECRET"
-
 exporter:
   type: "stdout"   # "stdout" | "file" | "http" (our own JSON format) | "otlp_http" (real OTLP — use this for any OTLP-native backend)
   # path: "/var/log/agent-i/export.jsonl"                    # file exporter

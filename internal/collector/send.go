@@ -43,8 +43,8 @@ type sendGate struct {
 // exists for the case where the consumer has genuinely stopped moving.
 const sendTimeout = 5 * time.Second
 
-// dropReportEvery rate-limits the drop log the same way pollLogger rate-limits
-// poll failures: a wedged pipeline would otherwise write a line per envelope
+// dropReportEvery rate-limits the drop log the same way the poll-failure log
+// once did: a wedged pipeline would otherwise write a line per envelope
 // and bury everything else in the journal.
 const dropReportEvery = 30 * time.Second
 

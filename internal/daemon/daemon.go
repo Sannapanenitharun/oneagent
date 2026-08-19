@@ -157,14 +157,8 @@ func New(cfg *config.Config) (*Daemon, error) {
 		))
 	}
 
-	cloudCollectors, err := buildCloudCollectors(cfg)
-	if err != nil {
-		return nil, err
-	}
-	collectors = append(collectors, cloudCollectors...)
-
 	if len(collectors) == 0 {
-		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, access_logs.enabled, traces.enabled, cloud.aws.enabled")
+		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, access_logs.enabled, traces.enabled")
 	}
 
 	// Built after the registry so the exporter can report which lines are
@@ -229,7 +223,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 
 // resolveExporterHeaders merges headers_env (env var references) into
 // Headers before the exporter is constructed — same secrets-stay-out-of-
-// YAML pattern as buildCloudCollectors below. Doesn't mutate the caller's
+// YAML pattern the agent uses everywhere. Doesn't mutate the caller's
 // config struct.
 func resolveExporterHeaders(cfg config.ExporterConfig) config.ExporterConfig {
 	if len(cfg.HeadersEnv) == 0 {
@@ -244,76 +238,6 @@ func resolveExporterHeaders(cfg config.ExporterConfig) config.ExporterConfig {
 	}
 	cfg.Headers = merged
 	return cfg
-}
-
-// resolving secrets from the environment variables named in config (see
-// the SECURITY note on config.CloudConfig — the YAML file itself never
-// holds a credential value, only the name of where to find one).
-func buildCloudCollectors(cfg *config.Config) ([]collector.Collector, error) {
-	var collectors []collector.Collector
-
-	if cfg.Cloud.AWS.Enabled {
-		accessKey := os.Getenv(cfg.Cloud.AWS.AccessKeyIDEnv)
-		secretKey := os.Getenv(cfg.Cloud.AWS.SecretAccessKeyEnv)
-		if accessKey == "" || secretKey == "" {
-			return nil, fmt.Errorf("config: cloud.aws.enabled is true but %s / %s are not set in the environment",
-				cfg.Cloud.AWS.AccessKeyIDEnv, cfg.Cloud.AWS.SecretAccessKeyEnv)
-		}
-		collectors = append(collectors, collector.NewCloudWatchCollector(collector.CloudWatchConfig{
-			AgentID:         cfg.AgentID,
-			Region:          cfg.Cloud.AWS.Region,
-			Namespace:       cfg.Cloud.AWS.Namespace,
-			MetricName:      cfg.Cloud.AWS.MetricName,
-			Statistic:       cfg.Cloud.AWS.Statistic,
-			DimensionName:   cfg.Cloud.AWS.DimensionName,
-			DimensionValue:  cfg.Cloud.AWS.DimensionValue,
-			Interval:        cfg.Interval,
-			AccessKeyID:     accessKey,
-			SecretAccessKey: secretKey,
-			SessionToken:    os.Getenv(cfg.Cloud.AWS.SessionTokenEnv),
-		}))
-	}
-
-	// Disabled along with their collectors — see the build tag at the top of
-	// internal/collector/gcpmonitoring.go and azuremonitor.go, and the matching
-	// commented structs in internal/config/config.go.
-	//
-	// if cfg.Cloud.GCP.Enabled {
-	// 	keyBytes, err := os.ReadFile(cfg.Cloud.GCP.ServiceAccountKeyPath)
-	// 	if err != nil {
-	// 		return nil, fmt.Errorf("config: cloud.gcp.enabled is true but reading service_account_key_path failed: %w", err)
-	// 	}
-	// 	gm, err := collector.NewGCPMonitoringCollector(collector.GCPMonitoringConfig{
-	// 		AgentID:           cfg.AgentID,
-	// 		ProjectID:         cfg.Cloud.GCP.ProjectID,
-	// 		MetricType:        cfg.Cloud.GCP.MetricType,
-	// 		ServiceAccountKey: keyBytes,
-	// 		Interval:          cfg.Interval,
-	// 	})
-	// 	if err != nil {
-	// 		return nil, fmt.Errorf("config: initializing GCP monitoring collector: %w", err)
-	// 	}
-	// 	collectors = append(collectors, gm)
-	// }
-	//
-	// if cfg.Cloud.Azure.Enabled {
-	// 	clientSecret := os.Getenv(cfg.Cloud.Azure.ClientSecretEnv)
-	// 	if clientSecret == "" {
-	// 		return nil, fmt.Errorf("config: cloud.azure.enabled is true but %s is not set in the environment", cfg.Cloud.Azure.ClientSecretEnv)
-	// 	}
-	// 	collectors = append(collectors, collector.NewAzureMonitorCollector(collector.AzureMonitorConfig{
-	// 		AgentID:        cfg.AgentID,
-	// 		TenantID:       cfg.Cloud.Azure.TenantID,
-	// 		ClientID:       cfg.Cloud.Azure.ClientID,
-	// 		ClientSecret:   clientSecret,
-	// 		SubscriptionID: cfg.Cloud.Azure.SubscriptionID,
-	// 		ResourceID:     cfg.Cloud.Azure.ResourceID,
-	// 		MetricName:     cfg.Cloud.Azure.MetricName,
-	// 		Interval:       cfg.Interval,
-	// 	}))
-	// }
-
-	return collectors, nil
 }
 
 // Run starts all collectors and drains their output into the exporter
@@ -593,7 +517,6 @@ func restartRequired(old, new *config.Config) []string {
 	add("exporter", old.Exporter.Type != new.Exporter.Type ||
 		old.Exporter.Endpoint != new.Exporter.Endpoint ||
 		old.Exporter.Path != new.Exporter.Path)
-	add("cloud.aws", old.Cloud.AWS != new.Cloud.AWS)
 
 	return changed
 }
