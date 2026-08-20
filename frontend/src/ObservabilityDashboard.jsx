@@ -1084,6 +1084,38 @@ const NAV_GROUPS = [
 ];
 const NAV_ITEMS = NAV_GROUPS.flatMap((g) => g.items);
 
+// HostFacts shows what the machine actually is, as discovered from the cloud
+// provider's metadata service rather than read from the config file.
+//
+// agent_id above it is a name someone chose, and it is identical on every host
+// cloned from one image — so on its own it cannot answer "which instance is
+// this". These fields can.
+//
+// Renders nothing off a cloud host: the agent omits the whole object when it
+// discovered nothing, and an empty "Instance" heading would be worse than no
+// heading at all.
+function HostFacts({ host }) {
+  const instanceID = host?.["host.id"];
+  if (!instanceID) return null;
+
+  const type = host["host.type"];
+  const zone = host["cloud.availability_zone"] || host["cloud.region"];
+  const account = host["cloud.account.id"];
+  const image = host["host.image.id"];
+
+  return (
+    <div className="text-[9.5px] text-[var(--ink-5)] font-mono leading-relaxed">
+      <div className="uppercase tracking-widest pb-0.5">instance</div>
+      <div className="text-[var(--ink-4)] break-all">{instanceID}</div>
+      {(type || zone) && (
+        <div className="text-[var(--ink-4)]">{[type, zone].filter(Boolean).join(" · ")}</div>
+      )}
+      {account && <div>account {account}</div>}
+      {image && <div className="break-all">{image}</div>}
+    </div>
+  );
+}
+
 function Sidebar({ view, setView, snap }) {
   return (
     <div className="w-[200px] flex-shrink-0 border-r border-[var(--n2)] flex flex-col py-4 overflow-y-auto">
@@ -1112,6 +1144,7 @@ function Sidebar({ view, setView, snap }) {
         <div className="text-[10px] text-[var(--ink-5)] font-mono leading-relaxed">
           agent-i {snap?.version || "—"}<br />{snap?.agent_id || "not connected"}
         </div>
+        <HostFacts host={snap?.host} />
         {/* Where to point an instrumented app. Every question about this
             ends up being "what URL do I send to", so it belongs on screen
             rather than in a config file someone has to go and read. */}

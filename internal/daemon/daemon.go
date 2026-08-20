@@ -167,8 +167,14 @@ func New(cfg *config.Config) (*Daemon, error) {
 	// the offset used to be written the moment a line was read, which meant a
 	// line sitting in the export queue when the process died was recorded as
 	// handled and never read again.
+	// Detected once and shared: the exporter attaches these to every signal it
+	// ships, and the dashboard shows them so the local view can say which
+	// instance it is describing. Probing twice would double a startup cost
+	// paid on every host for a value that cannot change while the process runs.
+	hostAttrs := detectHostAttributes(cfg)
+
 	expCfg := resolveExporterHeaders(cfg.Exporter)
-	expCfg.ResourceAttributes = detectHostAttributes(cfg)
+	expCfg.ResourceAttributes = hostAttrs
 
 	exp, err := exporter.New(expCfg, d.retire)
 	if err != nil {
@@ -209,6 +215,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 
 	if cfg.Dashboard.Enabled {
 		d.dash = dashboard.NewStore(cfg.AgentID, version.Version, cfg.Dashboard.Retain, cfg.Dashboard.MaxSeries)
+		d.dash.SetHostAttributes(hostAttrs)
 		// Constructed here rather than in Run so a port conflict is a
 		// startup error the operator sees immediately, alongside every other
 		// configuration failure, instead of a log line after the agent has
