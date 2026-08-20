@@ -368,7 +368,21 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	// service.name, it should never vary per-envelope.
 	attrs := []otlpKeyValue{
 		stringAttr("service.name", serviceName),
-		stringAttr("host.name", o.hostName()),
+	}
+
+	// host.name is emitted here, immediately after service.name, only when
+	// discovery did not supply one. For a while it was emitted unconditionally
+	// while discovery also supplied it from the EC2 Name tag, so the resource
+	// carried the attribute twice with two different values — and OTLP does
+	// not define which of a duplicated pair a backend keeps, so the host's
+	// name depended on the reader. The discovered one wins, for the same
+	// reason it does for host.id below: the Name tag is what the instance is
+	// actually called, while this is the agent's own configured id.
+	if _, discovered := o.resourceAttrs["host.name"]; !discovered {
+		attrs = append(attrs, stringAttr("host.name", o.hostName()))
+	}
+
+	attrs = append(attrs,
 		// os.type is what a backend's host-inventory view
 		// reads to populate its "OS Type" filter. Without it every host
 		// this agent reports lands in an unnamed, unselectable bucket in
@@ -386,7 +400,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 		// it carries.
 		stringAttr("telemetry.distro.name", "agent-i"),
 		stringAttr("telemetry.distro.version", version.Version),
-	}
+	)
 	// host.id is recommended (not required) by the OTel host resource
 	// Monitoring as a fallback identifier when hostnames collide (cloned
 	// VMs, ephemeral instances reusing a name) — included when available,
