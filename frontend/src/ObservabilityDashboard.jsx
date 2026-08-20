@@ -1186,6 +1186,11 @@ function UsageBar({ value }) {
 // know how a cell is rendered.
 const HOST_COLUMNS = [
   { id: "host", label: "Hostname", get: (r) => r.host, align: "left" },
+  // Its own column rather than a sub-line under Instance. The id is the only
+  // identifier on the row that is guaranteed unique and cannot be renamed, so
+  // it is what you match against an alert or a console tab — that is a lookup,
+  // and a lookup wants a column it can be sorted and scanned down.
+  { id: "instanceId", label: "Host ID", get: (r) => r.instanceID || "", align: "left" },
   { id: "status", label: "Status", get: (r) => (r.active ? 1 : 0), align: "left" },
   // Sortable rather than tucked under the hostname, because at fleet sizes the
   // useful questions are "which instance type is this" and "is one AZ having a
@@ -1281,7 +1286,7 @@ function FleetView({ results, loading, onOpen }) {
       </div>
 
       <div className="border border-[var(--n3)] rounded overflow-x-auto">
-        <table className="w-full min-w-[64rem] border-collapse">
+        <table className="w-full min-w-[74rem] border-collapse">
           <thead>
             <tr className="bg-[var(--surface)]">
               {HOST_COLUMNS.map((c) => (
@@ -1313,6 +1318,9 @@ function FleetView({ results, loading, onOpen }) {
                     <span className="block text-[10px] font-mono text-[var(--ink-5)]">{row.version}</span>
                   )}
                 </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)] whitespace-nowrap">
+                  {row.instanceID || "—"}
+                </td>
                 <td className="px-3 py-2.5">
                   <span className="inline-flex items-center gap-1.5 text-[10.5px] font-mono">
                     <span
@@ -1329,15 +1337,8 @@ function FleetView({ results, loading, onOpen }) {
                     </span>
                   )}
                 </td>
-                <td className="px-3 py-2.5">
-                  <span className="font-mono text-[11.5px] text-[var(--ink-3)]">
-                    {row.instanceType || "—"}
-                  </span>
-                  {row.instanceID && (
-                    <span className="block text-[10px] font-mono text-[var(--ink-5)] break-all">
-                      {row.instanceID}
-                    </span>
-                  )}
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)]">
+                  {row.instanceType || "—"}
                 </td>
                 <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)]">
                   {row.zone || "—"}
