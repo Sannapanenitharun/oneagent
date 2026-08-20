@@ -63,6 +63,10 @@ type Daemon struct {
 	// it, and the exporter's sender goroutine now reports into it too. The
 	// daemon's own state stays lock-free.
 	tailRegistry *collector.OffsetRegistry
+	// journalCursors is nil unless journald collection is enabled. Same role
+	// as tailRegistry for a source that has positions but no files: the
+	// exporter commits into it as entries settle.
+	journalCursors *collector.CursorStore
 
 	// reloadCh carries a new configuration into the drain loop. Reload is
 	// applied there rather than by the signal handler so that everything the
@@ -142,6 +146,24 @@ func New(cfg *config.Config) (*Daemon, error) {
 			log.Printf("multiline log assembly enabled: records start at /%s/", cfg.Logs.Multiline.StartPattern)
 		}
 	}
+	// The journal is not a file, so the tailer above cannot reach it. On a
+	// systemd host this is where the OS's own logs are — sshd, the kernel,
+	// unit failures — and without it those are simply not collected.
+	if cfg.Journald.Enabled {
+		jc := collector.NewJournaldCollector(d.agentID, collector.JournaldOptions{
+			Units:          cfg.Journald.Units,
+			ExcludeUnits:   cfg.Journald.ExcludeUnits,
+			Priority:       cfg.Journald.Priority,
+			Since:          cfg.Journald.Since,
+			JournalctlPath: cfg.Journald.JournalctlPath,
+			CursorPath:     cfg.Journald.CursorPath,
+		})
+		// The collector owns the store it reads from; the daemon needs the
+		// same one to commit into as envelopes settle.
+		d.journalCursors = jc.Cursors()
+		collectors = append(collectors, jc)
+	}
+
 	if cfg.AccessLogs.Enabled {
 		format := collector.FormatCombined
 		if cfg.AccessLogs.Format == "json" {
@@ -442,10 +464,12 @@ func (d *Daemon) export(env collector.Envelope) {
 // registry is the synchronisation point, which is why the daemon can keep
 // owning its own state without a lock.
 func (d *Daemon) retire(env collector.Envelope) {
-	if d.tailRegistry == nil {
-		return
+	if d.tailRegistry != nil {
+		collector.CommitTailOffset(d.tailRegistry, env)
 	}
-	collector.CommitTailOffset(d.tailRegistry, env)
+	if d.journalCursors != nil {
+		collector.CommitJournalCursor(d.journalCursors, env)
+	}
 }
 
 func (d *Daemon) flushAggregated() {

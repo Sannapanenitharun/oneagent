@@ -50,6 +50,43 @@ metrics:
   enabled: true
   collect: ["cpu", "memory"]
 
+# The systemd journal — the operating system's own logs (sshd, the kernel, unit
+# failures, authentication). These are not files, so the paths above cannot
+# reach them: journald keeps its own compressed binary store.
+#
+# Off by default, the same way Datadog and Dynatrace make it opt-in, because it
+# needs the agent user in the systemd-journal group. The installers add that
+# group, so on a host installed by them enabling this is the only step.
+#
+# Read by running journalctl and parsing its JSON, rather than by linking
+# libsystemd the way the commercial agents do. That would need cgo, and this
+# agent ships as a single static binary with no runtime dependencies — the
+# property that lets get.sh drop one file onto a host. The OpenTelemetry
+# Collector's journald receiver makes the same trade.
+#
+# With enabled: true and journalctl missing, the agent fails to start rather
+# than running without OS logs. Silently collecting nothing is the failure this
+# exists to prevent.
+journald:
+  enabled: false
+  # Limit to specific units. Empty collects the whole journal, which is usually
+  # what you want — the interesting entry tends to come from a unit nobody
+  # thought to list.
+  # units: ["sshd.service", "kubelet.service"]
+  # Drop named units. journalctl has no exclusion flag, so this is applied by
+  # the agent after reading.
+  # exclude_units: ["session-*.scope"]
+  # Keep this syslog level and more severe: emerg, alert, crit, err, warning,
+  # notice, info, debug. Empty keeps everything.
+  # priority: "warning"
+  # Where to start on a host with no stored position. Empty starts at the end
+  # of the journal rather than replaying however much history it retains.
+  # since: "-1h"
+  # Position of the last entry known to have been exported, so a restart
+  # resumes instead of skipping or repeating. Committed only once the exporter
+  # has taken the entry — the same rule the file tailer's offsets follow.
+  cursor_path: "/var/lib/agent-i/journald.cursor"
+
 logs:
   enabled: true
   paths:

@@ -46,6 +46,16 @@ id -u agent-i >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/
 # See get.sh for why this is unconditional (idempotent) rather than only
 # on first creation.
 usermod -aG adm agent-i
+# Read access to the systemd journal, which is owned by this group. Added here
+# rather than left to the operator so that turning journald.enabled on is a
+# one-line config change — the same group Datadog's installer documents. A host
+# without systemd has no such group, and that is not an error worth failing an
+# install over.
+if getent group systemd-journal >/dev/null 2>&1; then
+  usermod -aG systemd-journal agent-i
+else
+  echo "    no systemd-journal group on this host — journald collection will not be available"
+fi
 
 echo "==> installing config"
 mkdir -p /etc/agent-i

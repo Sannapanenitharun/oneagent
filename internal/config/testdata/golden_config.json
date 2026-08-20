@@ -20,6 +20,15 @@
       "Timeout": 2000000000
     }
   },
+  "Journald": {
+    "Enabled": false,
+    "Units": null,
+    "ExcludeUnits": null,
+    "Priority": "",
+    "Since": "",
+    "JournalctlPath": "",
+    "CursorPath": "/var/lib/agent-i/journald.cursor"
+  },
   "AccessLogs": {
     "Enabled": false,
     "Paths": [

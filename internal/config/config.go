@@ -22,6 +22,7 @@ type Config struct {
 	Interval   time.Duration   `yaml:"interval"`
 	Metrics    MetricsConfig   `yaml:"metrics"`
 	Logs       LogsConfig      `yaml:"logs"`
+	Journald   JournaldConfig  `yaml:"journald"`
 	AccessLogs AccessLogConfig `yaml:"access_logs"`
 	Tailing    TailingConfig   `yaml:"tailing"`
 	Traces     TracesConfig    `yaml:"traces"`
@@ -182,6 +183,38 @@ type AccessLogConfig struct {
 		DurationMs string `yaml:"duration_ms"`
 		RemoteAddr string `yaml:"remote_addr"`
 	} `yaml:"json_fields"`
+}
+
+// JournaldConfig controls collection of the systemd journal — the operating
+// system's own logs, which are not files and so cannot be reached by the path
+// tailer in LogsConfig.
+//
+// Off by default, for the same reason Datadog and Dynatrace both make it
+// opt-in: it needs the agent user to be in the systemd-journal group, and on a
+// host without systemd it cannot work at all.
+type JournaldConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Units limits collection to these systemd units. Empty collects the whole
+	// journal, which is the useful default for OS logs — the interesting entry
+	// is usually from a unit nobody thought to list.
+	Units []string `yaml:"units"`
+	// ExcludeUnits drops entries from named units, for the noisy one on an
+	// otherwise interesting host.
+	ExcludeUnits []string `yaml:"exclude_units"`
+	// Priority keeps entries at this syslog level and more severe ("err",
+	// "warning", "4"). Empty keeps everything.
+	Priority string `yaml:"priority"`
+	// Since seeds the first read when no cursor has been stored yet. Empty
+	// starts at the end of the journal rather than replaying whatever history
+	// the host retains.
+	Since string `yaml:"since"`
+	// JournalctlPath overrides the binary; needed inside a chroot, where
+	// resolving from $PATH does not work.
+	JournalctlPath string `yaml:"journalctl_path"`
+	// CursorPath persists the position of the last exported entry so a restart
+	// resumes instead of skipping or replaying. Defaults beside the tail
+	// registry in the state directory.
+	CursorPath string `yaml:"cursor_path"`
 }
 
 type TracesConfig struct {
@@ -345,6 +378,9 @@ func Load(path string) (*Config, error) {
 		cfg.Dashboard.MaxSeries = 500
 	}
 
+	if cfg.Journald.CursorPath == "" {
+		cfg.Journald.CursorPath = "/var/lib/agent-i/journald.cursor"
+	}
 	if cfg.Traces.ListenAddr == "" {
 		cfg.Traces.ListenAddr = "127.0.0.1:4319"
 	}
