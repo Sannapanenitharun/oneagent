@@ -191,12 +191,23 @@ dashboard:
   # the view is incomplete instead of quietly showing a subset.
   max_series: 500
 
+# Despite the name, this block configures the whole OTLP receiver, not only
+# traces. One listener serves all three signals, because an SDK configured with
+# OTEL_EXPORTER_OTLP_ENDPOINT — which is what auto-instrument.sh sets — sends
+# every signal to one base URL:
+#
+#   POST /v1/traces    spans from instrumented apps
+#   POST /v1/logs      application logs (accept_logs)
+#   POST /v1/metrics   application metrics (accept_metrics)
+#
+# The block is still called "traces" because renaming it would break every
+# existing config file for a cosmetic gain.
 traces:
   enabled: true
-  # OTLP/HTTP endpoint: POST /v1/traces, accepting both JSON and binary
-  # protobuf. Loopback by default: apps instrumented by auto-instrument.sh
-  # always send to localhost, and a receiver on 0.0.0.0 lets anything that can
-  # reach this host inject spans into your backend.
+  # OTLP/HTTP endpoint, accepting both JSON and binary protobuf. Loopback by
+  # default: apps instrumented by auto-instrument.sh always send to localhost,
+  # and a receiver on 0.0.0.0 lets anything that can reach this host inject
+  # telemetry into your backend.
   listen_addr: "127.0.0.1:4319"
   # Cap on a single request body. The protobuf path must read the whole body
   # into memory before it can decode it.
@@ -205,6 +216,18 @@ traces:
   # "Authorization: Bearer <token>". Set this if you ever move listen_addr off
   # loopback; put the value in /etc/agent-i/env.
   # auth_token_env: "AGENT_I_TRACE_TOKEN"
+
+  # The other two signals on this same listener. Both default to true: before
+  # they existed an auto-instrumented app posted its metrics and logs here and
+  # got 404s, so its traces arrived and the other two were silently lost.
+  #
+  # Turn one off and its path stops being served entirely — the app's exporter
+  # gets a 404 for that signal, exactly as before. Worth considering for
+  # metrics on a host with a large number of application series, since the
+  # local dashboard retains a bounded number of them and reports the rest as
+  # dropped.
+  accept_logs: true
+  accept_metrics: true
 
   # RED metrics (count, errors, latency distribution) computed over 100% of
   # spans. Computed BEFORE sampling, so these counts stay exact no matter how

@@ -198,6 +198,17 @@ type TracesConfig struct {
 	// clients must present. Empty means no authentication, which is only
 	// reasonable while ListenAddr is loopback.
 	AuthTokenEnv string `yaml:"auth_token_env"`
+	// AcceptLogs and AcceptMetrics control the other two OTLP signals on this
+	// same listener. An SDK configured with OTEL_EXPORTER_OTLP_ENDPOINT sends
+	// all three to one base URL, so accepting only traces silently 404s an
+	// application's metrics and logs — which is why both default to true.
+	//
+	// They are pointers so an existing config that predates them is
+	// distinguishable from one that sets them to false: a bare false is the
+	// zero value of a bool and would silently disable both on upgrade. See
+	// applyTraceSignalDefaults.
+	AcceptLogs    *bool `yaml:"accept_logs"`
+	AcceptMetrics *bool `yaml:"accept_metrics"`
 
 	Sampling TraceSamplingConfig `yaml:"sampling"`
 	Stats    TraceStatsConfig    `yaml:"stats"`
@@ -343,6 +354,18 @@ func Load(path string) (*Config, error) {
 	if cfg.Traces.Sampling.KeepErrors == nil {
 		keep := true
 		cfg.Traces.Sampling.KeepErrors = &keep
+	}
+	// Default on: an unset value means a config written before this listener
+	// accepted anything but traces, and on those hosts the application's
+	// metrics and logs were being 404'd. Turning them on is the fix, not a
+	// behaviour change someone has to opt into.
+	if cfg.Traces.AcceptLogs == nil {
+		on := true
+		cfg.Traces.AcceptLogs = &on
+	}
+	if cfg.Traces.AcceptMetrics == nil {
+		on := true
+		cfg.Traces.AcceptMetrics = &on
 	}
 	if cfg.Traces.Sampling.Enabled && cfg.Traces.Sampling.Rate <= 0 {
 		// Enabling sampling without a rate almost certainly means "I forgot to

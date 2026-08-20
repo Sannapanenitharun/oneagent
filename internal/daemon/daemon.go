@@ -165,12 +165,16 @@ func New(cfg *config.Config) (*Daemon, error) {
 		if traceToken == "" {
 			traceToken = os.Getenv(apiTokenEnv)
 		}
-		collectors = append(collectors, collector.NewOTLPTraceReceiverCollector(
+		rec := collector.NewOTLPReceiverCollector(
 			d.agentID,
 			cfg.Traces.ListenAddr,
 			cfg.Traces.MaxRequestBytes,
 			traceToken,
-		))
+		)
+		// Both default to true in config.Load, so the nil check there is what
+		// decides this — by here they are always set.
+		rec.AcceptSignals(*cfg.Traces.AcceptLogs, *cfg.Traces.AcceptMetrics)
+		collectors = append(collectors, rec)
 	}
 
 	if len(collectors) == 0 {

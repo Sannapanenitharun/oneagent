@@ -3,9 +3,16 @@
 #
 # Detects systemd-managed Node.js and Python web services running on this
 # host, and — only when explicitly told to — installs OpenTelemetry
-# instrumentation into them and points them at Agent-I's trace receiver
+# instrumentation into them and points them at Agent-I's OTLP receiver
 # (localhost:4319), so their real requests show up as traces without you
 # writing any instrumentation code by hand.
+#
+# The Python path below sets OTEL_EXPORTER_OTLP_ENDPOINT, the generic base URL,
+# so the SDK exports all three signals to it: traces, and also the metrics and
+# logs its auto-instrumentation produces. The agent serves /v1/traces, /v1/logs
+# and /v1/metrics on that one listener, so all three arrive. Set
+# traces.accept_logs or traces.accept_metrics to false in agent.yaml to refuse
+# one of them.
 #
 # SAFETY DESIGN, read before running with --apply:
 #   This script restarts real, possibly production, services that have

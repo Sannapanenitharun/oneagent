@@ -45,6 +45,8 @@
     "ListenAddr": "127.0.0.1:4319",
     "MaxRequestBytes": 4194304,
     "AuthTokenEnv": "",
+    "AcceptLogs": true,
+    "AcceptMetrics": true,
     "Sampling": {
       "Enabled": false,
       "Rate": 1,
