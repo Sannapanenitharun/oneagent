@@ -15,6 +15,7 @@ import {
   globalStats, toRate, fmtRps,
   alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
   parseLogBody, flattenFields, ADAPTER_VERSION, CONTRACT, contractMatches,
+  hostRow,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -249,6 +250,44 @@ check("layout safe", Object.keys(layoutTopology([], [])).length === 0);
 check("series safe", deriveAllSeries(EMPTY).length === 0);
 check("traffic safe", deriveTraffic(EMPTY).rps.length === 0);
 check("null snapshot safe", globalStats(null).envelopes === 0);
+
+// hostRow feeds the fleet table, which is the only view that shows many
+// machines at once — so it is the one place where confusing two hosts is
+// possible, and where identity has to survive the reduction intact.
+console.log("host row");
+const EC2 = {
+  ...EMPTY,
+  agent_id: "prod-web-01",
+  host: {
+    "cloud.provider": "aws",
+    "cloud.account.id": "123456789012",
+    "cloud.region": "us-east-1",
+    "cloud.availability_zone": "us-east-1a",
+    "host.id": "i-0123456789abcdef0",
+    "host.type": "t3.medium",
+  },
+  series: SNAP.series,
+};
+const ec2Row = hostRow(EC2);
+check("carries the instance id", ec2Row.instanceID === "i-0123456789abcdef0", ec2Row.instanceID);
+check("carries the instance type", ec2Row.instanceType === "t3.medium", ec2Row.instanceType);
+check("prefers the AZ over the region", ec2Row.zone === "us-east-1a", ec2Row.zone);
+check("keeps agent_id as the host name", ec2Row.host === "prod-web-01", ec2Row.host);
+
+// An instance reporting a region but no AZ still gets a usable zone column.
+const REGION_ONLY = { ...EC2, host: { "cloud.region": "eu-west-2", "host.id": "i-abc" } };
+check("falls back to the region", hostRow(REGION_ONLY).zone === "eu-west-2");
+
+// Off a cloud host the agent omits `host` entirely. These must come back as
+// strings: the fleet table sorts them with localeCompare, and undefined would
+// take the numeric path and order the rows nonsensically.
+const BARE = { ...EMPTY, agent_id: "laptop", series: SNAP.series };
+const bareRow = hostRow(BARE);
+check("no host object is not an error", bareRow !== null);
+check(
+  "absent instance fields are strings",
+  ["instanceID", "instanceType", "zone", "account"].every((k) => bareRow[k] === "")
+);
 
 // A malformed trace must not hang the render.
 console.log("malformed input");

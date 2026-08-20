@@ -504,8 +504,22 @@ export function hostRow(snap) {
   }, 0);
   const ageSec = newest && snap.now ? (snap.now - newest) / 1000 : Infinity;
 
+  // What the machine is, as the agent discovered it — distinct from agent_id
+  // above, which is only what it calls itself. Absent off a cloud host, so
+  // every field defaults to "" rather than undefined: the fleet table sorts
+  // these as strings, and a missing key would fall through to the numeric
+  // comparison and sort nonsensically against the rows that do have one.
+  const host = snap.host || {};
+
   return {
     host: base.host,
+    instanceID: host["host.id"] || "",
+    instanceType: host["host.type"] || "",
+    // Zone is the more specific of the two and the one that matters when a
+    // single AZ is having a bad day; region is the fallback on the rare
+    // instance that reports one without the other.
+    zone: host["cloud.availability_zone"] || host["cloud.region"] || "",
+    account: host["cloud.account.id"] || "",
     version: snap.version || "",
     os: "linux", // the agent reads /proc and builds only for Linux
     active: ageSec <= 600,

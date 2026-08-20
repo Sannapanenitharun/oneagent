@@ -1187,6 +1187,11 @@ function UsageBar({ value }) {
 const HOST_COLUMNS = [
   { id: "host", label: "Hostname", get: (r) => r.host, align: "left" },
   { id: "status", label: "Status", get: (r) => (r.active ? 1 : 0), align: "left" },
+  // Sortable rather than tucked under the hostname, because at fleet sizes the
+  // useful questions are "which instance type is this" and "is one AZ having a
+  // bad day" — both of which mean grouping rows, not reading one.
+  { id: "instance", label: "Instance", get: (r) => r.instanceType || "", align: "left" },
+  { id: "zone", label: "Zone", get: (r) => r.zone || "", align: "left" },
   { id: "cpu", label: "CPU Usage", get: (r) => r.cpu, align: "left", bar: true },
   { id: "mem", label: "Memory Usage", get: (r) => r.mem, align: "left", bar: true },
   { id: "iowait", label: "IOWait", get: (r) => r.iowait, align: "right" },
@@ -1213,6 +1218,9 @@ function FleetView({ results, loading, onOpen }) {
           row: row || {
             host: host.name || host.url.replace(/^https?:\/\//, ""),
             active: false, os: "—", version: "",
+            // Strings, not undefined: these columns sort with localeCompare and
+            // an absent value would take the numeric path instead.
+            instanceID: "", instanceType: "", zone: "", account: "",
             cpu: NaN, mem: NaN, iowait: NaN, disk: NaN, load15: NaN,
           },
         };
@@ -1222,7 +1230,16 @@ function FleetView({ results, loading, onOpen }) {
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const filtered = q ? rows.filter((r) => r.row.host.toLowerCase().includes(q)) : rows;
+    // Matches identity, not just the name. Searching an instance id is how you
+    // get from an alert or a console tab to the right row, and searching a zone
+    // or an instance type is how you check whether a problem is confined to
+    // one of them.
+    const filtered = q
+      ? rows.filter(({ row }) =>
+          [row.host, row.instanceID, row.instanceType, row.zone]
+            .some((field) => (field || "").toLowerCase().includes(q))
+        )
+      : rows;
     const col = HOST_COLUMNS.find((c) => c.id === sort.col) || HOST_COLUMNS[0];
     const sign = sort.dir === "asc" ? 1 : -1;
     return [...filtered].sort((a, b) => {
@@ -1253,8 +1270,8 @@ function FleetView({ results, loading, onOpen }) {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="filter by hostname"
-            aria-label="Filter hosts by name"
+            placeholder="filter by name, instance, type or zone"
+            aria-label="Filter hosts by name, instance id, instance type or zone"
             className="text-[11.5px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded pl-7 pr-2.5 py-1.5 text-[var(--ink)] w-[16rem]"
           />
         </div>
@@ -1264,7 +1281,7 @@ function FleetView({ results, loading, onOpen }) {
       </div>
 
       <div className="border border-[var(--n3)] rounded overflow-x-auto">
-        <table className="w-full min-w-[52rem] border-collapse">
+        <table className="w-full min-w-[64rem] border-collapse">
           <thead>
             <tr className="bg-[var(--surface)]">
               {HOST_COLUMNS.map((c) => (
@@ -1312,6 +1329,19 @@ function FleetView({ results, loading, onOpen }) {
                     </span>
                   )}
                 </td>
+                <td className="px-3 py-2.5">
+                  <span className="font-mono text-[11.5px] text-[var(--ink-3)]">
+                    {row.instanceType || "—"}
+                  </span>
+                  {row.instanceID && (
+                    <span className="block text-[10px] font-mono text-[var(--ink-5)] break-all">
+                      {row.instanceID}
+                    </span>
+                  )}
+                </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)]">
+                  {row.zone || "—"}
+                </td>
                 <td className="px-3 py-2.5 w-[14%]"><UsageBar value={row.cpu} /></td>
                 <td className="px-3 py-2.5 w-[14%]"><UsageBar value={row.mem} /></td>
                 <td className="px-3 py-2.5 text-right font-mono text-[11.5px] tabular-nums">
@@ -1329,7 +1359,8 @@ function FleetView({ results, loading, onOpen }) {
 
       <p className="text-[10.5px] font-mono text-[var(--ink-5)]">
         Select a host to open its infrastructure detail. Status is ACTIVE when a metric
-        arrived in the last 10 minutes.
+        arrived in the last 10 minutes. Instance and Zone come from the host's own
+        cloud metadata, and are empty off EC2.
       </p>
     </div>
   );
