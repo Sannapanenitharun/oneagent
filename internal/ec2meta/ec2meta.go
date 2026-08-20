@@ -17,6 +17,17 @@
 //	 "availabilityZone":"us-east-1a","imageId":"ami-…", …}
 //
 // so detection is a token request plus a single GET.
+//
+// The instance's Name tag is fetched separately and optionally:
+//
+//	GET /latest/meta-data/tags/instance/Name
+//
+// Tags are not part of the identity document and are not exposed by IMDS at
+// all unless the instance was launched with InstanceMetadataTags enabled, or
+// had it turned on later with modify-instance-metadata-options. Where that was
+// not done the path 404s, which is the common case and not an error. Reading
+// the tag any other way would mean calling ec2:DescribeTags with credentials —
+// a cloud API client, which this deliberately is not.
 package ec2meta
 
 import (
@@ -27,6 +38,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -50,6 +62,10 @@ type Metadata struct {
 	AccountID        string
 	AvailabilityZone string
 	ImageID          string
+	// Name is the instance's Name tag — the label the console shows and the
+	// one people actually use to refer to a host. Empty whenever the instance
+	// does not expose tags through IMDS, which is the default.
+	Name string
 }
 
 // identityDocument mirrors the JSON field names IMDS returns.
@@ -143,7 +159,30 @@ func (d *Detector) Detect(ctx context.Context) (*Metadata, error) {
 		AccountID:        doc.AccountID,
 		AvailabilityZone: doc.AvailabilityZone,
 		ImageID:          doc.ImageID,
+		// Deliberately last, and deliberately ignoring its error: the instance
+		// is already identified by this point, and a missing Name tag must not
+		// turn a successful detection into a failed one.
+		Name: d.fetchNameTag(ctx, token),
 	}, nil
+}
+
+// fetchNameTag reads the instance's Name tag, returning "" when it is not
+// available for any reason.
+//
+// Every failure mode here is ordinary rather than exceptional — tags not
+// exposed through IMDS at all (the default, a 404), no Name tag set on an
+// instance that does expose them (also a 404), or the request timing out — and
+// each one means the same thing to the caller: there is no name to use. So the
+// signature reports absence rather than an error nobody would act on.
+func (d *Detector) fetchNameTag(ctx context.Context, token string) string {
+	body, err := d.get(ctx, "/latest/meta-data/tags/instance/Name", token)
+	if err != nil {
+		return ""
+	}
+	// IMDS returns the raw tag value with no quoting or trailing newline, but a
+	// tag can legitimately have been set with surrounding whitespace, and that
+	// would end up in a resource attribute and an agent id.
+	return strings.TrimSpace(string(body))
 }
 
 // fetchToken performs the IMDSv2 handshake. A failure is not fatal: the caller
@@ -224,5 +263,11 @@ func (m *Metadata) ResourceAttributes() map[string]string {
 	set("host.id", m.InstanceID)
 	set("host.type", m.InstanceType)
 	set("host.image.id", m.ImageID)
+	// host.name is the Name tag rather than the private DNS name. The
+	// convention permits either, and the tag is what an operator recognises;
+	// the DNS name is derived from the private IP and tells them nothing they
+	// cannot already see. Absent unless the instance exposes tags, in which
+	// case the attribute is simply not set rather than guessed at.
+	set("host.name", m.Name)
 	return attrs
 }

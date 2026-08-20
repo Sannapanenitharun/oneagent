@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/agent-i/agent/internal/aggregate"
@@ -34,7 +35,12 @@ import (
 const apiTokenEnv = "AGENT_I_API_TOKEN"
 
 type Daemon struct {
-	cfg        *config.Config
+	cfg *config.Config
+	// agentID is the resolved name this agent reports under, which is not
+	// necessarily cfg.AgentID: an empty configured value is filled in from the
+	// host at startup. Held here so a reload rebuilding the processors reuses
+	// the resolved value instead of the empty one still sitting in the file.
+	agentID    string
 	collectors []collector.Collector
 	exp        exporter.Exporter
 	// agg is nil unless aggregation is enabled. When set it sits between the
@@ -81,16 +87,25 @@ func New(cfg *config.Config) (*Daemon, error) {
 			"count, not by a sample cap. The setting is ignored and can be deleted.")
 	}
 
+	// Detected before anything is constructed, because three things need it:
+	// the exporter attaches these attributes to every signal, the dashboard
+	// displays them, and the agent id below is derived from them when the
+	// config does not name one. Probing once and sharing the result keeps a
+	// per-host startup cost from being paid repeatedly for a value that cannot
+	// change while the process runs.
+	hostAttrs := detectHostAttributes(cfg)
+	d.agentID = resolveAgentID(cfg.AgentID, hostAttrs)
+
 	var collectors []collector.Collector
 	if cfg.Metrics.Enabled {
-		collectors = append(collectors, collector.NewHostMetricsCollector(cfg.AgentID, cfg.Interval, cfg.Metrics.Collect))
+		collectors = append(collectors, collector.NewHostMetricsCollector(d.agentID, cfg.Interval, cfg.Metrics.Collect))
 		// Additive, not a replacement — emits the standard OTel
 		// hostmetrics names (system.cpu.time, system.memory.usage)
 		// alongside our own host.cpu.used_pct/host.memory.used_pct.
 		// Required for a backend's host-inventory view
 		// > Hosts page to recognize this host at all (confirmed against
 		// the OTel hostmetrics receiver spec — see infra_hostmetrics.go).
-		collectors = append(collectors, collector.NewInfraHostMetricsCollector(cfg.AgentID, cfg.Interval))
+		collectors = append(collectors, collector.NewInfraHostMetricsCollector(d.agentID, cfg.Interval))
 	}
 	// Every file-tailing collector shares one offset registry. Two registries
 	// pointed at the same path would overwrite each other's offsets on every
@@ -111,7 +126,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 	}
 
 	if cfg.Logs.Enabled {
-		lc, err := collector.NewLogTailCollector(cfg.AgentID, cfg.Logs.Paths, tailOpts,
+		lc, err := collector.NewLogTailCollector(d.agentID, cfg.Logs.Paths, tailOpts,
 			collector.MultilineOptions{
 				StartPattern: cfg.Logs.Multiline.StartPattern,
 				MaxLines:     cfg.Logs.Multiline.MaxLines,
@@ -139,7 +154,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 			DurationMs: cfg.AccessLogs.JSONFields.DurationMs,
 			RemoteAddr: cfg.AccessLogs.JSONFields.RemoteAddr,
 		}
-		collectors = append(collectors, collector.NewAccessLogCollector(cfg.AgentID, cfg.AccessLogs.Paths, format, fields, tailOpts))
+		collectors = append(collectors, collector.NewAccessLogCollector(d.agentID, cfg.AccessLogs.Paths, format, fields, tailOpts))
 	}
 	if cfg.Traces.Enabled {
 		// traces.auth_token_env wins when it is set and non-empty, so a host
@@ -151,7 +166,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 			traceToken = os.Getenv(apiTokenEnv)
 		}
 		collectors = append(collectors, collector.NewOTLPTraceReceiverCollector(
-			cfg.AgentID,
+			d.agentID,
 			cfg.Traces.ListenAddr,
 			cfg.Traces.MaxRequestBytes,
 			traceToken,
@@ -167,12 +182,6 @@ func New(cfg *config.Config) (*Daemon, error) {
 	// the offset used to be written the moment a line was read, which meant a
 	// line sitting in the export queue when the process died was recorded as
 	// handled and never read again.
-	// Detected once and shared: the exporter attaches these to every signal it
-	// ships, and the dashboard shows them so the local view can say which
-	// instance it is describing. Probing twice would double a startup cost
-	// paid on every host for a value that cannot change while the process runs.
-	hostAttrs := detectHostAttributes(cfg)
-
 	expCfg := resolveExporterHeaders(cfg.Exporter)
 	expCfg.ResourceAttributes = hostAttrs
 
@@ -184,7 +193,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 	d.exp = exp
 
 	if cfg.Aggregation.Enabled {
-		d.agg = aggregate.New(cfg.AgentID, aggregate.Config{
+		d.agg = aggregate.New(d.agentID, aggregate.Config{
 			Enabled:       true,
 			Interval:      cfg.Aggregation.Interval,
 			MaxContexts:   cfg.Aggregation.MaxContexts,
@@ -193,7 +202,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 		log.Printf("aggregation enabled: access log requests summarised every %s", d.agg.Interval())
 	}
 
-	sp := spans.New(cfg.AgentID, spans.Config{
+	sp := spans.New(d.agentID, spans.Config{
 		StatsEnabled:    cfg.Traces.Stats.Enabled,
 		SamplingEnabled: cfg.Traces.Sampling.Enabled,
 		Rate:            cfg.Traces.Sampling.Rate,
@@ -214,7 +223,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 	}
 
 	if cfg.Dashboard.Enabled {
-		d.dash = dashboard.NewStore(cfg.AgentID, version.Version, cfg.Dashboard.Retain, cfg.Dashboard.MaxSeries)
+		d.dash = dashboard.NewStore(d.agentID, version.Version, cfg.Dashboard.Retain, cfg.Dashboard.MaxSeries)
 		d.dash.SetHostAttributes(hostAttrs)
 		// Constructed here rather than in Run so a port conflict is a
 		// startup error the operator sees immediately, alongside every other
@@ -230,6 +239,50 @@ func New(cfg *config.Config) (*Daemon, error) {
 	}
 
 	return d, nil
+}
+
+// fallbackAgentID names an agent on a host that could not identify itself at
+// all — not EC2, and no usable hostname. Reached only if os.Hostname fails,
+// which on a working system it does not.
+const fallbackAgentID = "unidentified-host"
+
+// resolveAgentID decides what this agent calls itself.
+//
+// A configured value always wins, because it is an operator saying so
+// explicitly. Everything after it covers the case this function exists for: a
+// config installed unattended across a fleet. That file used to carry a
+// hardcoded id, so every host installed from it reported under the same name
+// and no backend could tell them apart — which is precisely the question an
+// agent is deployed to answer.
+//
+// The fallbacks run most-meaningful-first. The Name tag is what people
+// actually call an instance, but it is absent unless tags are exposed through
+// IMDS, which is not the default. The instance id is always present on EC2 and
+// always unique, if ugly. The hostname is all that is left off EC2, and is
+// what someone filling the field in by hand would most likely have typed.
+func resolveAgentID(configured string, hostAttrs map[string]string) string {
+	if id := strings.TrimSpace(configured); id != "" {
+		return id
+	}
+	if name := hostAttrs["host.name"]; name != "" {
+		log.Printf("agent_id: not set in config — using the instance Name tag %q", name)
+		return name
+	}
+	if id := hostAttrs["host.id"]; id != "" {
+		log.Printf("agent_id: not set in config — using the EC2 instance id %s", id)
+		return id
+	}
+	if h, err := os.Hostname(); err == nil {
+		if h = strings.TrimSpace(h); h != "" {
+			log.Printf("agent_id: not set in config — using the hostname %q", h)
+			return h
+		}
+	}
+	// A shared id is acceptable here and nowhere else: the host has told us
+	// nothing to distinguish it by, and an agent running under a poor name
+	// still reports, whereas one that refuses to start reports nothing.
+	log.Printf("agent_id: not set in config and the host could not be identified — using %q", fallbackAgentID)
+	return fallbackAgentID
 }
 
 // detectHostAttributes discovers resource attributes that describe the machine
@@ -490,7 +543,7 @@ func (d *Daemon) applyConfig(cfg *config.Config, aggTicker, spanTicker *time.Tic
 	// Rebuild the processors. They hold only per-window state, which was just
 	// flushed, so replacing them wholesale loses nothing.
 	if cfg.Aggregation.Enabled {
-		d.agg = aggregate.New(cfg.AgentID, aggregate.Config{
+		d.agg = aggregate.New(d.agentID, aggregate.Config{
 			Enabled:       true,
 			Interval:      cfg.Aggregation.Interval,
 			MaxContexts:   cfg.Aggregation.MaxContexts,
@@ -500,7 +553,7 @@ func (d *Daemon) applyConfig(cfg *config.Config, aggTicker, spanTicker *time.Tic
 		d.agg = nil
 	}
 
-	sp := spans.New(cfg.AgentID, spans.Config{
+	sp := spans.New(d.agentID, spans.Config{
 		StatsEnabled:    cfg.Traces.Stats.Enabled,
 		SamplingEnabled: cfg.Traces.Sampling.Enabled,
 		Rate:            cfg.Traces.Sampling.Rate,

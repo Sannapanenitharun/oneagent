@@ -6,13 +6,29 @@
 # it could not apply. A file that fails to parse is reported and ignored; the
 # agent keeps running on the configuration it already has.
 
-agent_id: "host-001"
+# How this agent names itself in every signal it emits.
+#
+# Left empty, it is worked out at startup from the machine itself, in order:
+# the EC2 instance's Name tag, then the EC2 instance id, then the hostname.
+# That default is the useful one for an unattended install — a fixed value
+# shipped here would make every host in a fleet report under the same name.
+#
+# Set it to override, when the machine should be known by something other than
+# what it calls itself. Changing it needs a restart, not a reload.
+agent_id: ""
 interval: 15s
 
 # Label telemetry with the EC2 instance it came from, so a backend shows this
 # host as a specific instance rather than an anonymous Linux box. Adds the
 # standard OTel attributes: cloud.provider, cloud.platform, cloud.account.id,
 # cloud.region, cloud.availability_zone, host.type, host.image.id.
+#
+# Also adds host.name, the instance's Name tag — but only where the instance
+# exposes tags through IMDS, which is off by default. Turn it on per instance
+# at launch with --metadata-options InstanceMetadataTags=enabled, or after the
+# fact with `aws ec2 modify-instance-metadata-options --instance-metadata-tags
+# enabled`. Without it the tag is simply absent; nothing else changes, and the
+# agent does not fall back to querying the EC2 API for it.
 #
 # This needs NO AWS credentials and no IAM permission. It reads the Instance
 # Metadata Service at 169.254.169.254 — a link-local address reachable only

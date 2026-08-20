@@ -1087,9 +1087,10 @@ const NAV_ITEMS = NAV_GROUPS.flatMap((g) => g.items);
 // HostFacts shows what the machine actually is, as discovered from the cloud
 // provider's metadata service rather than read from the config file.
 //
-// agent_id above it is a name someone chose, and it is identical on every host
-// cloned from one image — so on its own it cannot answer "which instance is
-// this". These fields can.
+// agent_id above it is the name the agent reports under, which is usually
+// derived from the host and may well be the instance id repeated. Either way
+// it is a label, not evidence: it can be set to anything, and says nothing
+// about the type, zone or account the host actually runs in. These fields do.
 //
 // Renders nothing off a cloud host: the agent omits the whole object when it
 // discovered nothing, and an empty "Instance" heading would be worse than no

@@ -1,5 +1,5 @@
 {
-  "AgentID": "host-001",
+  "AgentID": "",
   "Interval": 15000000000,
   "Metrics": {
     "Enabled": true,

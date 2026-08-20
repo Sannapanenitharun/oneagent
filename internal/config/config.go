@@ -13,6 +13,11 @@ import (
 
 // Config is the root configuration for the agent daemon.
 type Config struct {
+	// AgentID names this agent in every signal it emits. Optional: left empty,
+	// the daemon derives one at startup from what the machine actually is —
+	// see daemon.resolveAgentID. It is not defaulted here because Load must
+	// stay a pure function of the file, and any useful default depends on the
+	// host rather than the configuration.
 	AgentID    string          `yaml:"agent_id"`
 	Interval   time.Duration   `yaml:"interval"`
 	Metrics    MetricsConfig   `yaml:"metrics"`
@@ -283,9 +288,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 
-	if cfg.AgentID == "" {
-		return nil, fmt.Errorf("config: agent_id is required")
-	}
+	// agent_id is deliberately not required. It used to be, which meant the
+	// shipped config had to carry a placeholder value for the agent to start at
+	// all — and that placeholder was then the real, identical id of every host
+	// installed from it. An empty value now means "work it out from the host",
+	// which is both a better default and impossible to leave wrong by accident.
 	if cfg.Interval <= 0 {
 		cfg.Interval = 15 * time.Second
 	}
