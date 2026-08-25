@@ -14,7 +14,7 @@ import {
 import { useSnapshot, useHostHealth, useAllSnapshots, HOSTS } from "./api";
 import { useTheme } from "./useTheme";
 import {
-  deriveTraces, deriveEdges, layoutTopology,
+  deriveTraces, deriveEdges, layoutTopology, deriveTopologyNodes,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
   fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow,
 } from "./adapters";
@@ -227,36 +227,94 @@ function ThemeSwitch({ theme, setTheme }) {
   );
 }
 
-function TopologyGraph({ services, edges, positions, selected, onSelect }) {
-  if (!services.length) return <EmptyHint>no services — send spans to the agent's OTLP receiver</EmptyHint>;
+// TopologyGraph draws the derived service map.
+//
+// Three things are encoded, because a map where every dependency looks
+// identical answers none of the questions a map is opened to answer:
+//
+//   thickness  call volume, relative to the busiest edge — which path
+//              carries the traffic
+//   colour     failure, on the edge and on the node it points at — which
+//              path is breaking, following the convention every commercial
+//              map uses of colouring the failing call rather than only the
+//              failing service
+//   shape      whether the far side is instrumented. A dashed node is an
+//              inferred dependency: a database, queue or third-party API
+//              that never reported a span and is known only because
+//              something called it.
+function TopologyGraph({ nodes, edges, positions, height, selected, onSelect }) {
+  if (!nodes.length) return <EmptyHint>no services — send spans to the agent&apos;s OTLP receiver</EmptyHint>;
+  const maxCalls = Math.max(1, ...edges.map((e) => e.calls));
+
   return (
-    <svg viewBox="0 0 460 190" className="w-full h-[220px]">
+    <svg viewBox={`0 0 460 ${height}`} className="w-full" style={{ height: Math.max(220, height + 30) }}>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
           <path d="M0,0 L8,4 L0,8 z" fill="var(--n5)" />
         </marker>
+        <marker id="arrow-bad" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path d="M0,0 L8,4 L0,8 z" fill="var(--crit)" />
+        </marker>
       </defs>
-      {edges.map(([from, to], i) => {
-        const a = positions[from], b = positions[to];
+
+      {edges.map((e, i) => {
+        const a = positions[e.from], b = positions[e.to];
         if (!a || !b) return null;
-        return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="var(--n5)" strokeWidth="1.5" markerEnd="url(#arrow)" />;
+        const failing = e.errPct > 1;
+        // Square-rooted so one very busy edge does not flatten every other
+        // one to a hairline; the eye reads area, not magnitude.
+        const w = 1 + 3 * Math.sqrt(e.calls / maxCalls);
+        const dim = selected && e.from !== selected && e.to !== selected;
+        return (
+          <line
+            key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+            stroke={failing ? "var(--crit)" : "var(--n5)"}
+            strokeWidth={w}
+            strokeDasharray={e.virtual ? "4 3" : undefined}
+            opacity={dim ? 0.25 : 1}
+            markerEnd={failing ? "url(#arrow-bad)" : "url(#arrow)"}
+          >
+            <title>
+              {`${e.from} → ${e.to}\n${e.calls} call${e.calls === 1 ? "" : "s"}, ${e.errPct}% errors\np50 ${e.p50}ms · p99 ${e.p99}ms${e.virtual ? "\ninferred — the far side is not instrumented" : ""}`}
+            </title>
+          </line>
+        );
       })}
-      {services.map((s) => {
+
+      {nodes.map((s) => {
         const p = positions[s.id];
         if (!p) return null;
         const isSelected = selected === s.id;
+        const tone = statusColor[s.status] || statusColor.healthy;
+        const dim = selected && !isSelected &&
+          !edges.some((e) => (e.from === selected && e.to === s.id) || (e.to === selected && e.from === s.id));
         return (
-          <g key={s.id} transform={`translate(${p.x},${p.y})`} className="cursor-pointer" onClick={() => onSelect(s.id)}>
+          <g key={s.id} transform={`translate(${p.x},${p.y})`} className="cursor-pointer"
+             opacity={dim ? 0.35 : 1} onClick={() => onSelect(s.id)}>
+            <title>
+              {s.virtual
+                ? `${s.label}\ninferred ${s.type} dependency — never reported a span\n${s.calls} inbound call${s.calls === 1 ? "" : "s"}, ${s.err}% errors`
+                : `${s.label}\n${fmtRps(s.rps)} rps · ${s.err}% errors · p99 ${s.p99}ms`}
+            </title>
             {s.status !== "healthy" && (
-              <circle r="20" fill={statusColor[s.status]} opacity="0.15">
+              <circle r="20" fill={tone} opacity="0.15">
                 <animate attributeName="r" values="14;24;14" dur="2s" repeatCount="indefinite" />
                 <animate attributeName="opacity" values="0.25;0;0.25" dur="2s" repeatCount="indefinite" />
               </circle>
             )}
-            <circle r="13" fill="var(--n2)" stroke={isSelected ? "var(--accent)" : statusColor[s.status]} strokeWidth={isSelected ? 2.5 : 1.5} />
-            <circle r="3.5" fill={statusColor[s.status]} />
-            <text y="26" textAnchor="middle" className="font-mono" fontSize="9.5" fill={isSelected ? "var(--accent)" : "var(--ink-3)"}>
-              {s.label}
+            <circle
+              r="13"
+              fill="var(--n2)"
+              stroke={isSelected ? "var(--accent)" : tone}
+              strokeWidth={isSelected ? 2.5 : 1.5}
+              strokeDasharray={s.virtual ? "3 2" : undefined}
+            />
+            {s.virtual
+              ? <VirtualGlyph type={s.type} tone={tone} />
+              : <circle r="3.5" fill={tone} />}
+            <text y="26" textAnchor="middle" className="font-mono" fontSize="9.5"
+                  fill={isSelected ? "var(--accent)" : "var(--ink-3)"}>
+              {s.label.length > 22 ? `${s.label.slice(0, 21)}…` : s.label}
             </text>
           </g>
         );
@@ -265,9 +323,31 @@ function TopologyGraph({ services, edges, positions, selected, onSelect }) {
   );
 }
 
+// VirtualGlyph marks an inferred node by what it is, so a datastore is
+// distinguishable from a queue at a glance rather than only by reading labels.
+function VirtualGlyph({ type, tone }) {
+  if (type === "database") {
+    return (
+      <g fill="none" stroke={tone} strokeWidth="1.2">
+        <ellipse cx="0" cy="-3" rx="4.5" ry="1.8" />
+        <path d="M-4.5,-3 L-4.5,3 A4.5,1.8 0 0 0 4.5,3 L4.5,-3" />
+      </g>
+    );
+  }
+  if (type === "messaging") {
+    return (
+      <g fill="none" stroke={tone} strokeWidth="1.2">
+        <rect x="-5" y="-3.5" width="10" height="7" rx="1" />
+        <path d="M-5,-3.5 L0,0.5 L5,-3.5" />
+      </g>
+    );
+  }
+  return <circle r="3.5" fill="none" stroke={tone} strokeWidth="1.2" />;
+}
+
 function ServiceDetail({ svc, edges }) {
   if (!svc) return <EmptyHint>no service selected</EmptyHint>;
-  const related = (edges || []).filter(([f, t]) => f === svc.id || t === svc.id);
+  const related = (edges || []).filter((e) => e.from === svc.id || e.to === svc.id);
   return (
     <>
       <div className="flex items-center justify-between mb-3">
@@ -286,11 +366,27 @@ function ServiceDetail({ svc, edges }) {
         <>
           <div className="text-[10px] text-[var(--ink-3)] font-mono uppercase mb-1.5">Upstream / Downstream</div>
           <div className="flex flex-col gap-1">
-            {related.map(([from, to], i) => (
+            {related.map((e, i) => (
               <div key={i} className="flex items-center gap-1.5 text-[11px] font-mono text-[var(--ink-2)]">
-                <span className={from === svc.id ? "text-[var(--accent)]" : ""}>{from}</span>
+                <span className={e.from === svc.id ? "text-[var(--accent)]" : ""}>{e.from}</span>
                 <ChevronRight size={11} className="text-[var(--ink-5)]" />
-                <span className={to === svc.id ? "text-[var(--accent)]" : ""}>{to}</span>
+                <span className={e.to === svc.id ? "text-[var(--accent)]" : ""}>{e.to}</span>
+                {/* The traffic on the dependency, not just its existence —
+                    which of a service's callees is busy, and which is failing,
+                    is the question this list is read to answer. */}
+                <span className="ml-auto tabular-nums text-[10px] text-[var(--ink-4)]">
+                  {e.calls}×
+                </span>
+                <span className="tabular-nums text-[10px]"
+                      style={{ color: e.errPct > 1 ? "var(--crit)" : "var(--ink-4)" }}>
+                  {e.errPct}%
+                </span>
+                <span className="tabular-nums text-[10px] text-[var(--ink-4)]">p99 {e.p99}ms</span>
+                {e.virtual && (
+                  <span className="text-[9px] uppercase tracking-wide text-[var(--ink-5)]" title="not instrumented — inferred from the caller's span attributes">
+                    inferred
+                  </span>
+                )}
               </div>
             ))}
           </div>
@@ -949,13 +1045,32 @@ function TracesView({ traces }) {
 }
 
 function TopologyView({ d, selected, setSelected }) {
-  const positions = useMemo(() => layoutTopology(d.services, d.edges), [d.services, d.edges]);
-  const svc = d.services.find((s) => s.id === selected) || d.services[0];
+  // Inferred dependencies are nodes on the map but not services, so they are
+  // added here rather than in deriveServices — see deriveTopologyNodes.
+  const nodes = useMemo(() => deriveTopologyNodes(d.services, d.edges), [d.services, d.edges]);
+
+  // Laid out twice on purpose. The height a graph needs depends on how many
+  // nodes share its busiest column, and that is only known once it has been
+  // laid out — so the first pass measures and the second uses the answer.
+  // Cheap: these graphs are a handful of nodes, and it is memoised.
+  const { positions, height } = useMemo(() => {
+    const probe = layoutTopology(nodes, d.edges);
+    const perColumn = {};
+    for (const id of Object.keys(probe)) {
+      const col = Math.round(probe[id].x);
+      perColumn[col] = (perColumn[col] || 0) + 1;
+    }
+    const rows = Math.max(1, ...Object.values(perColumn));
+    const h = Math.max(190, rows * 46);
+    return { positions: layoutTopology(nodes, d.edges, 460, h), height: h };
+  }, [nodes, d.edges]);
+
+  const svc = nodes.find((s) => s.id === selected) || nodes[0];
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
       <Panel title="Service Topology" className="lg:col-span-2">
-        <TopologyGraph services={d.services} edges={d.edges} positions={positions} selected={svc?.id} onSelect={setSelected} />
+        <TopologyGraph nodes={nodes} edges={d.edges} positions={positions} height={height} selected={svc?.id} onSelect={setSelected} />
         <div className="flex items-center justify-between mt-3 pt-3 border-t border-[var(--n3)]">
           <div className="flex items-center gap-4">
             {["healthy", "degraded"].map((s) => (
@@ -964,9 +1079,13 @@ function TopologyView({ d, selected, setSelected }) {
                 <span className="text-[10px] text-[var(--ink-3)] font-mono uppercase">{s}</span>
               </div>
             ))}
+            <div className="flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full border border-dashed" style={{ borderColor: "var(--ink-4)" }} />
+              <span className="text-[10px] text-[var(--ink-3)] font-mono uppercase">inferred</span>
+            </div>
           </div>
           <span className="text-[10px] font-mono text-[var(--ink-5)]">
-            {d.edges.length} edge{d.edges.length === 1 ? "" : "s"} derived from span parent links
+            {d.edges.length} edge{d.edges.length === 1 ? "" : "s"} · thickness is call volume, red is failing
           </span>
         </div>
       </Panel>

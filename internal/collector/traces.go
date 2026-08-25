@@ -401,6 +401,61 @@ func (t *OTLPReceiverCollector) handleProtobuf(w http.ResponseWriter, r *http.Re
 // functions separate rather than unifying through a shared intermediate
 // type — the two input shapes are different enough that a shared type
 // would just move the conversion complexity rather than remove it.
+// spanKindName renders OTLP's SpanKind enum.
+//
+// The kind is what separates a service graph from a call tree. A dependency
+// between two services is a CLIENT span in one whose child is a SERVER span in
+// the other — pairing on parent-child alone cannot tell that from an ordinary
+// nested call, and cannot tell an outbound call to an uninstrumented database
+// from one to a service that simply did not report. Both distinctions are
+// invisible without this field, so it rides on every span.
+func spanKindName(kind int32) string {
+	switch kind {
+	case 1:
+		return "internal"
+	case 2:
+		return "server"
+	case 3:
+		return "client"
+	case 4:
+		return "producer"
+	case 5:
+		return "consumer"
+	default:
+		return ""
+	}
+}
+
+// peerAttributeKeys are the attributes that identify what an outbound span was
+// talking to, when that something is not itself instrumented.
+//
+// A CLIENT span to a database or a third-party API has no matching SERVER span
+// anywhere in the trace, so the dependency is invisible unless the peer names
+// itself in an attribute. These are the attributes that do, and they are the
+// same set the OpenTelemetry service graph connector reads for the purpose.
+//
+// Promoted onto labels rather than left in the payload's attribute map because
+// the dashboard reads labels; the full attribute set stays in the payload
+// untouched. Both the current and the previous semantic-convention spellings
+// are listed, since which one arrives depends on the age of the SDK rather
+// than on anything the operator chose.
+var peerAttributeKeys = []string{
+	"peer.service",
+	"db.system", "db.system.name", "db.name", "db.namespace",
+	"messaging.system", "messaging.destination.name", "messaging.destination",
+	"rpc.system", "rpc.service",
+	"server.address", "net.peer.name",
+}
+
+// copyPeerAttributes lifts the peer-identifying attributes onto labels.
+func copyPeerAttributes(labels map[string]string, attrs map[string]any) {
+	for _, k := range peerAttributeKeys {
+		if v, ok := attrs[k].(string); ok && v != "" {
+			labels[k] = v
+		}
+	}
+}
+
 func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *otlpwire.Span) Envelope {
 	durationMs := float64(sp.EndTimeUnixNano-sp.StartTimeUnixNano) / 1e6
 
@@ -438,6 +493,10 @@ func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *otlpwire.Sp
 	for _, a := range sp.Attributes {
 		attrs[a.Key] = a.Value.String()
 	}
+	if k := spanKindName(sp.Kind); k != "" {
+		labels["span.kind"] = k
+	}
+	copyPeerAttributes(labels, attrs)
 
 	return Envelope{
 		Kind:      KindTrace,
@@ -482,6 +541,10 @@ func spanToEnvelopeJSON(agentID, serviceName, scopeName string, sp otlpSpan) Env
 	for _, a := range sp.Attributes {
 		attrs[a.Key] = a.Value.toString()
 	}
+	if k := spanKindName(int32(sp.Kind)); k != "" {
+		labels["span.kind"] = k
+	}
+	copyPeerAttributes(labels, attrs)
 
 	return Envelope{
 		Kind:      KindTrace,

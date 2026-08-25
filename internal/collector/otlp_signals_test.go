@@ -506,3 +506,90 @@ func sources(envs []Envelope) []string {
 	}
 	return out
 }
+
+// A service graph is a client span paired with a server span in another
+// service, and an uninstrumented dependency is a client span with nothing on
+// the other end that names its peer. Both facts live on the span, and the
+// dashboard cannot derive a topology without them — so they have to survive
+// the trip into the envelope.
+func TestOTLPReceiver_SpanKindAndPeerAttributes(t *testing.T) {
+	out, base := startReceiver(t, 14352, nil)
+
+	const body = `{"resourceSpans":[{"resource":{"attributes":[
+	  {"key":"service.name","value":{"stringValue":"orders"}}]},
+	  "scopeSpans":[{"scope":{"name":"app"},"spans":[
+	    {"traceId":"0102030405060708090a0b0c0d0e0f10","spanId":"1112131415161718",
+	     "name":"SELECT orders","kind":3,
+	     "startTimeUnixNano":"1786800000000000000","endTimeUnixNano":"1786800000020000000",
+	     "attributes":[
+	       {"key":"db.system","value":{"stringValue":"postgresql"}},
+	       {"key":"db.name","value":{"stringValue":"ordersdb"}},
+	       {"key":"net.peer.name","value":{"stringValue":"db-1.internal"}},
+	       {"key":"http.method","value":{"stringValue":"GET"}}]}]}]}]}`
+
+	resp, err := http.Post(base+"/v1/traces", "application/json", bytes.NewReader([]byte(body)))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	envs := drain(out)
+	if len(envs) != 1 {
+		t.Fatalf("got %d envelopes, want 1", len(envs))
+	}
+	e := envs[0]
+
+	// kind 3 is CLIENT. Without this the dashboard cannot tell an outbound
+	// call from an ordinary nested one.
+	if e.Labels["span.kind"] != "client" {
+		t.Errorf("span.kind = %q, want client", e.Labels["span.kind"])
+	}
+	for k, want := range map[string]string{
+		"db.system":     "postgresql",
+		"db.name":       "ordersdb",
+		"net.peer.name": "db-1.internal",
+	} {
+		if e.Labels[k] != want {
+			t.Errorf("label %s = %q, want %q", k, e.Labels[k], want)
+		}
+	}
+	// Only the peer-identifying attributes are promoted. Copying every
+	// attribute onto labels would put unbounded high-cardinality data into the
+	// series key and the dashboard payload.
+	if _, present := e.Labels["http.method"]; present {
+		t.Error("http.method was promoted to a label; only peer attributes should be")
+	}
+	// And the full attribute set is still in the payload, untouched.
+	attrs, _ := e.Payload["attributes"].(map[string]any)
+	if attrs["http.method"] != "GET" {
+		t.Errorf("payload attributes lost http.method: %v", attrs)
+	}
+}
+
+// A server span has no peer to name, and must not acquire empty labels.
+func TestOTLPReceiver_ServerSpanCarriesNoPeer(t *testing.T) {
+	out, base := startReceiver(t, 14353, nil)
+
+	const body = `{"resourceSpans":[{"scopeSpans":[{"spans":[
+	  {"traceId":"0102030405060708090a0b0c0d0e0f10","spanId":"2112131415161718",
+	   "name":"GET /orders","kind":2,
+	   "startTimeUnixNano":"1786800000000000000","endTimeUnixNano":"1786800000070000000"}]}]}]}`
+	resp, err := http.Post(base+"/v1/traces", "application/json", bytes.NewReader([]byte(body)))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	envs := drain(out)
+	if len(envs) != 1 {
+		t.Fatalf("got %d envelopes", len(envs))
+	}
+	if envs[0].Labels["span.kind"] != "server" {
+		t.Errorf("span.kind = %q, want server", envs[0].Labels["span.kind"])
+	}
+	for _, k := range []string{"db.system", "peer.service", "net.peer.name"} {
+		if _, present := envs[0].Labels[k]; present {
+			t.Errorf("server span carries peer label %q", k)
+		}
+	}
+}

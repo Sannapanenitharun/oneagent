@@ -227,27 +227,201 @@ export function deriveTraces(snap) {
   return traces.sort((a, b) => b.startedAt - a.startedAt);
 }
 
-// Caller -> callee edges, read straight off the parent links. This is exactly
-// how Grafana Tempo derives its service graph, and it means the topology is
-// observed rather than declared: it cannot drift from reality.
+// Caller -> callee edges, derived the way OpenTelemetry's service graph
+// connector derives them, because the naive reading of parent links gets two
+// things wrong that matter.
+//
+// An edge between two services is a CLIENT span whose child is a SERVER span
+// in another service. Pairing on parent-child alone cannot tell that from an
+// ordinary nested call, and — worse — it silently drops every dependency that
+// is not itself instrumented. A service's database, its queue and the
+// third-party API it calls produce a CLIENT span with no matching SERVER span
+// anywhere in the trace, so under the old derivation they did not exist. Those
+// are usually the dependencies a topology is being read to find.
+//
+// So this pairs on kind, and where a client span has no server span to pair
+// with it reads the peer's identity out of the span's own attributes and
+// creates a virtual node — the purple "inferred dependency" every commercial
+// map shows.
+//
+// Edges carry their traffic rather than only their existence. An unweighted
+// graph draws a dependency serving one request an hour identically to one
+// serving a thousand a second, and cannot show which edge is the failing one.
+
+// PEER_NAMERS resolve what an uninstrumented peer should be called, in
+// priority order. peer.service is the explicit answer when an SDK sets it;
+// everything after it is inference from what the span was doing.
+const PEER_NAMERS = [
+  (p) => p["peer.service"],
+  (p) => p["db.namespace"] || p["db.name"],
+  (p) => p["messaging.destination.name"] || p["messaging.destination"],
+  (p) => p["rpc.service"],
+  (p) => p["server.address"] || p["net.peer.name"],
+  (p) => p["db.system.name"] || p["db.system"],
+  (p) => p["messaging.system"],
+];
+
+// peerName resolves the display name of an uninstrumented dependency, or ""
+// when the span said nothing about who it was talking to — in which case no
+// edge is invented, because a node called "unknown" is worse than an absent
+// one.
+export function peerName(peer) {
+  if (!peer) return "";
+  for (const namer of PEER_NAMERS) {
+    const v = namer(peer);
+    if (v) return String(v);
+  }
+  return "";
+}
+
+// peerType classifies a dependency so the map can draw a datastore differently
+// from a queue differently from an HTTP service. Mirrors the connection_type
+// dimension the service graph connector puts on its metrics.
+export function peerType(peer) {
+  if (!peer) return "service";
+  if (peer["db.system"] || peer["db.system.name"] || peer["db.name"] || peer["db.namespace"]) return "database";
+  if (peer["messaging.system"] || peer["messaging.destination"] || peer["messaging.destination.name"]) return "messaging";
+  return "service";
+}
+
+const isServerSide = (k) => k === "server" || k === "consumer";
+const isClientSide = (k) => k === "client" || k === "producer";
+
+// deriveEdges returns one aggregated edge per caller/callee pair.
+//
+// Each carries calls, errors and a latency distribution, so the map can encode
+// volume as thickness and failure as colour instead of drawing every
+// dependency the same weight.
 export function deriveEdges(snap) {
   const spans = snap?.spans || [];
+  if (!spans.length) return [];
+
   const byId = new Map(spans.map((s) => [s.span_id, s]));
-  const seen = new Set();
-  const edges = [];
-  for (const sp of spans) {
-    if (!sp.parent_id) continue;
-    const parent = byId.get(sp.parent_id);
-    if (!parent) continue;
-    const from = parent.service || "unknown";
-    const to = sp.service || "unknown";
-    if (from === to) continue; // an internal call, not a service dependency
-    const key = `${from}->${to}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    edges.push([from, to]);
+  const childrenOf = new Map();
+  for (const s of spans) {
+    if (!s.parent_id) continue;
+    if (!childrenOf.has(s.parent_id)) childrenOf.set(s.parent_id, []);
+    childrenOf.get(s.parent_id).push(s);
   }
-  return edges;
+
+  // Whether the agent reporting these spans sends span kinds at all. Older
+  // agents do not, and on those the only derivation available is the parent
+  // link — worse, but far better than an empty map.
+  const hasKinds = spans.some((s) => s.kind);
+  const known = new Set(spans.map((s) => s.service).filter(Boolean));
+
+  const acc = new Map();
+  const add = (from, to, { error, durMs, type, virtual }) => {
+    if (!from || !to || from === to) return;
+    const key = `${from}\u0000${to}`;
+    let e = acc.get(key);
+    if (!e) {
+      e = { from, to, calls: 0, errors: 0, durs: [], type: type || "service", virtual: !!virtual };
+      acc.set(key, e);
+    }
+    e.calls++;
+    if (error) e.errors++;
+    if (Number.isFinite(durMs)) e.durs.push(durMs);
+    // An edge is only virtual while every call on it was to an unpaired peer.
+    // One real server span proves the far side is instrumented after all.
+    if (!virtual) e.virtual = false;
+    if (type === "database" || type === "messaging") e.type = type;
+  };
+
+  for (const sp of spans) {
+    const service = sp.service || "";
+    if (!service) continue;
+
+    // --- paired: a server span whose parent is a client span elsewhere ---
+    const parent = sp.parent_id ? byId.get(sp.parent_id) : null;
+    const pairedAsServer = parent && (!hasKinds || (isServerSide(sp.kind) && isClientSide(parent.kind)));
+    if (pairedAsServer) {
+      add(parent.service || "", service, {
+        // Either side failing makes the call a failed call: a caller that
+        // errored on a response the callee considered fine still had the
+        // request fail, and vice versa.
+        error: isError(sp) || isError(parent),
+        // The caller's duration, which is what the caller experienced —
+        // it includes the network and any queueing the callee never saw.
+        durMs: Number.isFinite(parent.dur_ms) ? parent.dur_ms : sp.dur_ms,
+        type: sp.kind === "consumer" ? "messaging" : "service",
+        virtual: false,
+      });
+      continue;
+    }
+
+    // --- unpaired: an outbound span with nothing on the other end ---
+    if (!hasKinds || !isClientSide(sp.kind)) continue;
+    const children = childrenOf.get(sp.span_id) || [];
+    if (children.some((c) => (c.service || "") !== service)) continue; // paired above
+
+    const name = peerName(sp.peer);
+    if (!name || name === service) continue;
+    // A peer that names an instrumented service is not virtual — its spans are
+    // simply outside this window, which the rolling buffer makes routine. This
+    // is what stops a real service flickering into a separate inferred node
+    // whenever its own spans age out first.
+    add(service, name, {
+      error: isError(sp),
+      durMs: sp.dur_ms,
+      type: peerType(sp.peer),
+      virtual: !known.has(name),
+    });
+  }
+
+  return [...acc.values()]
+    .map((e) => {
+      const sorted = e.durs.slice().sort((a, b) => a - b);
+      return {
+        from: e.from,
+        to: e.to,
+        calls: e.calls,
+        errors: e.errors,
+        errPct: e.calls ? Math.round((e.errors / e.calls) * 10000) / 100 : 0,
+        p50: Math.round(percentile(sorted, 0.5)),
+        p99: Math.round(percentile(sorted, 0.99)),
+        type: e.type,
+        virtual: e.virtual,
+      };
+    })
+    .sort((a, b) => b.calls - a.calls);
+}
+
+// deriveTopologyNodes returns every node the map should draw: the instrumented
+// services, plus a node for each inferred dependency an edge points at.
+//
+// Virtual nodes are built here rather than in deriveServices because they are
+// not services — nothing reported them, they have no latency of their own and
+// no health to speak of. Putting them in the services list would have them
+// counted in "healthy / seen" and listed in the services table, both of which
+// would be claims the data does not support.
+export function deriveTopologyNodes(services, edges) {
+  const nodes = services.map((s) => ({ ...s, virtual: false }));
+  const have = new Set(nodes.map((n) => n.id));
+
+  for (const e of edges) {
+    if (!e.virtual || have.has(e.to)) continue;
+    have.add(e.to);
+    const inbound = edges.filter((x) => x.to === e.to);
+    const calls = inbound.reduce((a, x) => a + x.calls, 0);
+    const errors = inbound.reduce((a, x) => a + x.errors, 0);
+    nodes.push({
+      id: e.to,
+      label: e.to,
+      virtual: true,
+      type: e.type,
+      calls,
+      // An inferred node's health is entirely what its callers saw, since it
+      // reported nothing itself. Said plainly rather than shown as unknown:
+      // a database failing every call is worth drawing as failing.
+      err: calls ? Math.round((errors / calls) * 10000) / 100 : 0,
+      status: calls && errors / calls > 0.01 ? "degraded" : "healthy",
+      p50: Math.round(Math.min(...inbound.map((x) => x.p50))),
+      p99: Math.round(Math.max(...inbound.map((x) => x.p99))),
+      rps: 0,
+    });
+  }
+  return nodes;
 }
 
 // Lays out a derived graph in dependency order: roots on the left, each node
@@ -256,7 +430,7 @@ export function deriveEdges(snap) {
 export function layoutTopology(services, edges, width = 460, height = 190) {
   if (!services.length) return {};
   const incoming = new Map(services.map((s) => [s.id, 0]));
-  for (const [, to] of edges) incoming.set(to, (incoming.get(to) || 0) + 1);
+  for (const { to } of edges) incoming.set(to, (incoming.get(to) || 0) + 1);
 
   const col = new Map();
   const roots = services.filter((s) => !incoming.get(s.id));
@@ -265,7 +439,7 @@ export function layoutTopology(services, edges, width = 460, height = 190) {
 
   for (let guard = 0; queue.length && guard < 500; guard++) {
     const cur = queue.shift();
-    for (const [from, to] of edges) {
+    for (const { from, to } of edges) {
       if (from !== cur) continue;
       const next = (col.get(cur) || 0) + 1;
       if ((col.get(to) ?? -1) < next) {

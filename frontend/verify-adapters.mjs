@@ -15,7 +15,7 @@ import {
   globalStats, toRate, fmtRps,
   alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
   parseLogBody, flattenFields, ADAPTER_VERSION, CONTRACT, contractMatches,
-  hostRow,
+  hostRow, deriveTopologyNodes, peerName, peerType,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -77,12 +77,97 @@ check("root service identified", trace.root === "api-gateway");
 check("error status propagates to trace", trace.status === "error");
 check("span start is relative to trace start", byOp["ChargeCard"].start === 130);
 
-console.log("edges");
+// The fixture above carries no span kinds, which is what an older agent sends.
+// The derivation has to fall back to parent links there rather than returning
+// an empty map — a dashboard pointed at a host that has not been upgraded must
+// still draw its topology.
+console.log("edges (no span kinds — fallback path)");
 const edges = deriveEdges(SNAP);
-const has = (f, t) => edges.some(([a, b]) => a === f && b === t);
+const has = (f, t) => edges.some((e) => e.from === f && e.to === t);
 check("api-gateway -> checkout", has("api-gateway", "checkout"));
 check("checkout -> payments", has("checkout", "payments"));
 check("self-calls are not dependencies", !has("checkout", "checkout"));
+
+const payEdge = edges.find((e) => e.to === "payments");
+check("edges carry their traffic", payEdge.calls === 1, `calls=${payEdge?.calls}`);
+check("edges carry their failures", payEdge.errors === 1 && payEdge.errPct === 100,
+  `errors=${payEdge?.errors} errPct=${payEdge?.errPct}`);
+check("edges carry latency", payEdge.p99 > 0, `p99=${payEdge?.p99}`);
+check("nothing is inferred without kinds", edges.every((e) => !e.virtual));
+
+// A service graph is a client span paired with a server span in another
+// service. With kinds present the derivation must use them, and must find the
+// dependencies that have no span of their own at all.
+console.log("edges (span kinds + uninstrumented peers)");
+const KINDED = {
+  agent_id: "x", version: "v", started_at: T0, now: T0 + 1000, retain_sec: 900,
+  counts: {}, series: [], logs: [],
+  spans: [
+    // gateway -> orders, paired client/server, called twice with one failure
+    { t: T0, trace_id: "t1", span_id: "a1", service: "gateway", name: "GET /o", kind: "client", dur_ms: 90 },
+    { t: T0, trace_id: "t1", span_id: "b1", parent_id: "a1", service: "orders", name: "GET /o", kind: "server", dur_ms: 70 },
+    { t: T0, trace_id: "t2", span_id: "a2", service: "gateway", name: "GET /o", kind: "client", dur_ms: 110 },
+    { t: T0, trace_id: "t2", span_id: "b2", parent_id: "a2", service: "orders", name: "GET /o", kind: "server", dur_ms: 95, status: "2" },
+    // orders -> postgres: a client span with no server span anywhere
+    { t: T0, trace_id: "t1", span_id: "c1", parent_id: "b1", service: "orders", name: "SELECT", kind: "client",
+      dur_ms: 20, peer: { "db.system": "postgresql", "db.name": "ordersdb" } },
+    // orders -> kafka: a producer with no consumer in this window
+    { t: T0, trace_id: "t1", span_id: "d1", parent_id: "b1", service: "orders", name: "publish", kind: "producer",
+      dur_ms: 5, peer: { "messaging.system": "kafka", "messaging.destination.name": "order-events" } },
+    // orders -> gateway named by peer.service, whose spans ARE present:
+    // outside the window this would look uninstrumented, and must not.
+    { t: T0, trace_id: "t3", span_id: "e1", service: "orders", name: "callback", kind: "client",
+      dur_ms: 15, peer: { "peer.service": "gateway" } },
+  ],
+};
+const ke = deriveEdges(KINDED);
+const kf = (f, t) => ke.find((e) => e.from === f && e.to === t);
+
+check("client/server pair becomes an edge", !!kf("gateway", "orders"));
+check("repeat calls aggregate onto one edge", kf("gateway", "orders").calls === 2,
+  `calls=${kf("gateway", "orders")?.calls}`);
+check("either side failing fails the call", kf("gateway", "orders").errors === 1);
+check("paired edges are not inferred", kf("gateway", "orders").virtual === false);
+// The caller's duration, not the callee's: it is what the caller experienced.
+check("edge latency is the caller's view", kf("gateway", "orders").p99 === 110,
+  `p99=${kf("gateway", "orders")?.p99}`);
+
+check("uninstrumented database becomes an edge", !!kf("orders", "ordersdb"));
+check("database edge is marked inferred", kf("orders", "ordersdb").virtual === true);
+check("database edge is typed", kf("orders", "ordersdb").type === "database",
+  `type=${kf("orders", "ordersdb")?.type}`);
+check("uninstrumented queue becomes an edge", !!kf("orders", "order-events"));
+check("queue edge is typed", kf("orders", "order-events").type === "messaging");
+
+// The rolling span buffer means a real service's own spans can age out first.
+// Treating it as uninstrumented would make it flicker into a separate node.
+check("a peer that is a known service is not inferred", kf("orders", "gateway")?.virtual === false,
+  `virtual=${kf("orders", "gateway")?.virtual}`);
+
+// Internal work is not a dependency.
+check("no self edges", ke.every((e) => e.from !== e.to));
+
+console.log("topology nodes");
+const kNodes = deriveTopologyNodes(deriveServices(KINDED), ke);
+const nodeIds = kNodes.map((n) => n.id);
+check("instrumented services are nodes", nodeIds.includes("gateway") && nodeIds.includes("orders"));
+check("inferred dependencies are nodes", nodeIds.includes("ordersdb") && nodeIds.includes("order-events"));
+check("no duplicate nodes", new Set(nodeIds).size === nodeIds.length);
+check("inferred nodes are marked", kNodes.find((n) => n.id === "ordersdb").virtual === true);
+check("real services are not marked inferred", kNodes.find((n) => n.id === "orders").virtual === false);
+// Inferred nodes must not be counted as services anywhere else, or "healthy /
+// seen" starts counting databases nobody instrumented.
+check("inferred nodes stay out of deriveServices",
+  !deriveServices(KINDED).some((s) => s.id === "ordersdb"));
+
+console.log("peer naming");
+check("peer.service wins", peerName({ "peer.service": "billing", "db.name": "x" }) === "billing");
+check("db name beats db system", peerName({ "db.system": "postgresql", "db.name": "ordersdb" }) === "ordersdb");
+check("falls back to the address", peerName({ "server.address": "api.stripe.com" }) === "api.stripe.com");
+check("no peer means no name", peerName(undefined) === "" && peerName({}) === "");
+check("database is typed", peerType({ "db.system": "redis" }) === "database");
+check("messaging is typed", peerType({ "messaging.system": "kafka" }) === "messaging");
+check("plain http is a service", peerType({ "server.address": "x" }) === "service");
 
 console.log("services");
 const services = deriveServices(SNAP);

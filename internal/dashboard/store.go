@@ -69,6 +69,22 @@ type Span struct {
 	Name     string  `json:"name"`
 	DurMs    float64 `json:"dur_ms"`
 	Status   string  `json:"status,omitempty"`
+	// Kind is OTLP's span kind — client, server, producer, consumer, internal.
+	//
+	// It is what makes a service graph derivable rather than guessed. An edge
+	// between two services is a client span whose child is a server span;
+	// parent-child alone cannot distinguish that from an ordinary nested call,
+	// and cannot tell an outbound call to an uninstrumented database from one
+	// to a service that happens not to be reporting.
+	Kind string `json:"kind,omitempty"`
+	// Peer carries the attributes naming what an outbound span was talking to,
+	// for the case where that something is not instrumented and so has no span
+	// of its own anywhere in the trace. Without it a service's databases,
+	// queues and third-party APIs are simply absent from the graph.
+	//
+	// Omitted when the span named no peer, which is every server span and most
+	// internal ones.
+	Peer map[string]string `json:"peer,omitempty"`
 }
 
 // AdapterContract identifies the derivation semantics this payload is built
@@ -247,12 +263,41 @@ func (s *Store) Record(e collector.Envelope) {
 			Name:     e.Labels["name"],
 			DurMs:    e.Value,
 			Status:   e.Labels["status.code"],
+			Kind:     e.Labels["span.kind"],
+			Peer:     peerAttributes(e.Labels),
 		}, maxSpans)
 	case collector.KindAPICall:
 		// An access-log request is a metric-shaped thing here: its latency
 		// over time is the useful view, keyed by method+path+status.
 		s.recordMetric(e)
 	}
+}
+
+// peerAttributeKeys mirrors the receiver's list. Kept as an explicit set
+// rather than "every label that is not one of ours" so that a new label added
+// elsewhere cannot silently start appearing on every span in the payload.
+var peerAttributeKeys = []string{
+	"peer.service",
+	"db.system", "db.system.name", "db.name", "db.namespace",
+	"messaging.system", "messaging.destination.name", "messaging.destination",
+	"rpc.system", "rpc.service",
+	"server.address", "net.peer.name",
+}
+
+// peerAttributes extracts what an outbound span named as its peer, returning
+// nil when it named none — which is most spans, and nil keeps the field out of
+// the JSON entirely rather than sending an empty object per span.
+func peerAttributes(labels map[string]string) map[string]string {
+	var out map[string]string
+	for _, k := range peerAttributeKeys {
+		if v := labels[k]; v != "" {
+			if out == nil {
+				out = make(map[string]string, 2)
+			}
+			out[k] = v
+		}
+	}
+	return out
 }
 
 func (s *Store) recordMetric(e collector.Envelope) {

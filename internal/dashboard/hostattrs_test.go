@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-i/agent/internal/collector"
 )
 
 // The dashboard has to answer "which machine am I looking at", not just "what
@@ -104,5 +106,61 @@ func TestSnapshot_HostDoesNotDisturbTheRestOfThePayload(t *testing.T) {
 	}
 	if snap.Series == nil || snap.Logs == nil || snap.Spans == nil {
 		t.Error("series/logs/spans must stay non-nil so they encode as arrays")
+	}
+}
+
+// The dashboard's span shape is what the topology is derived from. Kind and
+// peer attributes have to reach it, or the service map degrades to guessing
+// from parent links — which cannot see an uninstrumented database at all.
+func TestSnapshot_SpansCarryKindAndPeer(t *testing.T) {
+	s := NewStore("agent-1", "v1", time.Minute, 100)
+	s.Record(collector.Envelope{
+		Kind: collector.KindTrace, AgentID: "agent-1", Source: "otlp.span",
+		Timestamp: time.Now(), Value: 20,
+		Labels: map[string]string{
+			"trace_id": "t1", "span_id": "s1", "service.name": "orders",
+			"name": "SELECT", "span.kind": "client",
+			"db.system": "postgresql", "db.name": "ordersdb",
+			"scope.name": "app",
+		},
+	})
+
+	snap := s.Snapshot()
+	if len(snap.Spans) != 1 {
+		t.Fatalf("got %d spans", len(snap.Spans))
+	}
+	sp := snap.Spans[0]
+	if sp.Kind != "client" {
+		t.Errorf("kind = %q", sp.Kind)
+	}
+	if sp.Peer["db.system"] != "postgresql" || sp.Peer["db.name"] != "ordersdb" {
+		t.Errorf("peer = %v", sp.Peer)
+	}
+	// Only peer attributes ride along; scope.name is not one of them.
+	if _, present := sp.Peer["scope.name"]; present {
+		t.Errorf("peer picked up an unrelated label: %v", sp.Peer)
+	}
+}
+
+// A span that named no peer must omit the field entirely rather than carry an
+// empty object on every span in the payload.
+func TestSnapshot_SpanPeerOmittedWhenAbsent(t *testing.T) {
+	s := NewStore("agent-1", "v1", time.Minute, 100)
+	s.Record(collector.Envelope{
+		Kind: collector.KindTrace, AgentID: "agent-1", Source: "otlp.span",
+		Timestamp: time.Now(), Value: 70,
+		Labels: map[string]string{"trace_id": "t1", "span_id": "s2", "span.kind": "server"},
+	})
+
+	snap := s.Snapshot()
+	if snap.Spans[0].Peer != nil {
+		t.Errorf("peer = %v, want nil", snap.Spans[0].Peer)
+	}
+	b, err := json.Marshal(snap.Spans[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), `"peer"`) {
+		t.Errorf("span carries an empty peer key: %s", b)
 	}
 }
