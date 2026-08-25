@@ -10,3 +10,7 @@ configs/agent.local.yaml
 
 # Local dev tunnel with machine-specific key path and host; use scripts/dev-tunnel.sh instead.
 tunnel.sh
+
+# Local list of servers to tunnel to; names hosts and key paths.
+# Copy scripts/hosts.txt.example and edit.
+hosts.txt

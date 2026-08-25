@@ -1,0 +1,19 @@
+# Servers to forward, one per line, for scripts/dev-tunnels.sh.
+#
+# Copy this to hosts.txt (which is gitignored — it names your infrastructure
+# and your key paths) and replace these with your own:
+#
+#   cp scripts/hosts.txt.example hosts.txt
+#   scripts/dev-tunnels.sh hosts.txt
+#
+# Columns: name, ssh target, identity file (optional).
+#
+# The identity column is per host, which is what lets one file cover servers
+# in different AWS accounts. Omit it to use the -i default or your ssh config.
+#
+# Local ports are assigned in order from 8089, so the first line below becomes
+# http://127.0.0.1:8089 and so on. The script prints the finished list in the
+# format the dashboard's host manager accepts.
+
+# name        ssh target              identity
+teleport      ubuntu@54.209.31.122    ~/.ssh/your-key.pem
