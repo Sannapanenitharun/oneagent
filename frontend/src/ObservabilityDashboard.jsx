@@ -1084,40 +1084,7 @@ const NAV_GROUPS = [
 ];
 const NAV_ITEMS = NAV_GROUPS.flatMap((g) => g.items);
 
-// HostFacts shows what the machine actually is, as discovered from the cloud
-// provider's metadata service rather than read from the config file.
-//
-// agent_id above it is the name the agent reports under, which is usually
-// derived from the host and may well be the instance id repeated. Either way
-// it is a label, not evidence: it can be set to anything, and says nothing
-// about the type, zone or account the host actually runs in. These fields do.
-//
-// Renders nothing off a cloud host: the agent omits the whole object when it
-// discovered nothing, and an empty "Instance" heading would be worse than no
-// heading at all.
-function HostFacts({ host }) {
-  const instanceID = host?.["host.id"];
-  if (!instanceID) return null;
-
-  const type = host["host.type"];
-  const zone = host["cloud.availability_zone"] || host["cloud.region"];
-  const account = host["cloud.account.id"];
-  const image = host["host.image.id"];
-
-  return (
-    <div className="text-[9.5px] text-[var(--ink-5)] font-mono leading-relaxed">
-      <div className="uppercase tracking-widest pb-0.5">instance</div>
-      <div className="text-[var(--ink-4)] break-all">{instanceID}</div>
-      {(type || zone) && (
-        <div className="text-[var(--ink-4)]">{[type, zone].filter(Boolean).join(" · ")}</div>
-      )}
-      {account && <div>account {account}</div>}
-      {image && <div className="break-all">{image}</div>}
-    </div>
-  );
-}
-
-function Sidebar({ view, setView, snap }) {
+function Sidebar({ view, setView }) {
   return (
     <div className="w-[200px] flex-shrink-0 border-r border-[var(--n2)] flex flex-col py-4 overflow-y-auto">
       {NAV_GROUPS.map((group) => (
@@ -1141,23 +1108,6 @@ function Sidebar({ view, setView, snap }) {
           })}
         </nav>
       ))}
-      <div className="mt-auto px-4 pt-4 border-t border-[var(--n2)] mx-2 flex flex-col gap-2">
-        <div className="text-[10px] text-[var(--ink-5)] font-mono leading-relaxed">
-          agent-i {snap?.version || "—"}<br />{snap?.agent_id || "not connected"}
-        </div>
-        <HostFacts host={snap?.host} />
-        {/* Where to point an instrumented app. Every question about this
-            ends up being "what URL do I send to", so it belongs on screen
-            rather than in a config file someone has to go and read. */}
-        <div className="text-[9.5px] text-[var(--ink-5)] font-mono leading-relaxed">
-          <div className="uppercase tracking-widest pb-0.5">send traces to</div>
-          <div className="text-[var(--ink-4)] break-all">{window.location.origin}/v1/traces</div>
-        </div>
-        <a href="/agent" target="_blank" rel="noreferrer"
-           className="text-[9.5px] font-mono text-[var(--ink-5)] hover:text-[var(--accent)] underline decoration-dotted">
-          agent's built-in page ↗
-        </a>
-      </div>
     </div>
   );
 }
@@ -1545,7 +1495,7 @@ export default function ObservabilityDashboard() {
       )}
 
       <div className="flex flex-1 min-h-0">
-        <Sidebar view={view} setView={setView} snap={snapshot} />
+        <Sidebar view={view} setView={setView} />
 
         <div className="flex-1 min-w-0 p-5 overflow-y-auto">
           <div className="flex items-center gap-2 text-[11px] text-[var(--ink-5)] font-mono mb-3">
