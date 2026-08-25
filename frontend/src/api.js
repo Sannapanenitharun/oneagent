@@ -5,21 +5,30 @@ import { useEffect, useRef, useState } from "react";
 // agent" and leaving you to guess which one.
 const TARGET = typeof __AGENT_TARGET__ === "string" ? __AGENT_TARGET__ : "the agent";
 
-// The agents this UI can switch between, from AGENT_I_HOSTS — see
-// vite.config.js. Always at least one entry, so nothing downstream has to
-// handle an empty list.
-export const HOSTS =
-  typeof __AGENT_HOSTS__ !== "undefined" && Array.isArray(__AGENT_HOSTS__) && __AGENT_HOSTS__.length > 0
-    ? __AGENT_HOSTS__
-    : [{ name: "", url: TARGET }];
+// Every request goes through the dev server's /h route, which forwards to the
+// address in this header. The agent serves no CORS headers on purpose, so the
+// page cannot fetch it directly; and the target rides in a header rather than
+// being a fixed proxy route so hosts can be added while the UI is running.
+// See vite.config.js.
+function agentFetch(host, path, init = {}) {
+  return fetch(`/h${path}`, {
+    ...init,
+    cache: "no-store",
+    headers: { ...(init.headers || {}), "X-Agent-Target": host.url },
+  });
+}
 
-// Each host is proxied under its own prefix rather than fetched directly:
-// the agent serves no CORS headers on purpose, so a cross-origin fetch from
-// the page would fail even with the tunnel up.
-const hostPath = (i) => `/h/${i}`;
-
-function targetOf(i) {
-  return HOSTS[i]?.url || TARGET;
+// The proxy reports why it could not reach an agent in a JSON body. Reading it
+// is what separates "the tunnel is down" from "the agent is stopped" — a bare
+// status code makes those identical, and they have different fixes.
+async function proxyDetail(res) {
+  try {
+    const body = await res.clone().json();
+    if (body && typeof body.error === "string") return body.error;
+  } catch {
+    /* not our JSON; fall back to the generic wording */
+  }
+  return "";
 }
 
 // Why this distinguishes failure kinds at all:
@@ -54,11 +63,11 @@ async function originAlive(signal) {
   }
 }
 
-export async function fetchSnapshot(signal, hostIndex = 0) {
-  const TARGET = targetOf(hostIndex);
+export async function fetchSnapshot(signal, host) {
+  const TARGET = host?.url || "the agent";
   let res;
   try {
-    res = await fetch(`${hostPath(hostIndex)}/api/snapshot`, { cache: "no-store", signal });
+    res = await agentFetch(host, "/api/snapshot", { signal });
   } catch (err) {
     // An aborted request is a caller concern, so it passes through.
     if (err.name === "AbortError") throw err;
@@ -87,12 +96,15 @@ export async function fetchSnapshot(signal, hostIndex = 0) {
   }
 
   if (!res.ok) {
+    const detail = await proxyDetail(res);
     throw new SnapshotError(
       "unreachable",
       "agent not reachable",
-      `The dev server proxy could not reach ${TARGET} and returned HTTP ${res.status}. ` +
-        `The agent never returns an error status on this endpoint, so this is a connection ` +
-        `failure in front of it — a stopped agent, or a closed SSH tunnel if ${TARGET} is forwarded.`
+      detail
+        ? `The dev server proxy could not reach ${TARGET}: ${detail}`
+        : `The dev server proxy could not reach ${TARGET} and returned HTTP ${res.status}. ` +
+            `The agent never returns an error status on this endpoint, so this is a connection ` +
+            `failure in front of it — a stopped agent, or a closed SSH tunnel if ${TARGET} is forwarded.`
     );
   }
 
@@ -113,7 +125,7 @@ export async function fetchSnapshot(signal, hostIndex = 0) {
 // Polls rather than streams: the agent has no push channel, and at a 5s
 // cadence over loopback the payload is small enough that adding a websocket
 // would be complexity without benefit.
-export function useSnapshot(intervalMs = 5000, hostIndex = 0) {
+export function useSnapshot(intervalMs = 5000, host = null) {
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -134,9 +146,9 @@ export function useSnapshot(intervalMs = 5000, hostIndex = 0) {
     setLoading(true);
 
     async function tick() {
-      if (pausedRef.current) return;
+      if (pausedRef.current || !host?.url) return;
       try {
-        const snap = await fetchSnapshot(controller.signal, hostIndex);
+        const snap = await fetchSnapshot(controller.signal, host);
         if (cancelled) return;
         setSnapshot(snap);
         setError(null);
@@ -163,7 +175,10 @@ export function useSnapshot(intervalMs = 5000, hostIndex = 0) {
       controller.abort();
       clearInterval(id);
     };
-  }, [intervalMs, hostIndex]);
+    // Keyed on the URL, not the object: the host list is rebuilt on every edit,
+    // so a new object identity for an unchanged address would restart the poll
+    // and blank the dashboard every time an unrelated host was renamed.
+  }, [intervalMs, host?.url]);
 
   return { snapshot, error, loading, paused, setPaused };
 }
@@ -181,8 +196,8 @@ export function useSnapshot(intervalMs = 5000, hostIndex = 0) {
 //
 // One host failing must not blank the others — each result carries its own
 // error, and Promise.all over already-caught promises never rejects.
-export function useAllSnapshots(intervalMs = 10000, enabled = true) {
-  const [results, setResults] = useState(() => HOSTS.map(() => ({ snapshot: null, error: null })));
+export function useAllSnapshots(hosts, intervalMs = 10000, enabled = true) {
+  const [results, setResults] = useState(() => hosts.map((h) => ({ host: h, snapshot: null, error: null })));
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -193,12 +208,13 @@ export function useAllSnapshots(intervalMs = 10000, enabled = true) {
 
     async function tick() {
       const next = await Promise.all(
-        HOSTS.map(async (_, i) => {
+        hosts.map(async (h) => {
           try {
-            return { snapshot: await fetchSnapshot(controller.signal, i), error: null };
+            return { host: h, snapshot: await fetchSnapshot(controller.signal, h), error: null };
           } catch (err) {
             if (err.name === "AbortError") return null;
             return {
+              host: h,
               snapshot: null,
               error: { kind: err.kind || "unreachable", message: err.message, detail: err.detail || "" },
             };
@@ -217,7 +233,10 @@ export function useAllSnapshots(intervalMs = 10000, enabled = true) {
       controller.abort();
       clearInterval(id);
     };
-  }, [intervalMs, enabled]);
+    // Joined rather than passed as an array for the same reason useSnapshot
+    // keys on the URL: a fresh array on every render would re-run this effect
+    // continuously and never complete a poll.
+  }, [intervalMs, enabled, hosts.map((h) => h.url).join(",")]);
 
   return { results, loading };
 }
@@ -232,37 +251,38 @@ export function useAllSnapshots(intervalMs = 10000, enabled = true) {
 // Slow on purpose. This exists to stop you switching to a host whose tunnel
 // died, not to be a monitor — the selected host is polled at the normal rate
 // and is the one whose state actually matters.
-export function useHostHealth(intervalMs = 20000) {
-  const [health, setHealth] = useState(() => HOSTS.map(() => "unknown"));
+export function useHostHealth(hosts, intervalMs = 20000) {
+  // Keyed by URL rather than by position. The list is editable while the UI is
+  // running, so a positional array would hand one host's reachability to
+  // whichever host inherited its index after a removal — showing a live dot on
+  // a dead tunnel, which is the one thing this is here to prevent.
+  const [health, setHealth] = useState({});
 
   useEffect(() => {
     let cancelled = false;
     const controller = new AbortController();
 
     async function probe() {
-      const results = await Promise.all(
-        HOSTS.map(async (_, i) => {
+      const probed = await Promise.all(
+        hosts.map(async (h) => {
           try {
-            const res = await fetch(`${hostPath(i)}/healthz`, {
-              cache: "no-store",
-              signal: controller.signal,
-            });
+            const res = await agentFetch(h, "/healthz", { signal: controller.signal });
             // res.ok alone is not enough. An unproxied path falls through to
             // the dev server's SPA handler, which answers 200 with index.html
             // — so a host with no route would read as healthy. The agent's
             // own /healthz is text/plain "ok", never HTML. Same hazard the
             // snapshot fetch already guards against below.
-            if (!res.ok) return "down";
+            if (!res.ok) return [h.url, "down"];
             const type = res.headers.get("content-type") || "";
-            return type.includes("text/html") ? "down" : "up";
+            return [h.url, type.includes("text/html") ? "down" : "up"];
           } catch {
             // Includes the abort on unmount, which the cancelled guard below
             // discards rather than rendering as every host going down.
-            return "down";
+            return [h.url, "down"];
           }
         })
       );
-      if (!cancelled) setHealth(results);
+      if (!cancelled) setHealth(Object.fromEntries(probed));
     }
 
     probe();
@@ -272,7 +292,7 @@ export function useHostHealth(intervalMs = 20000) {
       controller.abort();
       clearInterval(id);
     };
-  }, [intervalMs]);
+  }, [intervalMs, hosts.map((h) => h.url).join(",")]);
 
   return health;
 }

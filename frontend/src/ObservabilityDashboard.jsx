@@ -8,10 +8,11 @@ import {
   Cpu, MemoryStick, Gauge, Search, Bell, ChevronRight,
   LayoutDashboard, ScrollText, Waypoints, HardDrive,
   Network, PlugZap, Pause, Play, Sun, Moon, Monitor,
-  ChevronUp, ChevronDown, X, Braces,
+  ChevronUp, ChevronDown, X, Braces, Settings,
 } from "lucide-react";
 
-import { useSnapshot, useHostHealth, useAllSnapshots, HOSTS } from "./api";
+import { useSnapshot, useHostHealth, useAllSnapshots } from "./api";
+import { loadHosts, saveHosts, parseHostSpec, toHostSpec, hostLabel, configuredHosts } from "./hosts";
 import { useTheme } from "./useTheme";
 import {
   deriveTraces, deriveEdges, layoutTopology, deriveTopologyNodes,
@@ -1220,11 +1221,14 @@ function Fact({ label, children }) {
 
 // ---------------------------------------------------------------------------
 
-const NAV_GROUPS = [
+// A function rather than a constant because the host list is now editable
+// while the UI is running: adding a second server has to make the Fleet tab
+// appear without a reload.
+const navGroups = (hostCount) => [
   { label: "Monitor", items: [
     // Only meaningful with more than one agent configured, and hidden
     // otherwise — a "Fleet" of one is a worse Overview.
-    ...(HOSTS.length > 1 ? [{ id: "fleet", label: "Fleet", icon: Server }] : []),
+    ...(hostCount > 1 ? [{ id: "fleet", label: "Fleet", icon: Server }] : []),
     { id: "overview", label: "Overview", icon: LayoutDashboard },
     { id: "topology", label: "Service Topology", icon: Network },
   ]},
@@ -1240,12 +1244,12 @@ const NAV_GROUPS = [
     { id: "monitors", label: "Monitors", icon: Bell },
   ]},
 ];
-const NAV_ITEMS = NAV_GROUPS.flatMap((g) => g.items);
 
-function Sidebar({ view, setView }) {
+function Sidebar({ view, setView, hostCount }) {
+  const groups = navGroups(hostCount);
   return (
     <div className="w-[200px] flex-shrink-0 border-r border-[var(--n2)] flex flex-col py-4 overflow-y-auto">
-      {NAV_GROUPS.map((group) => (
+      {groups.map((group) => (
         <nav key={group.label} className="flex flex-col gap-0.5 px-2 mb-3">
           <div className="px-3 pb-1 text-[9.5px] font-mono uppercase tracking-widest text-[var(--ink-5)]">{group.label}</div>
           {group.items.map((item) => {
@@ -1317,15 +1321,18 @@ function FleetView({ results, loading, onOpen }) {
   const [sort, setSort] = useState({ col: "host", dir: "asc" });
 
   // One derivation per host per poll, not per render.
+  //
+  // Driven off the results rather than the host list: each result carries the
+  // host it came from, so an edit that lands mid-poll cannot pair one server's
+  // metrics with another server's name.
   const rows = useMemo(
     () =>
-      HOSTS.map((host, i) => {
-        const snap = results[i]?.snapshot;
+      results.map(({ host, snapshot: snap, error }) => {
         const row = snap ? hostRow(snap) : null;
         return {
-          index: i,
+          host,
           url: host.url,
-          error: results[i]?.error,
+          error,
           // A host that never answered still gets a row: its configured name
           // is all we know about it, and omitting it would hide the outage.
           row: row || {
@@ -1368,7 +1375,7 @@ function FleetView({ results, loading, onOpen }) {
   }, [rows, query, sort]);
 
   if (loading) {
-    return <p className="text-[12px] font-mono text-[var(--ink-3)]">polling {HOSTS.length} hosts…</p>;
+    return <p className="text-[12px] font-mono text-[var(--ink-3)]">polling {results.length} hosts…</p>;
   }
 
   const toggle = (id) =>
@@ -1414,10 +1421,10 @@ function FleetView({ results, loading, onOpen }) {
             </tr>
           </thead>
           <tbody>
-            {visible.map(({ index, row, error, url }) => (
+            {visible.map(({ host, row, error, url }) => (
               <tr
                 key={url}
-                onClick={() => onOpen(index)}
+                onClick={() => onOpen(host)}
                 className="cursor-pointer hover:bg-[var(--surface)] border-b border-[var(--n2)] last:border-b-0"
               >
                 <td className="px-3 py-2.5">
@@ -1475,50 +1482,168 @@ function FleetView({ results, loading, onOpen }) {
   );
 }
 
-// HostPicker switches which agent the dashboard is reading.
+// HostPicker switches which agent the dashboard is reading, and is the way in
+// to editing the list.
 //
 // A native <select> rather than a custom dropdown: it is keyboard accessible
 // and screen-reader correct for free, and closes on outside click without any
-// of the listener bookkeeping a div-based menu needs. At fleet sizes this UI
-// is meant for — a handful of hosts you have tunnels open to — there is
-// nothing a custom menu would add.
+// of the listener bookkeeping a div-based menu needs.
 //
 // The dot is the host's own reachability, not the selected host's. Its whole
 // purpose is to tell you a host is unreachable BEFORE you switch to it and
 // wonder why the dashboard went blank.
-function HostPicker({ hostIndex, setHostIndex, health, agentID }) {
+function HostPicker({ hosts, selectedURL, setSelectedURL, health, agentID, onManage }) {
   const dot = (state) =>
     state === "up" ? "var(--good)" : state === "down" ? "var(--crit)" : "var(--ink-3)";
-
-  // A configured name always wins: it is the only label available for a host
-  // whose tunnel is down, since an unreachable agent reports no agent_id.
-  // The live agent_id is a fallback for entries given as a bare URL.
-  const labelFor = (host, i) => {
-    if (host.name) return host.name;
-    if (i === hostIndex && agentID) return agentID;
-    return host.url.replace(/^https?:\/\//, "");
-  };
 
   return (
     <div className="flex items-center gap-2 pl-3 ml-1 border-l border-[var(--n2)]">
       <span
         className="w-2 h-2 rounded-full shrink-0"
-        style={{ background: dot(health[hostIndex]) }}
+        style={{ background: dot(health[selectedURL]) }}
         aria-hidden="true"
       />
       <select
         aria-label="Select host"
-        value={hostIndex}
-        onChange={(e) => setHostIndex(Number(e.target.value))}
+        value={selectedURL}
+        onChange={(e) => setSelectedURL(e.target.value)}
         className="text-[11px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded px-2 py-1 text-[var(--ink)] cursor-pointer max-w-[14rem]"
       >
-        {HOSTS.map((host, i) => (
-          <option key={host.url} value={i}>
-            {health[i] === "down" ? "○ " : "● "}
-            {labelFor(host, i)}
+        {hosts.map((host) => (
+          <option key={host.url} value={host.url}>
+            {health[host.url] === "down" ? "○ " : "● "}
+            {hostLabel(host, host.url === selectedURL ? agentID : "")}
           </option>
         ))}
       </select>
+      <button
+        onClick={onManage}
+        title="Add or remove hosts"
+        aria-label="Manage hosts"
+        className="flex items-center gap-1 text-[11px] font-mono px-2 py-1 rounded bg-[var(--surface)] border border-[var(--n4)] text-[var(--ink-3)] hover:text-[var(--ink)]"
+      >
+        <Settings size={12} />
+        {hosts.length}
+      </button>
+    </div>
+  );
+}
+
+// HostManager edits the list of agents.
+//
+// This exists because the list used to be an environment variable Vite froze
+// into the bundle, so adding a server meant stopping the dev server, editing a
+// shell command and starting it again — for a list that changes every time a
+// tunnel comes up. Servers in different accounts get added one at a time, and
+// the place to do that is the UI already showing you the others.
+//
+// The bulk box is the primary input, not a convenience. Ten forwarded ports
+// arrive as a block of text out of a terminal or a runbook; typing them into
+// ten separate fields is the same information entered ten times more slowly.
+function HostManager({ hosts, setHosts, health, onClose }) {
+  const [text, setText] = useState(() => toHostSpec(hosts));
+  const [error, setError] = useState("");
+
+  const apply = () => {
+    const parsed = parseHostSpec(text);
+    if (parsed.length === 0) {
+      // Refused rather than accepted: an empty list leaves the dashboard with
+      // nothing to talk to and no obvious way back.
+      setError("No usable addresses. Expected one per line, as name=url or a bare host:port.");
+      return;
+    }
+    setHosts(parsed);
+    onClose();
+  };
+
+  const restore = () => {
+    const seeded = configuredHosts();
+    setText(toHostSpec(seeded.length > 0 ? seeded : hosts));
+    setError(seeded.length > 0 ? "" : "AGENT_I_HOSTS was not set when the dev server started.");
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[8vh] px-4 bg-[color-mix(in_srgb,var(--bg)_75%,transparent)]"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-[560px] rounded border border-[var(--n4)] bg-[var(--surface)] shadow-xl flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--n2)]">
+          <h2 className="font-mono text-[13px]">Hosts</h2>
+          <button onClick={onClose} aria-label="Close" className="text-[var(--ink-3)] hover:text-[var(--ink)]">
+            <XCircle size={16} />
+          </button>
+        </div>
+
+        <div className="px-4 py-3 flex flex-col gap-3">
+          <p className="text-[11px] text-[var(--ink-4)] leading-relaxed">
+            One per line, as <span className="font-mono text-[var(--ink-3)]">name=url</span> or a bare
+            address. Each needs to be reachable from this machine — for agents on other servers that
+            means an SSH forward per host, since the dashboard port binds loopback and has no
+            authentication. See <span className="font-mono text-[var(--ink-3)]">scripts/dev-tunnels.sh</span>.
+          </p>
+
+          <textarea
+            value={text}
+            onChange={(e) => { setText(e.target.value); setError(""); }}
+            spellCheck={false}
+            rows={8}
+            aria-label="Host list"
+            placeholder={"prod-web-1=http://127.0.0.1:8089\nprod-web-2=http://127.0.0.1:8090\n127.0.0.1:8091"}
+            className="w-full font-mono text-[12px] leading-relaxed bg-[var(--bg)] border border-[var(--n4)] rounded px-2.5 py-2 text-[var(--ink)] resize-y"
+          />
+
+          {/* Live preview of what will be saved. Normalisation is forgiving —
+              a missing scheme is added, a pasted /api/snapshot is stripped —
+              and showing the result is how that stays trustworthy rather than
+              surprising. */}
+          <div className="flex flex-col gap-1">
+            {parseHostSpec(text).map((h) => (
+              <div key={h.url} className="flex items-center gap-2 text-[11px] font-mono">
+                <span
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{
+                    background:
+                      health[h.url] === "up" ? "var(--good)"
+                      : health[h.url] === "down" ? "var(--crit)"
+                      : "var(--ink-5)",
+                  }}
+                />
+                <span className="text-[var(--ink-3)] min-w-[8rem]">{h.name || "(unnamed)"}</span>
+                <span className="text-[var(--ink-5)]">{h.url}</span>
+              </div>
+            ))}
+          </div>
+
+          {error && <p className="text-[11px] font-mono text-[var(--crit)]">{error}</p>}
+        </div>
+
+        <div className="flex items-center justify-between px-4 py-3 border-t border-[var(--n2)]">
+          <button
+            onClick={restore}
+            className="text-[11px] font-mono text-[var(--ink-4)] hover:text-[var(--ink-3)]"
+          >
+            Restore from AGENT_I_HOSTS
+          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onClose}
+              className="text-[11px] font-mono px-3 py-1.5 rounded border border-[var(--n4)] text-[var(--ink-3)]"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={apply}
+              className="text-[11px] font-mono px-3 py-1.5 rounded bg-[color-mix(in_srgb,var(--accent)_15%,transparent)] border border-[color-mix(in_srgb,var(--accent)_40%,transparent)] text-[var(--accent)]"
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1527,11 +1652,42 @@ export default function ObservabilityDashboard() {
   const [view, setView] = useState("overview");
   const [selected, setSelected] = useState(null);
   const [now, setNow] = useState(new Date());
-  const [hostIndex, setHostIndex] = useState(0);
-  const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000, hostIndex);
-  const hostHealth = useHostHealth();
+
+  // The host list is runtime state, seeded from AGENT_I_HOSTS on first run and
+  // persisted in the browser after that. See hosts.js.
+  const [hosts, setHostsState] = useState(loadHosts);
+  const [managing, setManaging] = useState(false);
+  const setHosts = (next) => {
+    const applied = next.length > 0 ? next : hosts;
+    setHostsState(applied);
+    saveHosts(applied);
+  };
+
+  // Selection is by URL, not by index. The list is editable while the UI is
+  // running, and an index would silently point at a different machine the
+  // moment a host above it was removed.
+  const [selectedURL, setSelectedURL] = useState(() => loadHosts()[0]?.url || "");
+  const selectedHost =
+    hosts.find((h) => h.url === selectedURL) || hosts[0] || null;
+
+  // A removed host must not leave the dashboard polling an address that is no
+  // longer in the list.
+  useEffect(() => {
+    if (hosts.length > 0 && !hosts.some((h) => h.url === selectedURL)) {
+      setSelectedURL(hosts[0].url);
+    }
+  }, [hosts, selectedURL]);
+
+  const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000, selectedHost);
+  const hostHealth = useHostHealth(hosts);
   // Only polls while the fleet view is on screen — see useAllSnapshots.
-  const { results: fleet, loading: fleetLoading } = useAllSnapshots(10000, view === "fleet");
+  const { results: fleet, loading: fleetLoading } = useAllSnapshots(hosts, 10000, view === "fleet");
+
+  // The Fleet tab disappears when the list drops back to one host, so a view
+  // that is no longer reachable in the nav must not stay on screen.
+  useEffect(() => {
+    if (view === "fleet" && hosts.length <= 1) setView("overview");
+  }, [view, hosts.length]);
   // Charts need no re-render on theme change: their colours are var()
   // references that CSS re-resolves at paint time.
   const { theme, setTheme } = useTheme();
@@ -1556,7 +1712,7 @@ export default function ObservabilityDashboard() {
     };
   }, [snapshot]);
 
-  const activeLabel = NAV_ITEMS.find((n) => n.id === view)?.label;
+  const activeLabel = navGroups(hosts.length).flatMap((g) => g.items).find((n) => n.id === view)?.label;
   const connected = !!snapshot && !error;
 
   return (
@@ -1569,20 +1725,22 @@ export default function ObservabilityDashboard() {
           <div>
             <h1 className="font-mono text-sm tracking-wide">AGENT-I</h1>
             <p className="text-[10px] text-[var(--ink-3)] font-mono">
-              {HOSTS.length > 1 ? `${HOSTS.length} hosts` : snapshot?.agent_id || "—"} ·{" "}
+              {hosts.length > 1 ? `${hosts.length} hosts` : snapshot?.agent_id || "—"} ·{" "}
               {now.toLocaleTimeString()}
             </p>
           </div>
-          {/* Only rendered for a genuine fleet. A picker with one entry is
-              chrome that implies a choice you do not have. */}
-          {HOSTS.length > 1 && (
-            <HostPicker
-              hostIndex={hostIndex}
-              setHostIndex={setHostIndex}
-              health={hostHealth}
-              agentID={snapshot?.agent_id}
-            />
-          )}
+          {/* Always rendered, unlike before. With one host it was chrome
+              implying a choice you did not have — but it is also the only way
+              to reach the host manager, and "add a second server" is exactly
+              what someone with one host wants to do. */}
+          <HostPicker
+            hosts={hosts}
+            selectedURL={selectedHost?.url || ""}
+            setSelectedURL={setSelectedURL}
+            health={hostHealth}
+            agentID={snapshot?.agent_id}
+            onManage={() => setManaging(true)}
+          />
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-[11px] font-mono">
@@ -1653,7 +1811,15 @@ export default function ObservabilityDashboard() {
       )}
 
       <div className="flex flex-1 min-h-0">
-        <Sidebar view={view} setView={setView} />
+        {managing && (
+          <HostManager
+            hosts={hosts}
+            setHosts={setHosts}
+            health={hostHealth}
+            onClose={() => setManaging(false)}
+          />
+        )}
+        <Sidebar view={view} setView={setView} hostCount={hosts.length} />
 
         <div className="flex-1 min-w-0 p-5 overflow-y-auto">
           <div className="flex items-center gap-2 text-[11px] text-[var(--ink-5)] font-mono mb-3">
@@ -1673,8 +1839,8 @@ export default function ObservabilityDashboard() {
             <FleetView
               results={fleet}
               loading={fleetLoading}
-              onOpen={(i) => {
-                setHostIndex(i);
+              onOpen={(host) => {
+                setSelectedURL(host.url);
                 // SigNoz opens the host's detail, not a generic overview.
                 setView("infra");
               }}
