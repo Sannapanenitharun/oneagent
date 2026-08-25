@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -49,21 +50,62 @@ func New(cfg config.ExporterConfig, retire func(collector.Envelope)) (Exporter, 
 		// Network exporters are wrapped so delivery happens off the
 		// collectors' goroutines — see async.go for why that matters. stdout
 		// and file are left synchronous: they are local, fast, and tests rely
-		// on their output being deterministic.
+		// on their output being deterministic. They also have no use for a
+		// spool, since the sink they write to IS the disk.
 		h, err := newHTTPExporter(cfg)
 		if err != nil {
 			return nil, err
 		}
-		return newAsyncExporter(h, cfg.QueueSize, cfg.ShutdownTimeout, retire), nil
+		sp, err := openConfiguredSpool(cfg, retire)
+		if err != nil {
+			return nil, err
+		}
+		return newAsyncExporter(h, cfg.QueueSize, cfg.ShutdownTimeout, retire, sp), nil
 	case "otlp_http":
 		o, err := newOTLPHTTPExporter(cfg)
 		if err != nil {
 			return nil, err
 		}
-		return newAsyncExporter(o, cfg.QueueSize, cfg.ShutdownTimeout, retire), nil
+		sp, err := openConfiguredSpool(cfg, retire)
+		if err != nil {
+			return nil, err
+		}
+		return newAsyncExporter(o, cfg.QueueSize, cfg.ShutdownTimeout, retire, sp), nil
 	default:
 		return nil, fmt.Errorf("unknown exporter type %q", cfg.Type)
 	}
+}
+
+// openConfiguredSpool builds the disk spool, if one is wanted.
+//
+// The failure handling is deliberately asymmetric. A spool_dir written in the
+// config is a promise the operator made about where this agent keeps its data,
+// and quietly ignoring an unusable one would leave them believing an outage is
+// survivable when it is not — so that is a startup error, in keeping with how
+// this package already treats a typo'd exporter type. The default path is a
+// guess we made on their behalf, and an agent that refuses to start because it
+// could not create /var/lib/agent-i/spool (unprivileged run, read-only root)
+// would be worse than one that collects with the pre-spool durability. So that
+// case warns loudly and carries on.
+func openConfiguredSpool(cfg config.ExporterConfig, retire func(collector.Envelope)) (*spool, error) {
+	if !cfg.Spool.SpoolEnabled() {
+		return nil, nil
+	}
+	sp, err := openSpool(spoolOptions{
+		Dir:          cfg.Spool.Dir,
+		MaxBytes:     cfg.Spool.MaxBytes,
+		SegmentBytes: cfg.Spool.SegmentBytes,
+		SyncInterval: cfg.Spool.SyncInterval,
+		Retire:       retire,
+	})
+	if err == nil {
+		return sp, nil
+	}
+	if cfg.Spool.SpoolRequired() {
+		return nil, fmt.Errorf("opening exporter spool: %w", err)
+	}
+	log.Printf("exporter: no spool (%v) — envelopes will be dropped oldest-first during an outage and lost on restart; set exporter.spool.dir to a writable path to keep them", err)
+	return nil, nil
 }
 
 // retiringExporter reports the fate of an envelope for the synchronous sinks,

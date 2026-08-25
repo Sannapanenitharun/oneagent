@@ -316,7 +316,71 @@ type ExporterConfig struct {
 	// ShutdownTimeout bounds the final flush attempt on SIGTERM. An unbounded
 	// flush against an unreachable backend turns a restart into an outage.
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+
+	// Spool backs the queue above with disk so an outage or a restart does not
+	// end in data loss.
+	Spool SpoolConfig `yaml:"spool"`
 }
+
+// SpoolConfig controls the exporter's disk-backed overflow buffer.
+//
+// QueueSize alone bounds how much of an outage the agent can absorb, and it
+// bounds it in memory, so raising it trades RAM on the observed host for
+// resilience — a bad trade past a few thousand envelopes, and one that a
+// restart wipes out anyway. The spool moves that buffer to disk, where it is
+// cheap and survives the process.
+//
+// It matters most for signals the agent cannot re-read. A tailed file or the
+// journal is itself a durable log, so those recover by rewinding a saved
+// position. Spans, logs and metrics pushed into the OTLP receiver were handed
+// over once and will not be offered again; without a spool, they are simply
+// gone.
+type SpoolConfig struct {
+	// Enabled is a pointer so an absent block means on. The healthy path never
+	// touches the disk — envelopes are written only once the in-memory queue
+	// has overflowed — so leaving it off by default would cost every existing
+	// deployment its data on the next outage in exchange for nothing.
+	Enabled *bool `yaml:"enabled"`
+
+	// Dir holds the segment files. Setting it explicitly also makes the spool
+	// mandatory: a directory the agent cannot open is a startup error rather
+	// than a warning, on the grounds that someone who named a path meant it.
+	// Left unset, an unusable default degrades to a warning and the old
+	// drop-oldest behaviour instead of refusing to start.
+	Dir string `yaml:"dir"`
+
+	// MaxBytes caps total spool size on disk. Beyond it the oldest whole
+	// segment is discarded, mirroring the in-memory queue's shed-oldest
+	// policy — a spool that filled the disk would take the host down with it,
+	// which is worse than losing the telemetry it was holding.
+	MaxBytes int64 `yaml:"max_bytes"`
+
+	// SegmentBytes is the size of one segment file. Segments are the unit of
+	// reclamation: a fully-read segment is deleted outright, so nothing is
+	// ever rewritten or compacted. Clamped to at most half of MaxBytes, since
+	// the cap has to hold one segment being written plus one still draining.
+	SegmentBytes int64 `yaml:"segment_bytes"`
+
+	// SyncInterval bounds how long a written envelope can sit in the page
+	// cache before fsync. This is the durability window: a power loss inside
+	// it loses those envelopes. Syncing per envelope would close the window
+	// and cost an fsync per record, which is more than duplicate telemetry is
+	// worth.
+	SyncInterval time.Duration `yaml:"sync_interval"`
+
+	// explicit records whether the YAML named this block at all, captured
+	// before defaults are applied — after which Dir is always set and could no
+	// longer answer the question. It is what separates "the operator asked for
+	// a spool here" from "nobody said, so we picked somewhere".
+	explicit bool
+}
+
+// SpoolEnabled reports whether to spool, treating an unset value as true.
+func (c SpoolConfig) SpoolEnabled() bool { return c.Enabled == nil || *c.Enabled }
+
+// SpoolRequired reports whether the spool was asked for by name. Only then is
+// a failure to open it fatal.
+func (c SpoolConfig) SpoolRequired() bool { return c.explicit }
 
 // Load reads and validates a YAML config file. Fails loudly on malformed
 // config rather than silently falling back to defaults — a mis-scoped agent
@@ -380,6 +444,23 @@ func Load(path string) (*Config, error) {
 
 	if cfg.Journald.CursorPath == "" {
 		cfg.Journald.CursorPath = "/var/lib/agent-i/journald.cursor"
+	}
+
+	// Spool defaults. Alongside the tailing registry and the journald cursor,
+	// because it is the same kind of thing: agent state that has to outlive
+	// the process for the agent to be able to promise anything.
+	cfg.Exporter.Spool.explicit = cfg.Exporter.Spool.Enabled != nil || cfg.Exporter.Spool.Dir != ""
+	if cfg.Exporter.Spool.Dir == "" {
+		cfg.Exporter.Spool.Dir = "/var/lib/agent-i/spool"
+	}
+	if cfg.Exporter.Spool.MaxBytes <= 0 {
+		cfg.Exporter.Spool.MaxBytes = 128 << 20
+	}
+	if cfg.Exporter.Spool.SegmentBytes <= 0 {
+		cfg.Exporter.Spool.SegmentBytes = 8 << 20
+	}
+	if cfg.Exporter.Spool.SyncInterval <= 0 {
+		cfg.Exporter.Spool.SyncInterval = time.Second
 	}
 	if cfg.Traces.ListenAddr == "" {
 		cfg.Traces.ListenAddr = "127.0.0.1:4319"

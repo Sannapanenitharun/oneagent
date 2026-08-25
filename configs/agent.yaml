@@ -315,3 +315,19 @@ exporter:
   # backend cannot stall collection. These bound that buffer:
   # queue_size: 4096         # envelopes buffered before the oldest are dropped (drops are logged)
   # shutdown_timeout: 5s     # bound on the final flush attempt at SIGTERM
+
+  # That buffer is in memory, so on its own it bounds an outage to queue_size
+  # envelopes and loses everything in it on restart. The spool moves the
+  # overflow to disk, which is what makes an outage or a restart survivable
+  # rather than merely brief. It matters most for spans, logs and metrics
+  # pushed into the OTLP receiver: unlike a tailed file or the journal, the
+  # application will not offer them a second time.
+  #
+  # Nothing is written while the backend is keeping up — envelopes reach the
+  # disk only once the queue above has overflowed, or at shutdown.
+  spool:
+    enabled: true
+    dir: "/var/lib/agent-i/spool"
+    max_bytes: 134217728     # 128 MiB; past this the oldest segment is discarded, so a backlog can never fill the disk
+    segment_bytes: 8388608   # 8 MiB per file; a fully-delivered file is deleted outright, so nothing is ever rewritten
+    sync_interval: 1s        # how long a written envelope may sit in the page cache before fsync — the power-loss window
