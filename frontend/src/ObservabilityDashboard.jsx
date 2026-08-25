@@ -341,6 +341,32 @@ function ServiceTable({ services, selected, setSelected }) {
 // Views
 // ---------------------------------------------------------------------------
 
+// TracesEmpty replaces the span-derived panels on a host that has never had a
+// span, which is the ordinary state until someone instruments an application.
+//
+// The copy it replaced said "enable traces.enabled and point an app at the
+// agent's OTLP receiver" — advice that is wrong half the time it is shown,
+// because traces.enabled is true by default and the receiver is already
+// listening. What is actually missing is a producer, so this says that, and
+// gives the address to point one at rather than making it the reader's job to
+// find it in a config file.
+function TracesEmpty() {
+  return (
+    <Panel title="Traces" className="lg:col-span-2">
+      <div className="flex flex-col gap-2 py-0.5">
+        <div className="text-[12.5px] font-mono text-[var(--ink-3)]">No spans received.</div>
+        <div className="text-[11.5px] font-mono text-[var(--ink-4)] leading-relaxed">
+          Rate, errors, duration and service health are all derived from spans.
+          They appear here once an instrumented application sends to:
+        </div>
+        <div className="text-[11.5px] font-mono text-[var(--accent)] break-all">
+          {window.location.origin}/v1/traces
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
 // Overview summarises; it does not re-host other views' tables. Where a panel
 // shows the same entity another view owns, clicking it navigates there rather
 // than selecting in place — a selection that changes nothing on screen is a
@@ -348,6 +374,11 @@ function ServiceTable({ services, selected, setSelected }) {
 function OverviewView({ snap, d, openService, openHost, openLogs }) {
   const healthy = d.services.filter((s) => s.status === "healthy").length;
   const infra = d.infra[0];
+  // Whether there is anything span-derived to draw at all. Not the same as
+  // "this window is quiet": a host with no instrumented application never has
+  // spans, and showing it four empty panels forever is not a state, it is a
+  // permanent condition the page should name once and move on from.
+  const hasTraces = (snap?.spans?.length || 0) > 0 || d.services.length > 0;
 
   return (
     <>
@@ -372,12 +403,17 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
         </div>
       )}
 
+      {/* Everything in the RED row and in Service Health is derived from spans,
+          so with none received they are four panels of empty axes — most of a
+          screen spent saying nothing. Collapsed into one honest notice
+          instead, and restored the moment a span arrives. */}
       {/* RED hero row. Rate and errors on the left, duration on the right —
           the convention every platform surveyed follows, and the order an
           operator actually asks the questions in: is it serving, is it
           broken, is it slow. These are taller than everything below them so
           the layout itself says which panels matter; a uniform grid makes you
           scan all of them equally, every time. */}
+      {hasTraces && (
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
         <Panel title="Rate" className="lg:col-span-2" right={<span className="text-[10px] font-mono text-[var(--ink-5)]">req/s</span>}>
           {d.traffic.rps.length > 1 ? (
@@ -427,9 +463,11 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
           ) : <EmptyHint>needs spans</EmptyHint>}
         </Panel>
       </div>
+      )}
 
       {/* Secondary: context for the row above, deliberately shorter. */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-4">
+        {hasTraces ? (
         <Panel title="Service Health" className="lg:col-span-2">
           {d.services.length ? (
             <div className="flex flex-col gap-1.5">
@@ -446,11 +484,12 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
               ))}
             </div>
           ) : (
-            <EmptyHint>
-              no services yet — enable <span className="text-[var(--accent)]">traces.enabled</span> and point an app at the agent's OTLP receiver
-            </EmptyHint>
+            <EmptyHint>no services seen in this window</EmptyHint>
           )}
         </Panel>
+        ) : (
+          <TracesEmpty />
+        )}
 
         <Panel title="This Host" right={infra && (<button onClick={openHost} className="text-[10px] font-mono text-[var(--accent)]">open ↗</button>)}>
           {infra ? (
