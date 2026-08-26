@@ -1014,14 +1014,41 @@ export function globalStats(snap) {
   const totalRps = services.reduce((a, s) => a + s.rps, 0);
   const p99 = services.length ? Math.max(...services.map((s) => s.p99)) : NaN;
   const counts = snap?.counts || {};
-  const uptimeSec = snap ? Math.max(1, (snap.now - snap.started_at) / 1000) : 1;
   const envelopes = Object.values(counts).reduce((a, b) => a + b, 0);
+
+  // What the rate is measured over.
+  //
+  // An agent reports started_at, so its rate is "since the process started".
+  // A backend snapshot has no such thing — the process it would refer to is
+  // on another machine and may have restarted a dozen times inside the window
+  // — so the denominator is the window the payload covers. Naming which is
+  // not decoration: 12 envelopes over a 15-minute window and 12 since a
+  // process started an hour ago are different numbers, and a rate that does
+  // not say what it is divided by cannot be checked.
+  //
+  // Subtracting an absent started_at produced NaN and rendered "NaN/s", which
+  // is the failure this guards: an arithmetic result printed with the same
+  // confidence as a real one.
+  let uptimeSec = 0;
+  let rateBasis = "";
+  if (snap && Number.isFinite(snap.started_at) && snap.started_at > 0) {
+    uptimeSec = Math.max(1, (snap.now - snap.started_at) / 1000);
+    rateBasis = "since start";
+  } else if (snap && Number.isFinite(snap.retain_sec) && snap.retain_sec > 0) {
+    uptimeSec = snap.retain_sec;
+    rateBasis = "over the window";
+  }
+
   return {
     services,
     totalRps: Math.round(totalRps * 1000) / 1000,
     p99,
     envelopes,
-    envelopesPerSec: Math.round((envelopes / uptimeSec) * 10) / 10,
+    // NaN rather than a fabricated 0 when there is nothing to divide by. The
+    // UI renders it as an em dash; a 0 would be a claim that nothing is
+    // arriving.
+    envelopesPerSec: uptimeSec > 0 ? Math.round((envelopes / uptimeSec) * 10) / 10 : NaN,
+    rateBasis,
     counts,
     seriesDropped: snap?.series_dropped || 0,
   };

@@ -491,7 +491,16 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
           sub={`in the last ${Math.round((snap?.retain_sec || 900) / 60)} min`} />
         <KpiTile icon={Gauge} label="Series" value={d.allSeries.length.toLocaleString()}
           tone={d.seriesDropped > 0 ? "warn" : "normal"} sub={d.seriesDropped > 0 ? `${d.seriesDropped} refused` : "metric streams held"} />
-        <KpiTile icon={Activity} label="Envelopes" value={d.envelopes.toLocaleString()} sub={`${d.envelopesPerSec}/s since start`} />
+        <KpiTile
+          icon={Activity}
+          label="Envelopes"
+          value={d.envelopes.toLocaleString()}
+          sub={
+            Number.isFinite(d.envelopesPerSec)
+              ? `${d.envelopesPerSec}/s ${d.rateBasis}`
+              : "rate unavailable"
+          }
+        />
       </div>
 
       {d.seriesDropped > 0 && (
@@ -2034,11 +2043,33 @@ export default function ObservabilityDashboard() {
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-[11px] font-mono">
-            <span className="w-2 h-2 rounded-full" style={{ background: connected ? "var(--good)" : "var(--crit)" }} />
+            {/* Red means something failed, not merely that nothing is
+                connected yet. Idle takes the neutral colour, or the header
+                claims an outage on a dashboard that has not been pointed at
+                anything. */}
+            <span
+              className="w-2 h-2 rounded-full"
+              style={{ background: connected ? "var(--good)" : error ? "var(--crit)" : "var(--ink-4)" }}
+            />
             {/* title carries the diagnosis — which layer failed and what to
                 check — without spending header width on it. */}
-            <span style={{ color: connected ? "var(--ink-3)" : "var(--crit)" }} title={error?.detail || ""}>
-              {loading ? "connecting…" : connected ? "live" : error.message}
+            <span
+              style={{ color: connected ? "var(--ink-3)" : error ? "var(--crit)" : "var(--ink-4)" }}
+              title={error?.detail || ""}
+            >
+              {/* Four states, not three. "Not loading, not connected, no
+                  error" is idle — nothing has been asked to connect — and it
+                  used to be unreachable because the poll never stopped
+                  loading when there was no host. Fixing that made this branch
+                  reachable and it read error.message off null, which took the
+                  whole page down rather than showing a status. */}
+              {loading
+                ? "connecting…"
+                : connected
+                  ? readingBackend ? "from backend" : "live"
+                  : error
+                    ? error.message
+                    : "no host selected"}
             </span>
           </div>
           {/* Pausing stops the agent poll. There is no agent poll to stop

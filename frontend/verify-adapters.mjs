@@ -486,5 +486,40 @@ check("undefined is never", fmtAge(undefined) === "never", fmtAge(undefined));
 // "-3s" would read as a dashboard bug rather than as mild clock skew.
 check("negative age reads as now", fmtAge(-3) === "now", fmtAge(-3));
 
+// The envelope rate has to say what it is divided by.
+//
+// An agent reports started_at, so its rate is since the process started. A
+// backend snapshot has no such field - the process it would refer to is on
+// another machine and may have restarted inside the window - so the
+// denominator is the window itself. Subtracting an absent started_at produced
+// NaN and rendered "NaN/s", an arithmetic accident printed with the same
+// confidence as a real measurement.
+console.log("envelope rate");
+{
+  const withStart = globalStats({ ...EMPTY, now: T0 + 60000, started_at: T0, counts: { metric: 120 } });
+  check("rate uses uptime when started_at exists", withStart.envelopesPerSec === 2, withStart.envelopesPerSec);
+  check("basis is named as since start", withStart.rateBasis === "since start", withStart.rateBasis);
+
+  // A backend snapshot: no started_at, but it declares the window it covers.
+  const windowed = globalStats({ now: T0, retain_sec: 900, counts: { series: 4, logs: 5 }, series: [], logs: [], spans: [] });
+  check("rate falls back to the window", windowed.envelopesPerSec === 0, windowed.envelopesPerSec);
+  check("basis is named as the window", windowed.rateBasis === "over the window", windowed.rateBasis);
+  check("windowed rate is a number, never NaN", Number.isFinite(windowed.envelopesPerSec), windowed.envelopesPerSec);
+
+  const busy = globalStats({ now: T0, retain_sec: 100, counts: { a: 500 }, series: [], logs: [], spans: [] });
+  check("windowed rate divides by the window", busy.envelopesPerSec === 5, busy.envelopesPerSec);
+
+  // Neither basis available: NaN rather than a fabricated 0, which would be a
+  // claim that nothing is arriving.
+  const neither = globalStats({ now: T0, counts: { a: 7 }, series: [], logs: [], spans: [] });
+  check("no basis yields NaN, not 0", Number.isNaN(neither.envelopesPerSec), neither.envelopesPerSec);
+  check("no basis has no label", neither.rateBasis === "", neither.rateBasis);
+  check("the count itself is still reported", neither.envelopes === 7, neither.envelopes);
+
+  // A zero or negative started_at is not a timestamp.
+  const bogus = globalStats({ now: T0, started_at: 0, retain_sec: 900, counts: { a: 900 }, series: [], logs: [], spans: [] });
+  check("a zero started_at falls through to the window", bogus.rateBasis === "over the window", bogus.rateBasis);
+}
+
 console.log(failed === 0 ? "\nOK — all adapter checks passed" : `\n${failed} check(s) failed`);
 process.exit(failed ? 1 : 0);
