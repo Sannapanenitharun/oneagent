@@ -14,3 +14,7 @@ tunnel.sh
 # Local list of servers to tunnel to; names hosts and key paths.
 # Copy scripts/hosts.txt.example and edit.
 hosts.txt
+
+# Compose reads this automatically and it holds the ingest API keys and the
+# ClickHouse password. Never commit it.
+deploy/.env

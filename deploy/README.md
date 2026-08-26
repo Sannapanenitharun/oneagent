@@ -22,6 +22,24 @@ AGENTI_API_KEYS="acct-a:$(openssl rand -hex 24)" docker compose up -d
 docker compose logs -f server
 ```
 
+On Windows, in PowerShell — `VAR=value command` is bash syntax and PowerShell
+reads it as the name of a command, so set the variable first:
+
+```powershell
+cd deploy
+$bytes = New-Object byte[] 24
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$env:AGENTI_API_KEYS = "acct-a:$(($bytes | ForEach-Object { '{0:x2}' -f $_ }) -join '')"
+docker compose up -d
+docker compose logs -f server
+```
+
+`RandomNumberGenerator` rather than `Get-Random`, which is seeded from the
+clock and is not meant for anything anyone has to keep secret.
+
+Either way the variable lives in that one shell. Put it in `deploy/.env` — which
+is gitignored, and which compose reads on its own — to survive a new terminal.
+
 ClickHouse binds to loopback; only the server's `:4318` is exposed, because
 that is the only port anything outside this host needs.
 
@@ -70,6 +88,26 @@ curl -s localhost:4318/api/hosts | jq '.hosts[] | {host_id, agent_id, cpu_pct}'
 The ingest paths are OTLP's own, so any OTLP producer can send here — not only
 this project's agent. That is most of the value of having picked OTLP as the
 wire format.
+
+## What fills the fleet columns
+
+`GET /api/hosts` reads specific metric names. A name that nothing emits shows
+as an empty cell, not an error, so it is worth being explicit:
+
+| Column | Read from | Notes |
+|---|---|---|
+| CPU | `host.cpu.used_pct`, else `system.cpu.utilization` | the semconv name is a 0..1 ratio and is scaled by 100 |
+| Memory | `host.memory.used_pct`, else `system.memory.utilization` | same |
+| Disk | `system.filesystem.usage` where `mountpoint=/` | bytes, split `state=used`/`state=free`; the percentage is computed from the pair |
+
+There is no disk *percentage* metric anywhere in the agent — the hostmetrics
+collector reports filesystem bytes, which is what the OpenTelemetry receiver
+does — so the fleet table derives it. The root filesystem is used because it
+is the one every host has and the one "disk" means unqualified.
+
+An empty cell means the host has not reported that metric inside the window.
+It is distinct from `0`, which is a real reading: an idle machine shows 0%
+CPU, not a blank. `internal/store/query_test.go` pins both cases.
 
 ## Configuration
 

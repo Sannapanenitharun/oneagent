@@ -50,7 +50,10 @@ SELECT
     h.attributes                         AS attributes,
     m.cpu_pct                            AS cpu_pct,
     m.mem_pct                            AS mem_pct,
-    m.disk_pct                           AS disk_pct
+    m.disk_pct                           AS disk_pct,
+    m.has_cpu                            AS has_cpu,
+    m.has_mem                            AS has_mem,
+    m.has_disk                           AS has_disk
 FROM (SELECT host_id, agent_id, last_seen, attributes FROM hosts FINAL) AS h
 LEFT JOIN (
     SELECT
@@ -58,12 +61,53 @@ LEFT JOIN (
         -- argMax rather than max: the newest reading, not the largest one
         -- ever seen. max would make a host that briefly spiked look pinned
         -- there forever.
-        argMaxIf(value, timestamp, name = 'host.cpu.used_pct')    AS cpu_pct,
-        argMaxIf(value, timestamp, name = 'host.memory.used_pct') AS mem_pct,
-        argMaxIf(value, timestamp, name = 'host.disk.used_pct')   AS disk_pct
+        --
+        -- Two names are accepted for each headline number. This agent emits
+        -- host.*.used_pct as a percentage; the OpenTelemetry semantic
+        -- convention name is system.*.utilization as a 0..1 ratio. Anything
+        -- speaking OTLP can send here, so the fleet table reads both and
+        -- scales the ratio. The agent's own name wins where both are
+        -- present, because it is the one this agent is known to compute.
+        argMaxIf(value, timestamp, name = 'host.cpu.used_pct')          AS cpu_own,
+        argMaxIf(value, timestamp, name = 'system.cpu.utilization')     AS cpu_sem,
+        countIf(name = 'host.cpu.used_pct')                             AS n_cpu_own,
+        countIf(name = 'system.cpu.utilization')                        AS n_cpu_sem,
+
+        argMaxIf(value, timestamp, name = 'host.memory.used_pct')       AS mem_own,
+        argMaxIf(value, timestamp, name = 'system.memory.utilization')  AS mem_sem,
+        countIf(name = 'host.memory.used_pct')                          AS n_mem_own,
+        countIf(name = 'system.memory.utilization')                     AS n_mem_sem,
+
+        -- Disk has no single-number metric to read. The agent reports
+        -- system.filesystem.usage in BYTES, split into a used and a free
+        -- sample per mountpoint, which is what the hostmetrics receiver
+        -- does. The percentage the fleet table wants is therefore computed
+        -- here, from the root filesystem: it is the one every host has and
+        -- the one "disk" means without further qualification.
+        argMaxIf(value, timestamp,
+            name = 'system.filesystem.usage'
+            AND attributes['state'] = 'used'
+            AND attributes['mountpoint'] = '/')                         AS fs_used,
+        argMaxIf(value, timestamp,
+            name = 'system.filesystem.usage'
+            AND attributes['state'] = 'free'
+            AND attributes['mountpoint'] = '/')                         AS fs_free,
+        countIf(name = 'system.filesystem.usage'
+            AND attributes['mountpoint'] = '/')                         AS n_fs,
+
+        multiIf(n_cpu_own > 0, cpu_own, n_cpu_sem > 0, cpu_sem * 100, 0) AS cpu_pct,
+        multiIf(n_mem_own > 0, mem_own, n_mem_sem > 0, mem_sem * 100, 0) AS mem_pct,
+        if(n_fs > 0 AND (fs_used + fs_free) > 0,
+           fs_used / (fs_used + fs_free) * 100, 0)                       AS disk_pct,
+
+        toUInt8(n_cpu_own > 0 OR n_cpu_sem > 0)                          AS has_cpu,
+        toUInt8(n_mem_own > 0 OR n_mem_sem > 0)                          AS has_mem,
+        toUInt8(n_fs > 0 AND (fs_used + fs_free) > 0)                    AS has_disk
     FROM metrics
     WHERE timestamp >= now() - INTERVAL {window:UInt32} SECOND
-      AND name IN ('host.cpu.used_pct', 'host.memory.used_pct', 'host.disk.used_pct')
+      AND name IN ('host.cpu.used_pct', 'host.memory.used_pct',
+                   'system.cpu.utilization', 'system.memory.utilization',
+                   'system.filesystem.usage')
     GROUP BY host_id
 ) AS m ON m.host_id = h.host_id
 ORDER BY h.last_seen DESC`
@@ -76,6 +120,9 @@ ORDER BY h.last_seen DESC`
 		CPU        float64           `json:"cpu_pct"`
 		Mem        float64           `json:"mem_pct"`
 		Disk       float64           `json:"disk_pct"`
+		HasCPU     uint8             `json:"has_cpu"`
+		HasMem     uint8             `json:"has_mem"`
+		HasDisk    uint8             `json:"has_disk"`
 	}
 	params := map[string]string{"window": strconv.Itoa(int(window.Seconds()))}
 	if err := c.Query(ctx, q, params, &rows); err != nil {
@@ -89,12 +136,22 @@ ORDER BY h.last_seen DESC`
 			Attributes: r.Attributes,
 		}
 		// A LEFT JOIN with no match yields 0, which is indistinguishable from
-		// a genuine zero reading in the result. The host having reported the
-		// metric at all is the thing being tested, so presence is decided by
-		// the join, not by the value.
-		if r.CPU != 0 || r.Mem != 0 || r.Disk != 0 {
-			cpu, mem, disk := r.CPU, r.Mem, r.Disk
-			h.CPUPct, h.MemPct, h.DiskPct = &cpu, &mem, &disk
+		// a genuine zero reading. Presence therefore comes from a count taken
+		// alongside the value, per metric rather than for all three together:
+		// a host that reports CPU but no filesystem usage — which is every
+		// host whose agent has the infra collector disabled — must show a CPU
+		// number and an empty disk cell, not three empty cells.
+		if r.HasCPU != 0 {
+			v := r.CPU
+			h.CPUPct = &v
+		}
+		if r.HasMem != 0 {
+			v := r.Mem
+			h.MemPct = &v
+		}
+		if r.HasDisk != 0 {
+			v := r.Disk
+			h.DiskPct = &v
 		}
 		out = append(out, h)
 	}

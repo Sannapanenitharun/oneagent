@@ -58,7 +58,10 @@ services:
       AGENTI_API_KEYS: ${AGENTI_API_KEYS:-}
     ports:
       # This one IS meant to be reachable — it is where the agents send.
-      - "4318:4318"
+      # The published port is overridable because 4318 is OTLP's default and
+      # anything else speaking OTLP on this machine will already have claimed
+      # it. Inside the container it stays 4318.
+      - "${AGENTI_PORT:-4318}:4318"
     depends_on:
       clickhouse:
         # Waits for the healthcheck, not just the container. The server would
