@@ -86,8 +86,14 @@ func New(cfg Config) (*Client, error) {
 }
 
 // Ping reports whether the server is reachable and answering.
+//
+// Deliberately not scoped to the configured database. Selecting it would make
+// Ping fail until Migrate has created it — and Migrate runs after the caller
+// has waited for Ping to succeed, so a fresh database could never bootstrap.
+// The question this answers is "is ClickHouse up", which is a question about
+// the server.
 func (c *Client) Ping(ctx context.Context) error {
-	_, err := c.exec(ctx, "SELECT 1", nil)
+	_, err := c.execIn(ctx, "", "SELECT 1", nil, nil, false)
 	return err
 }
 
