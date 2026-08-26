@@ -7,8 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node verify-adapters.mjs && node verify-hosts.mjs",
-    "test:hosts": "node verify-hosts.mjs"
+    "test": "node verify-adapters.mjs && node verify-hosts.mjs && node verify-backend.mjs",
+    "test:hosts": "node verify-hosts.mjs",
+    "test:backend": "node verify-backend.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.451.0",

@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 
 import { useSnapshot, useHostHealth, useAllSnapshots } from "./api";
-import { useBackendFleet, useBackendSnapshot } from "./backend";
+import { useBackendFleet, useBackendSnapshot, chooseBackendFallback } from "./backend";
 import { loadHosts, saveHosts, parseHostSpec, toHostSpec, hostLabel, configuredHosts } from "./hosts";
 import { useTheme } from "./useTheme";
 import {
@@ -1907,6 +1907,19 @@ export default function ObservabilityDashboard() {
     [readingBackend, selectedHost, snapshot]
   );
 
+  // What to offer when the selected agent cannot be reached.
+  //
+  // Matched on the configured name against the host the backend knows, since
+  // an unreachable agent has told us nothing about itself — there is no
+  // instance id to match on, precisely because the poll failed. An unmatched
+  // offer is still worth making: any backend host is more useful than an error
+  // with nothing behind it, but it is labelled differently so the offer never
+  // claims to be the same machine when it has not established that.
+  const backendFallback = useMemo(
+    () => chooseBackendFallback({ readingBackend, error, backendRows, selectedHost }),
+    [readingBackend, error, backendRows, selectedHost]
+  );
+
   const fleetEntries = useMemo(
     () => (usingBackend ? fleetFromBackend(backendRows, hosts, agentIDs) : fleetFromAgents(fleet)),
     [usingBackend, backendRows, hosts, agentIDs, fleet]
@@ -2052,6 +2065,33 @@ export default function ObservabilityDashboard() {
             {error.detail && <span className="text-[var(--ink-3)]"> — {error.detail}</span>}
             {snapshot && (
               <span className="text-[var(--ink-4)]"> Showing the last successful poll.</span>
+            )}
+            {/* The way out of the dead end.
+                An unreachable agent used to leave nothing to do here: the
+                address is a forwarded port, the tunnel is down, and the fix
+                was to go edit the host list. But the backend usually holds
+                this host's telemetry already — it arrives by the host pushing
+                outward, which needs no route from this browser — so the
+                honest response to "cannot reach the agent" is to offer the
+                copy that does not need reaching. */}
+            {backendFallback && (
+              <>
+                <span className="text-[var(--ink-4)]">
+                  {" "}
+                  {backendFallback.matched
+                    ? "This host is also reporting to the backend."
+                    : `${backendRows.length} host${backendRows.length === 1 ? " is" : "s are"} reporting to the backend.`}
+                </span>{" "}
+                <button
+                  onClick={() => setBackendHostID(backendFallback.hostID)}
+                  className="underline underline-offset-2"
+                  style={{ color: "var(--accent)" }}
+                >
+                  {backendFallback.matched
+                    ? `Read ${backendFallback.label} from the backend`
+                    : `Open ${backendFallback.label}`}
+                </button>
+              </>
             )}
           </span>
         </div>

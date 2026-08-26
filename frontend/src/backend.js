@@ -133,6 +133,30 @@ export function backendHostRow(h, nowMs) {
   };
 }
 
+// chooseBackendFallback decides what to offer when the selected agent cannot
+// be reached.
+//
+// Matched on the configured name, because an unreachable agent has told us
+// nothing about itself — there is no instance id to match on, precisely
+// because the poll failed. An unmatched offer is still worth making: any
+// backend host beats an error with nothing behind it. It is labelled
+// differently so the offer never claims to be the same machine when that has
+// not been established.
+//
+// Pure, and separate from the component, so the decision can be tested
+// without a browser. See verify-backend.mjs.
+export function chooseBackendFallback({ readingBackend, error, backendRows, selectedHost }) {
+  if (readingBackend || !error) return null;
+  const rows = backendRows || [];
+  if (rows.length === 0) return null;
+
+  const name = (selectedHost?.name || "").trim().toLowerCase();
+  const match = name ? rows.find((r) => (r.host || "").trim().toLowerCase() === name) : null;
+  const target = match || rows[0];
+  if (!target || !target.instanceID) return null;
+  return { hostID: target.instanceID, label: target.host, matched: !!match };
+}
+
 // useBackendFleet polls the backend's host inventory.
 //
 // `enabled` matters less than it does for the agent fleet poll — this is one
