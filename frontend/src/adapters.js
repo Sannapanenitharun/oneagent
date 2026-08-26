@@ -668,6 +668,24 @@ export function deriveInfra(snap) {
 // IOWait earns its column despite looking like a CPU detail. A host pinned on
 // iowait is not busy, it is BLOCKED — the CPU is idle waiting for a disk that
 // cannot keep up. Read from CPU usage alone that host looks fine.
+// fmtAge renders how long ago something happened, at one significant unit.
+//
+// Coarse on purpose: the question it answers is "is this host still
+// reporting", and "22m" answers it. A precise duration would be more
+// characters saying the same thing and would change on every poll for every
+// row, which makes a table impossible to read at a glance.
+export function fmtAge(sec) {
+  if (!Number.isFinite(sec)) return "never";
+  // Negative means the host's clock is ahead of the backend's. Rendering
+  // "-3s ago" would look like a bug in the dashboard rather than what it is,
+  // which is a machine whose time is slightly off.
+  if (sec < 0) return "now";
+  if (sec < 60) return `${Math.round(sec)}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h`;
+  return `${Math.round(sec / 86400)}d`;
+}
+
 export function hostRow(snap) {
   const base = deriveInfra(snap)[0];
   if (!base) return null;

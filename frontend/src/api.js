@@ -217,6 +217,18 @@ export function useSnapshot(intervalMs = 5000, host = null) {
     // showing one machine's metrics labelled as another's.
     setSnapshot(null);
     setError(null);
+
+    // No host to poll settles immediately rather than sitting in a loading
+    // state forever. The poll below returns early on a null host, so without
+    // this the header read "connecting…" indefinitely — describing a
+    // connection that was never going to be attempted. It is a real
+    // configuration now that hosts can come from the backend instead, and
+    // having no direct agent at all is the normal case rather than a broken
+    // one.
+    if (!host?.url) {
+      setLoading(false);
+      return undefined;
+    }
     setLoading(true);
 
     async function tick() {

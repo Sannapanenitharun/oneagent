@@ -18,7 +18,7 @@ import { useTheme } from "./useTheme";
 import {
   deriveTraces, deriveEdges, layoutTopology, deriveTopologyNodes,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
-  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow,
+  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow, fmtAge,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -1347,6 +1347,18 @@ const HOST_COLUMNS = [
   // and a lookup wants a column it can be sorted and scanned down.
   { id: "instanceId", label: "Host ID", get: (r) => r.instanceID || "", align: "left" },
   { id: "status", label: "Status", get: (r) => (r.active ? 1 : 0), align: "left" },
+  // How long since the host last reported.
+  //
+  // Without this, INACTIVE is a verdict with no evidence: a host that stopped
+  // ten minutes ago and one that stopped last week look identical, and an
+  // empty metrics row reads as a broken dashboard rather than as a quiet
+  // machine. It is the first thing you want when a row is not green, and the
+  // difference between "the agent just restarted" and "nobody has touched
+  // this box in a month".
+  //
+  // Sorted by age rather than by the rendered string, so "2m" and "3h" order
+  // correctly instead of alphabetically.
+  { id: "seen", label: "Last Seen", get: (r) => (Number.isFinite(r.ageSec) ? r.ageSec : Infinity), align: "right" },
   // Sortable rather than tucked under the hostname, because at fleet sizes the
   // useful questions are "which instance type is this" and "is one AZ having a
   // bad day" — both of which mean grouping rows, not reading one.
@@ -1395,6 +1407,8 @@ function fleetFromAgents(results) {
         // absent value would take the numeric path instead.
         instanceID: "", instanceType: "", zone: "", account: "",
         cpu: NaN, mem: NaN, iowait: NaN, disk: NaN, load15: NaN,
+        // Never heard from, as distinct from heard from a long time ago.
+        ageSec: Infinity,
       },
     };
   });
@@ -1504,7 +1518,7 @@ function FleetView({ entries, loading, source, sourceError, onOpen }) {
       )}
 
       <div className="border border-[var(--n3)] rounded overflow-x-auto">
-        <table className="w-full min-w-[74rem] border-collapse">
+        <table className="w-full min-w-[80rem] border-collapse">
           <thead>
             <tr className="bg-[var(--surface)]">
               {HOST_COLUMNS.map((c) => (
@@ -1559,6 +1573,10 @@ function FleetView({ entries, loading, source, sourceError, onOpen }) {
                       {error.message}
                     </span>
                   )}
+                </td>
+                <td className="px-3 py-2.5 text-right font-mono text-[11.5px] tabular-nums whitespace-nowrap"
+                    style={{ color: row.active ? "var(--ink-3)" : "var(--warn)" }}>
+                  {fmtAge(row.ageSec)}
                 </td>
                 <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)]">
                   {row.instanceType || "—"}
@@ -1674,6 +1692,12 @@ function HostPicker({
         onChange={onChange}
         className="text-[11px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded px-2 py-1 text-[var(--ink)] cursor-pointer max-w-[16rem]"
       >
+        {/* A value matching no option makes a browser display the first one,
+            so an empty host list showed the name of a machine nothing had
+            selected — the picker asserting a selection that did not exist.
+            An explicit placeholder keeps the displayed value honest. */}
+        {!hosts.length && !backendHostID && <option value="">no host selected</option>}
+        {hosts.length > 0 && (
         <optgroup label="Direct agents">
           {hosts.map((host) => (
             <option key={host.url} value={AGENT_OPT + host.url}>
@@ -1682,6 +1706,7 @@ function HostPicker({
             </option>
           ))}
         </optgroup>
+        )}
         {backendOnly.length > 0 && (
           <optgroup label="Via backend">
             {backendOnly.map((r) => (
@@ -1924,6 +1949,18 @@ export default function ObservabilityDashboard() {
     () => (usingBackend ? fleetFromBackend(backendRows, hosts, agentIDs) : fleetFromAgents(fleet)),
     [usingBackend, backendRows, hosts, agentIDs, fleet]
   );
+
+  // With no configured agent there is nothing else to show, so a backend host
+  // is selected rather than leaving the dashboard empty next to a fleet table
+  // full of machines. Not a silent source swap — the header says "via
+  // backend" — and it only fires when the alternative is a blank page: an
+  // agent that merely fails is left alone, because switching away from it
+  // would hide the failure the operator needs to see.
+  useEffect(() => {
+    if (hosts.length === 0 && !backendHostID && backendRows.length > 0) {
+      setBackendHostID(backendRows[0].instanceID);
+    }
+  }, [hosts.length, backendHostID, backendRows]);
 
   // The Fleet tab disappears when there is nothing to compare, so a view that
   // is no longer reachable in the nav must not stay on screen.
@@ -2168,8 +2205,12 @@ export default function ObservabilityDashboard() {
           <div className="flex items-center gap-2 text-[10px] text-[var(--ink-5)] font-mono mt-5">
             <Cpu size={11} />
             {connected
-              ? `live from agent-i · ${d.envelopes.toLocaleString()} envelopes · ${snapshot.retain_sec}s window`
-              : "not connected to an agent"}
+              ? readingBackend
+                ? `from the backend · ${snapshot.counts?.series ?? 0} series · ${snapshot.counts?.logs ?? 0} logs · ${snapshot.counts?.spans ?? 0} spans · ${snapshot.retain_sec}s window`
+                : `live from agent-i · ${d.envelopes.toLocaleString()} envelopes · ${snapshot.retain_sec}s window`
+              : hosts.length === 0 && backendRows.length === 0
+                ? "no agents configured and nothing reporting to the backend"
+                : "not connected to an agent"}
           </div>
         </div>
       </div>

@@ -15,7 +15,7 @@ import {
   globalStats, toRate, fmtRps,
   alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
   parseLogBody, flattenFields, ADAPTER_VERSION, CONTRACT, contractMatches,
-  hostRow, deriveTopologyNodes, peerName, peerType,
+  hostRow, deriveTopologyNodes, peerName, peerType, fmtAge,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -457,6 +457,34 @@ const CORR = { ...EMPTY, logs: [
 const cl = deriveLogs(CORR).slice().reverse();
 check("trace id is surfaced", cl[0].traceId === "5b8efff798038103", cl[0].traceId);
 check("absent trace id stays null", cl[1].traceId === null, String(cl[1].traceId));
+
+// How long since a host reported. Without it, INACTIVE is a verdict with no
+// evidence: a host that stopped ten minutes ago and one that stopped last
+// week look identical, and an empty metrics row reads as a broken dashboard
+// rather than as a quiet machine.
+console.log("fmtAge");
+check("seconds", fmtAge(22) === "22s", fmtAge(22));
+check("rounds to the nearest second", fmtAge(0.4) === "0s", fmtAge(0.4));
+check("just under a minute stays seconds", fmtAge(59) === "59s", fmtAge(59));
+check("a minute becomes minutes", fmtAge(60) === "1m", fmtAge(60));
+check("the case from the fleet table", fmtAge(1320) === "22m", fmtAge(1320));
+check("just under an hour stays minutes", fmtAge(3599) === "60m", fmtAge(3599));
+check("an hour becomes hours", fmtAge(3600) === "1h", fmtAge(3600));
+check("two hours exactly", fmtAge(7200) === "2h", fmtAge(7200));
+// 2.5h rounds half up, which is the language's rule and fine here:
+// the unit is coarse on purpose and nothing downstream reads it.
+check("half an hour rounds up", fmtAge(9000) === "3h", fmtAge(9000));
+check("a day becomes days", fmtAge(86400) === "1d", fmtAge(86400));
+check("a week reads in days", fmtAge(7 * 86400) === "7d", fmtAge(7 * 86400));
+// Never heard from is not the same as heard from a long time ago, and the
+// fleet table distinguishes them: a configured agent that has never answered
+// has no age at all.
+check("infinite age is never", fmtAge(Infinity) === "never", fmtAge(Infinity));
+check("NaN is never", fmtAge(NaN) === "never", fmtAge(NaN));
+check("undefined is never", fmtAge(undefined) === "never", fmtAge(undefined));
+// A host whose clock runs ahead of the backend's produces a negative age.
+// "-3s" would read as a dashboard bug rather than as mild clock skew.
+check("negative age reads as now", fmtAge(-3) === "now", fmtAge(-3));
 
 console.log(failed === 0 ? "\nOK — all adapter checks passed" : `\n${failed} check(s) failed`);
 process.exit(failed ? 1 : 0);
