@@ -33,20 +33,30 @@ async function proxyDetail(res) {
 
 // Why this distinguishes failure kinds at all:
 //
-// The agent's /api/snapshot handler always writes 200 with a JSON body. It has
-// no path that produces an error status — a failed encode is logged on the
-// host, not surfaced as a code. So a non-OK status on this endpoint did NOT
-// come from the agent; it came from the dev-server proxy in front of it, which
-// turns a refused upstream connection into a 500.
+// The agent's /api/snapshot handler always writes 200 with a JSON body, and
+// has no path that produces an error status — a failed encode is logged on the
+// host, not surfaced as a code. So a non-OK status on this endpoint did not
+// come from the agent.
 //
-// Reporting that as "agent returned HTTP 500" points you at a healthy agent
-// and away from the actual cause, which is usually a dead SSH tunnel or a
-// stopped container. Naming the layer that failed is the whole point.
+// It does not follow that it came from the proxy. This originally assumed it
+// did, and told anyone who hit a 404 to go and check their SSH tunnel — while
+// the actual cause was another process sitting on the port they had typed,
+// answering happily and knowing nothing about /api/snapshot. A tunnel that is
+// fine is an expensive thing to be sent to debug.
+//
+// So the layer is identified rather than assumed: the proxy reports its own
+// failures as a JSON body carrying `error`, and anything else is an answer
+// from whatever is actually listening. See describeSnapshotFailure.
 export class SnapshotError extends Error {
   constructor(kind, message, detail) {
     super(message);
     this.name = "SnapshotError";
-    this.kind = kind; // "offline" | "unreachable" | "malformed"
+    // "offline"      — this page cannot reach its own origin
+    // "unreachable"  — nothing usable answered at the target
+    // "not-an-agent" — something answered, but it is not an agent
+    // "unauthorized" — an agent answered and refused
+    // "malformed"    — a 200 that was not the payload
+    this.kind = kind;
     this.detail = detail;
   }
 }
@@ -61,6 +71,77 @@ async function originAlive(signal) {
   } catch {
     return false;
   }
+}
+
+// describeSnapshotFailure works out which layer produced a non-OK response.
+//
+// The distinction is the whole value of the message. The dev-server proxy
+// reports its own failures as a JSON body carrying `error` — a refused
+// connection, a timeout, a dead tunnel. Anything else came back from whatever
+// is listening at that address, which means something IS there and answering,
+// and the interesting question changes from "why can I not connect" to "what
+// am I connected to".
+//
+// A 404 is the common shape of that: a port on this machine that belongs to a
+// different process entirely. The agent serves /api/snapshot and cannot 404
+// it, so a 404 is positive evidence of the wrong address rather than of a
+// broken one — and telling someone to check their SSH tunnel when the real
+// problem is that they typed the port of another service sends them to debug
+// a tunnel that is fine.
+//
+// Pure, so the classification can be tested without a server. See
+// verify-api.mjs.
+export function describeSnapshotFailure(status, proxyError, target) {
+  if (proxyError) {
+    return {
+      kind: "unreachable",
+      message: "agent not reachable",
+      detail: `The dev server proxy could not reach ${target}: ${proxyError}`,
+    };
+  }
+  if (status === 404) {
+    return {
+      kind: "not-an-agent",
+      message: "not an agent",
+      detail:
+        `Something is listening at ${target} and it answered HTTP 404 for /api/snapshot. ` +
+        `The agent serves that path and never 404s it, so this is a different process on ` +
+        `that port — check the address rather than the tunnel.`,
+    };
+  }
+  if (status === 401 || status === 403) {
+    return {
+      kind: "unauthorized",
+      message: "agent refused the request",
+      detail:
+        `${target} answered HTTP ${status}. The agent's dashboard has an auth token ` +
+        `configured and this page is not sending it.`,
+    };
+  }
+  return {
+    kind: "unreachable",
+    message: "agent not reachable",
+    detail:
+      `${target} answered HTTP ${status}, which the agent does not return for this path. ` +
+      `Something is listening there, so this is more likely the wrong address than a dead tunnel.`,
+  };
+}
+
+// isAgentHealthz reports whether a /healthz response came from an agent.
+//
+// Status alone is not enough, and neither is "200 and not HTML". Any service
+// that happens to occupy the port can answer 200 text/plain — an ingest
+// endpoint, a metrics exporter, another project's daemon — and the health dot
+// exists precisely to stop you switching to a host that will not load. A dot
+// that goes green for the wrong process is worse than no dot: it moves the
+// confusion from the picker to the dashboard.
+//
+// The agent's /healthz returns the literal string "ok" and is documented to,
+// so that is what is checked.
+export function isAgentHealthz(ok, contentType, body) {
+  if (!ok) return false;
+  if ((contentType || "").includes("text/html")) return false;
+  return String(body || "").trim().toLowerCase() === "ok";
 }
 
 export async function fetchSnapshot(signal, host) {
@@ -97,15 +178,8 @@ export async function fetchSnapshot(signal, host) {
 
   if (!res.ok) {
     const detail = await proxyDetail(res);
-    throw new SnapshotError(
-      "unreachable",
-      "agent not reachable",
-      detail
-        ? `The dev server proxy could not reach ${TARGET}: ${detail}`
-        : `The dev server proxy could not reach ${TARGET} and returned HTTP ${res.status}. ` +
-            `The agent never returns an error status on this endpoint, so this is a connection ` +
-            `failure in front of it — a stopped agent, or a closed SSH tunnel if ${TARGET} is forwarded.`
-    );
+    const f = describeSnapshotFailure(res.status, detail, TARGET);
+    throw new SnapshotError(f.kind, f.message, f.detail);
   }
 
   // A proxy misconfiguration can return 200 with the SPA's own index.html,
@@ -267,14 +341,15 @@ export function useHostHealth(hosts, intervalMs = 20000) {
         hosts.map(async (h) => {
           try {
             const res = await agentFetch(h, "/healthz", { signal: controller.signal });
-            // res.ok alone is not enough. An unproxied path falls through to
-            // the dev server's SPA handler, which answers 200 with index.html
-            // — so a host with no route would read as healthy. The agent's
-            // own /healthz is text/plain "ok", never HTML. Same hazard the
-            // snapshot fetch already guards against below.
-            if (!res.ok) return [h.url, "down"];
+            // The body is read, not just the status. An unproxied path falls
+            // through to the dev server's SPA handler and answers 200 with
+            // index.html; any other process on that port can answer 200
+            // text/plain. Both would read as healthy on status alone, and a
+            // green dot on the wrong process is worse than no dot — it moves
+            // the confusion from the picker into the dashboard.
+            const body = res.ok ? await res.text() : "";
             const type = res.headers.get("content-type") || "";
-            return [h.url, type.includes("text/html") ? "down" : "up"];
+            return [h.url, isAgentHealthz(res.ok, type, body) ? "up" : "down"];
           } catch {
             // Includes the abort on unmount, which the cancelled guard below
             // discards rather than rendering as every host going down.
