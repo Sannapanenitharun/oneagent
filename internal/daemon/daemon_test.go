@@ -366,3 +366,23 @@ func TestRefreshHostAttributes_StopsOnContextCancel(t *testing.T) {
 		t.Fatal("refreshHostAttributes ignored context cancellation")
 	}
 }
+
+// The startup banner reports what the agent calls itself, so it has to read
+// the resolved name rather than the configured one. Those differ on every host
+// that names itself from its hostname or its EC2 Name tag — the default, and
+// so the common case: a real host logged "agent_id=" while reporting as
+// "teleport", on the one line written specifically to say what it is.
+//
+// resolveAgentID's own fallback order is covered in agentid_test.go; what this
+// pins is that the resolved answer is reachable from outside the package at
+// all, which is what the banner needs.
+func TestAgentID_ExposesTheResolvedName(t *testing.T) {
+	d := &Daemon{agentID: resolveAgentID("", map[string]string{"host.name": "teleport"})}
+
+	if d.AgentID() != "teleport" {
+		t.Fatalf("AgentID() = %q, want the resolved name", d.AgentID())
+	}
+	if d.AgentID() == "" {
+		t.Fatal("an empty configured id must not surface as an empty reported id")
+	}
+}

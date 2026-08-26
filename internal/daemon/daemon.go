@@ -279,6 +279,16 @@ func New(cfg *config.Config) (*Daemon, error) {
 // which on a working system it does not.
 const fallbackAgentID = "unidentified-host"
 
+// AgentID is the name this agent actually reports under, which is not
+// necessarily what the config file says: an empty configured value is filled in
+// from the host at startup.
+//
+// Exposed because the startup banner used to print cfg.AgentID, so a host that
+// named itself from its EC2 Name tag logged "agent_id=" and left the reader to
+// find the real answer three lines earlier in the journal — on the one line
+// written specifically to say what this process is.
+func (d *Daemon) AgentID() string { return d.agentID }
+
 // resolveAgentID decides what this agent calls itself.
 //
 // A configured value always wins, because it is an operator saying so

@@ -63,7 +63,10 @@ func main() {
 		}
 	}()
 
-	log.Printf("agent-i starting (version=%s, agent_id=%s, interval=%s)", version.Version, cfg.AgentID, cfg.Interval)
+	// d.AgentID(), not cfg.AgentID: the configured value is empty on any host
+	// that names itself from its hostname or its EC2 Name tag, which is the
+	// default and therefore the common case.
+	log.Printf("agent-i starting (version=%s, agent_id=%s, interval=%s)", version.Version, d.AgentID(), cfg.Interval)
 	if err := d.Run(ctx); err != nil {
 		log.Fatalf("daemon error: %v", err)
 	}
