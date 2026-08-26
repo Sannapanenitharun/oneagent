@@ -26,6 +26,7 @@ type Host struct {
 	CPUPct  *float64 `json:"cpu_pct"`
 	MemPct  *float64 `json:"mem_pct"`
 	DiskPct *float64 `json:"disk_pct"`
+	Load15  *float64 `json:"load15"`
 }
 
 // Hosts returns the fleet: every host that has reported, newest activity
@@ -46,15 +47,51 @@ func (c *Client) Hosts(ctx context.Context, window time.Duration) ([]Host, error
 SELECT
     h.host_id                            AS host_id,
     h.agent_id                           AS agent_id,
-    formatDateTime(h.last_seen, '%Y-%m-%dT%H:%i:%SZ') AS last_seen,
+    formatDateTime(h.seen_at, '%Y-%m-%dT%H:%i:%SZ') AS last_seen,
     h.attributes                         AS attributes,
     m.cpu_pct                            AS cpu_pct,
     m.mem_pct                            AS mem_pct,
     m.disk_pct                           AS disk_pct,
+    m.load15                             AS load15,
     m.has_cpu                            AS has_cpu,
     m.has_mem                            AS has_mem,
-    m.has_disk                           AS has_disk
-FROM (SELECT host_id, agent_id, last_seen, attributes FROM hosts FINAL) AS h
+    m.has_disk                           AS has_disk,
+    m.has_load                           AS has_load
+FROM (
+    SELECT
+        host_id,
+        -- Ordered the same way as attributes below, so the name and the
+        -- description come from one row rather than from two. Taking the name
+        -- from the newest row instead means a sparse export — which has no
+        -- host.name to offer and falls back to the host id — renames the
+        -- machine in the table while its description stays correct, and the
+        -- row then disagrees with itself.
+        argMax(agent_id, (length(hosts.attributes), hosts.last_seen)) AS agent_id,
+        -- Aliased away from the column name it aggregates: an alias that
+        -- shadows its own source column resolves to the aggregate when it is
+        -- referenced again below, which ClickHouse rejects outright.
+        max(hosts.last_seen)                            AS seen_at,
+        -- The most complete description, not simply the newest one.
+        --
+        -- ReplacingMergeTree keeps the row with the greatest last_seen, which
+        -- makes any export carrying a thinner resource erase what a richer one
+        -- established: a host that has reported its OS, account and zone for a
+        -- week loses all of it the moment one export arrives with only a host
+        -- id. This agent sends the same resource on every signal, so it does
+        -- not do that to itself — but an application on the host sending its
+        -- own traces with host.id and nothing else does, and the fleet table
+        -- would go blank with no error anywhere.
+        --
+        -- Ordering by key count first, last_seen second, keeps the fullest
+        -- description and breaks ties toward the newer one. The cost is that
+        -- an attribute a host genuinely stops reporting persists rather than
+        -- disappearing. That is the better failure: inventory is a description
+        -- of a machine, and a stale field is more useful than no field.
+        -- Liveness is unaffected — last_seen is its own max above.
+        argMax(attributes, (length(hosts.attributes), hosts.last_seen)) AS attributes
+    FROM hosts
+    GROUP BY host_id
+) AS h
 LEFT JOIN (
     SELECT
         host_id,
@@ -100,17 +137,25 @@ LEFT JOIN (
         if(n_fs > 0 AND (fs_used + fs_free) > 0,
            fs_used / (fs_used + fs_free) * 100, 0)                       AS disk_pct,
 
+        -- Load average is a gauge and needs no derivation, unlike IOWait,
+        -- which is a share of a cumulative CPU-time counter and would need a
+        -- rate over two points. The fleet table leaves that one to the agent
+        -- view rather than computing a rate in SQL.
+        argMaxIf(value, timestamp, name = 'system.cpu.load_average.15m') AS load15,
+        countIf(name = 'system.cpu.load_average.15m')                    AS n_load,
+
         toUInt8(n_cpu_own > 0 OR n_cpu_sem > 0)                          AS has_cpu,
         toUInt8(n_mem_own > 0 OR n_mem_sem > 0)                          AS has_mem,
-        toUInt8(n_fs > 0 AND (fs_used + fs_free) > 0)                    AS has_disk
+        toUInt8(n_fs > 0 AND (fs_used + fs_free) > 0)                    AS has_disk,
+        toUInt8(n_load > 0)                                              AS has_load
     FROM metrics
     WHERE timestamp >= now() - INTERVAL {window:UInt32} SECOND
       AND name IN ('host.cpu.used_pct', 'host.memory.used_pct',
                    'system.cpu.utilization', 'system.memory.utilization',
-                   'system.filesystem.usage')
+                   'system.filesystem.usage', 'system.cpu.load_average.15m')
     GROUP BY host_id
 ) AS m ON m.host_id = h.host_id
-ORDER BY h.last_seen DESC`
+ORDER BY h.seen_at DESC`
 
 	var rows []struct {
 		HostID     string            `json:"host_id"`
@@ -123,6 +168,8 @@ ORDER BY h.last_seen DESC`
 		HasCPU     uint8             `json:"has_cpu"`
 		HasMem     uint8             `json:"has_mem"`
 		HasDisk    uint8             `json:"has_disk"`
+		Load15     float64           `json:"load15"`
+		HasLoad    uint8             `json:"has_load"`
 	}
 	params := map[string]string{"window": strconv.Itoa(int(window.Seconds()))}
 	if err := c.Query(ctx, q, params, &rows); err != nil {
@@ -152,6 +199,10 @@ ORDER BY h.last_seen DESC`
 		if r.HasDisk != 0 {
 			v := r.Disk
 			h.DiskPct = &v
+		}
+		if r.HasLoad != 0 {
+			v := r.Load15
+			h.Load15 = &v
 		}
 		out = append(out, h)
 	}

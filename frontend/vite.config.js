@@ -20,6 +20,21 @@ import https from "node:https";
 const AGENT = process.env.AGENT_I_URL || "http://127.0.0.1:8088";
 const OTLP = process.env.AGENT_I_OTLP_URL || "http://127.0.0.1:4319";
 
+// The backend, which is a different thing from an agent and answers a
+// different question. An agent knows one machine and holds a short window of
+// it in memory; the backend holds every machine that has ever reported, for
+// as long as its retention says. The fleet table reads from here, so a host
+// appears without the browser having to reach that host at all — which is the
+// entire reason the backend exists and the reason there are no longer tunnels
+// to keep alive.
+//
+// Its own port, and its own default, because it is a different process from
+// the agent whose OTLP receiver OTLP above points at. Defaulting it to the
+// same address made the backend unreachable the moment anything else on the
+// machine had already taken that port — and on a developer laptop something
+// usually has.
+const BACKEND = process.env.AGENT_I_BACKEND_URL || "http://127.0.0.1:4400";
+
 // AGENT_I_HOSTS seeds the host list on first run:
 //
 //   AGENT_I_HOSTS="ec2-prod-1=http://127.0.0.1:8089,ec2-prod-2=http://127.0.0.1:8090"
@@ -165,6 +180,7 @@ export default defineConfig({
   // forwarded port and the question is whether the tunnel is up.
   define: {
     __AGENT_TARGET__: JSON.stringify(AGENT),
+    __BACKEND_TARGET__: JSON.stringify(BACKEND),
     __AGENT_HOSTS__: JSON.stringify(SEED),
   },
   server: {
@@ -175,6 +191,15 @@ export default defineConfig({
       // UI reads goes through /h instead.
       "/api": { target: AGENT, changeOrigin: true },
       "/healthz": { target: AGENT, changeOrigin: true },
+
+      // The backend's query API, on its own prefix so it cannot collide with
+      // the agent's /api above. Stripped before forwarding, so the backend
+      // sees the /api/hosts path it actually serves.
+      "/b": {
+        target: BACKEND,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/b/, ""),
+      },
 
       // OTLP ingest. Lets an instrumented app send to
       // http://localhost:5173/v1/traces instead of needing the receiver's own

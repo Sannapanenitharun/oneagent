@@ -709,7 +709,11 @@ export function hostRow(snap) {
     // kernel family and is the floor for a host whose /etc/os-release could
     // not be read. Empty rather than guessed when the agent predates the
     // detection, so an old agent reads as unknown instead of as Linux.
-    os: [host["os.name"], host["os.version"]].filter(Boolean).join(" ") || host["os.type"] || "",
+    os:
+      [host["os.name"], host["os.version"]].filter(Boolean).join(" ") ||
+      host["os.description"] ||
+      host["os.type"] ||
+      "",
     osDescription: host["os.description"] || "",
     arch: host["host.arch"] || "",
     active: ageSec <= 600,

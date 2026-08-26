@@ -115,16 +115,34 @@ SETTINGS index_granularity = 8192
 // background. Queries still use FINAL — merges are asynchronous, so without it
 // a host that reported twice can appear twice — but the table is one row per
 // host, which is the one size where FINAL costs nothing worth measuring.
+// The inventory table.
+//
+// ORDER BY includes attr_count, which looks redundant — one row per machine is
+// the point of the table — and is load-bearing. ReplacingMergeTree collapses
+// rows sharing an ordering key down to the one with the greatest version, and
+// deletes the rest during a background merge. With ORDER BY host_id alone,
+// a single export carrying a thinner resource permanently destroys the fuller
+// description: an application on the host sending traces tagged with host.id
+// and nothing else erases the machine's OS, account and zone, and no query can
+// recover them afterwards because the row is gone from storage.
+//
+// Including the attribute count in the key means descriptions of different
+// completeness are different rows and never collapse into one another. Rows of
+// equal completeness still deduplicate, which is the case that actually
+// repeats — every export from a steady agent. The query side then picks the
+// fullest, breaking ties toward the newest. Bounded in size by how many
+// distinct attribute counts a host has ever reported, which is a handful.
 const hostsDDL = `
 CREATE TABLE IF NOT EXISTS hosts (
     host_id     String,
     agent_id    String,
     last_seen   DateTime64(3),
     first_seen  DateTime64(3),
-    attributes  Map(LowCardinality(String), String)
+    attributes  Map(LowCardinality(String), String),
+    attr_count  UInt16 MATERIALIZED toUInt16(length(attributes))
 )
 ENGINE = ReplacingMergeTree(last_seen)
-ORDER BY host_id
+ORDER BY (host_id, attr_count)
 `
 
 // migrations run in order. Splitting them keeps a failure pointing at one

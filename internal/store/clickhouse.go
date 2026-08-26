@@ -114,7 +114,42 @@ func (c *Client) Migrate(ctx context.Context) error {
 			return fmt.Errorf("store: migration %d: %w", i+1, err)
 		}
 	}
-	return nil
+	return c.checkHostsKey(ctx)
+}
+
+// checkHostsKey refuses to run against a hosts table created before the
+// ordering key included attr_count.
+//
+// CREATE TABLE IF NOT EXISTS silently accepts an existing table with a
+// different ordering key, so a deployment upgraded in place would keep the old
+// one and keep losing host descriptions on every merge — working, wrong, and
+// quiet, which is the combination worth failing over.
+//
+// This reports rather than repairs. Rewriting a table is destructive and not a
+// thing a process should decide to do to someone else's database on startup,
+// even when — as here — the contents are re-derived from the next export and
+// the practical cost of dropping it is a few seconds of an empty fleet table.
+func (c *Client) checkHostsKey(ctx context.Context) error {
+	var rows []struct {
+		Key string `json:"sorting_key"`
+	}
+	const q = `SELECT sorting_key FROM system.tables
+	           WHERE database = {db:String} AND name = 'hosts'`
+	if err := c.Query(ctx, q, map[string]string{"db": c.database}, &rows); err != nil {
+		// Not fatal: a restricted user may not be able to read system.tables,
+		// and refusing to start over a diagnostic would be worse than the
+		// problem it diagnoses.
+		return nil
+	}
+	if len(rows) == 0 || strings.Contains(rows[0].Key, "attr_count") {
+		return nil
+	}
+	return fmt.Errorf(
+		"store: the hosts table has ordering key (%s) and predates the attr_count key, "+
+			"so host descriptions are erased whenever a sparse export merges over a full one. "+
+			"Its contents are rebuilt from the next export, so it is safe to drop: "+
+			"DROP TABLE %s.hosts",
+		rows[0].Key, quoteIdent(c.database))
 }
 
 // Insert writes rows to a table using JSONEachRow.

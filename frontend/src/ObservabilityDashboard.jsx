@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 
 import { useSnapshot, useHostHealth, useAllSnapshots } from "./api";
+import { useBackendFleet } from "./backend";
 import { loadHosts, saveHosts, parseHostSpec, toHostSpec, hostLabel, configuredHosts } from "./hosts";
 import { useTheme } from "./useTheme";
 import {
@@ -1261,11 +1262,16 @@ function Fact({ label, children }) {
 // A function rather than a constant because the host list is now editable
 // while the UI is running: adding a second server has to make the Fleet tab
 // appear without a reload.
-const navGroups = (hostCount) => [
+// showFleet is separate from hostCount because the two no longer mean the same
+// thing. hostCount is how many agents this browser has an address for; the
+// backend knows about hosts it does not. A fleet of ten reporting through the
+// backend with none configured locally is the normal case now, and gating the
+// tab on hostCount hid the tab from exactly that setup.
+const navGroups = (hostCount, fleetCount = 0) => [
   { label: "Monitor", items: [
-    // Only meaningful with more than one agent configured, and hidden
-    // otherwise — a "Fleet" of one is a worse Overview.
-    ...(hostCount > 1 ? [{ id: "fleet", label: "Fleet", icon: Server }] : []),
+    // Still hidden for a single host with no backend — a "Fleet" of one is a
+    // worse Overview.
+    ...(hostCount > 1 || fleetCount > 1 ? [{ id: "fleet", label: "Fleet", icon: Server }] : []),
     { id: "overview", label: "Overview", icon: LayoutDashboard },
     { id: "topology", label: "Service Topology", icon: Network },
   ]},
@@ -1282,8 +1288,8 @@ const navGroups = (hostCount) => [
   ]},
 ];
 
-function Sidebar({ view, setView, hostCount }) {
-  const groups = navGroups(hostCount);
+function Sidebar({ view, setView, hostCount, fleetCount }) {
+  const groups = navGroups(hostCount, fleetCount);
   return (
     <div className="w-[200px] flex-shrink-0 border-r border-[var(--n2)] flex flex-col py-4 overflow-y-auto">
       {groups.map((group) => (
@@ -1363,37 +1369,67 @@ const HOST_COLUMNS = [
   { id: "load15", label: "Load Avg", get: (r) => r.load15, align: "right" },
 ];
 
-function FleetView({ results, loading, onOpen }) {
+// The two mappings onto the fleet row shape.
+//
+// fleetFromAgents is the original path: poll every configured agent and derive
+// a row from its snapshot. It can only ever show hosts this browser can reach.
+//
+// fleetFromBackend reads the backend's inventory, which lists every host that
+// has reported regardless of whether there is a route to it from here. Where a
+// backend host matches a configured agent, the two are paired so the row stays
+// clickable — matching on instance id first, because that is the identifier
+// that cannot be renamed, and on the configured name second.
+function fleetFromAgents(results) {
+  return results.map(({ host, snapshot: snap, error }) => {
+    const row = snap ? hostRow(snap) : null;
+    return {
+      key: host.url,
+      host,
+      error,
+      // A host that never answered still gets a row: its configured name is
+      // all we know about it, and omitting it would hide the outage.
+      row: row || {
+        host: host.name || host.url.replace(/^https?:\/\//, ""),
+        active: false, os: "", osDescription: "", arch: "", version: "",
+        // Strings, not undefined: these columns sort with localeCompare and an
+        // absent value would take the numeric path instead.
+        instanceID: "", instanceType: "", zone: "", account: "",
+        cpu: NaN, mem: NaN, iowait: NaN, disk: NaN, load15: NaN,
+      },
+    };
+  });
+}
+
+function fleetFromBackend(rows, hosts, agentIDs) {
+  return rows.map((row) => {
+    const match =
+      hosts.find((h) => agentIDs[h.url] && agentIDs[h.url] === row.instanceID) ||
+      hosts.find((h) => h.name && h.name === row.host) ||
+      null;
+    // Keyed on the host id, which the backend guarantees is unique per row and
+    // which survives a rename — unlike the display name, where two machines
+    // called "web" would collapse into one row.
+    return { key: row.instanceID || row.host, host: match, error: null, row };
+  });
+}
+
+// FleetView renders an already-derived set of rows.
+//
+// It takes rows rather than snapshots because there are now two sources for
+// them — the backend's host inventory, and a direct poll of each agent — and
+// the sorting, filtering and formatting here is identical for both. Deriving
+// inside this component would have meant it could only ever render one of
+// them. See fleetFromBackend and fleetFromAgents below for the two mappings.
+//
+// Each entry is { key, host, row, error }. `host` is the configured agent this
+// row can be opened against, and is null for a host the backend knows about
+// but which this browser has no route to — which is most of them, and the
+// reason the backend exists.
+function FleetView({ entries, loading, source, sourceError, onOpen }) {
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState({ col: "host", dir: "asc" });
 
-  // One derivation per host per poll, not per render.
-  //
-  // Driven off the results rather than the host list: each result carries the
-  // host it came from, so an edit that lands mid-poll cannot pair one server's
-  // metrics with another server's name.
-  const rows = useMemo(
-    () =>
-      results.map(({ host, snapshot: snap, error }) => {
-        const row = snap ? hostRow(snap) : null;
-        return {
-          host,
-          url: host.url,
-          error,
-          // A host that never answered still gets a row: its configured name
-          // is all we know about it, and omitting it would hide the outage.
-          row: row || {
-            host: host.name || host.url.replace(/^https?:\/\//, ""),
-            active: false, os: "", osDescription: "", arch: "", version: "",
-            // Strings, not undefined: these columns sort with localeCompare and
-            // an absent value would take the numeric path instead.
-            instanceID: "", instanceType: "", zone: "", account: "",
-            cpu: NaN, mem: NaN, iowait: NaN, disk: NaN, load15: NaN,
-          },
-        };
-      }),
-    [results]
-  );
+  const rows = entries;
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -1422,7 +1458,11 @@ function FleetView({ results, loading, onOpen }) {
   }, [rows, query, sort]);
 
   if (loading) {
-    return <p className="text-[12px] font-mono text-[var(--ink-3)]">polling {results.length} hosts…</p>;
+    return (
+      <p className="text-[12px] font-mono text-[var(--ink-3)]">
+        {source === "backend" ? "loading the fleet from the backend…" : `polling ${rows.length} hosts…`}
+      </p>
+    );
   }
 
   const toggle = (id) =>
@@ -1443,9 +1483,25 @@ function FleetView({ results, loading, onOpen }) {
           />
         </div>
         <span className="text-[11px] font-mono text-[var(--ink-4)]">
-          Showing {visible.length} of {rows.length} hosts · {active} active
+          Showing {visible.length} of {rows.length} hosts · {active} active ·{" "}
+          {/* Which source produced this table is not a detail. It decides what
+              an empty row means: from the backend, a host that stopped
+              reporting; from the agents, possibly just a tunnel this laptop
+              cannot open. */}
+          <span style={{ color: source === "backend" ? "var(--accent)" : "var(--ink-5)" }}>
+            {source === "backend" ? "via backend" : "polling agents"}
+          </span>
         </span>
       </div>
+
+      {sourceError && (
+        <div className="border border-[var(--warn)] rounded px-3 py-2">
+          <p className="text-[11.5px] font-mono text-[var(--warn)]">{sourceError.message}</p>
+          {sourceError.detail && (
+            <p className="text-[10.5px] font-mono text-[var(--ink-4)] mt-0.5">{sourceError.detail}</p>
+          )}
+        </div>
+      )}
 
       <div className="border border-[var(--n3)] rounded overflow-x-auto">
         <table className="w-full min-w-[74rem] border-collapse">
@@ -1468,11 +1524,19 @@ function FleetView({ results, loading, onOpen }) {
             </tr>
           </thead>
           <tbody>
-            {visible.map(({ host, row, error, url }) => (
+            {visible.map(({ key, host, row, error }) => (
               <tr
-                key={url}
-                onClick={() => onOpen(host)}
-                className="cursor-pointer hover:bg-[var(--surface)] border-b border-[var(--n2)] last:border-b-0"
+                key={key}
+                onClick={host ? () => onOpen(host) : undefined}
+                // Only clickable when there is an agent to open. A host the
+                // backend knows about but this browser cannot reach has no
+                // detail view to go to, and a row that looks clickable and
+                // silently does nothing is worse than one that does not.
+                title={host ? "" : "No direct route to this host — add it under Manage hosts to open its detail."}
+                className={
+                  "border-b border-[var(--n2)] last:border-b-0 " +
+                  (host ? "cursor-pointer hover:bg-[var(--surface)]" : "cursor-default")
+                }
               >
                 <td className="px-3 py-2.5">
                   <span className="font-mono text-[12.5px] text-[var(--accent)]">{row.host}</span>
@@ -1533,10 +1597,24 @@ function FleetView({ results, loading, onOpen }) {
       </div>
 
       <p className="text-[10.5px] font-mono text-[var(--ink-5)]">
-        Select a host to open its infrastructure detail. Status is ACTIVE when a metric
-        arrived in the last 10 minutes. Instance, Zone and Account come from the host's
-        own cloud metadata and are empty off EC2; OS is read from the host itself, and
-        is empty on agents older than the release that started reporting it.
+        {source === "backend" ? (
+          <>
+            Read from the backend, so a host appears because it reported — from any
+            account or region, with no route from this browser to the machine itself.
+            Rows with a direct agent configured open their infrastructure detail;
+            the rest have nothing to open, because that detail still comes from the
+            agent. IOWait is not computed here.
+          </>
+        ) : (
+          <>
+            Polled from each configured agent directly, which is why every host needs a
+            reachable address. Start the backend and these come from one place instead.
+          </>
+        )}{" "}
+        Status is ACTIVE when a metric arrived in the last 10 minutes. Instance, Zone and
+        Account come from the host's own cloud metadata and are empty off EC2; OS is read
+        from the host itself, and is empty on agents older than the release that started
+        reporting it.
       </p>
     </div>
   );
@@ -1740,14 +1818,49 @@ export default function ObservabilityDashboard() {
 
   const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000, selectedHost);
   const hostHealth = useHostHealth(hosts);
-  // Only polls while the fleet view is on screen — see useAllSnapshots.
-  const { results: fleet, loading: fleetLoading } = useAllSnapshots(hosts, 10000, view === "fleet");
 
-  // The Fleet tab disappears when the list drops back to one host, so a view
-  // that is no longer reachable in the nav must not stay on screen.
+  // The backend poll runs whether or not the fleet view is open, because its
+  // result decides whether the Fleet tab exists at all — a tab that only
+  // appears once you are already on the view it leads to is no tab. It is one
+  // small request either way, unlike the agent poll below, which transfers
+  // every host's whole retention window and so is gated on the view.
+  const {
+    rows: backendRows,
+    error: backendError,
+    loading: backendLoading,
+  } = useBackendFleet(view === "fleet" ? 10000 : 60000, true);
+
+  // Only polls while the fleet view is on screen, and only when the backend is
+  // not already answering — see useAllSnapshots for why that gate matters.
+  const usingBackend = backendRows.length > 0;
+  const { results: fleet, loading: fleetLoading } = useAllSnapshots(
+    hosts,
+    10000,
+    view === "fleet" && !usingBackend
+  );
+
+  // agentIDs maps a configured agent's URL to the host id it reports, so a
+  // backend row can be paired with an agent this browser can actually reach.
+  // Only the selected host's id is known — that is the only snapshot being
+  // polled — which is enough: pairing exists to keep a row clickable, and the
+  // fallback to matching on name covers the rest.
+  const agentIDs = useMemo(
+    () => (selectedHost && snapshot?.host?.["host.id"]
+      ? { [selectedHost.url]: snapshot.host["host.id"] }
+      : {}),
+    [selectedHost, snapshot]
+  );
+
+  const fleetEntries = useMemo(
+    () => (usingBackend ? fleetFromBackend(backendRows, hosts, agentIDs) : fleetFromAgents(fleet)),
+    [usingBackend, backendRows, hosts, agentIDs, fleet]
+  );
+
+  // The Fleet tab disappears when there is nothing to compare, so a view that
+  // is no longer reachable in the nav must not stay on screen.
   useEffect(() => {
-    if (view === "fleet" && hosts.length <= 1) setView("overview");
-  }, [view, hosts.length]);
+    if (view === "fleet" && hosts.length <= 1 && backendRows.length <= 1) setView("overview");
+  }, [view, hosts.length, backendRows.length]);
   // Charts need no re-render on theme change: their colours are var()
   // references that CSS re-resolves at paint time.
   const { theme, setTheme } = useTheme();
@@ -1772,7 +1885,9 @@ export default function ObservabilityDashboard() {
     };
   }, [snapshot]);
 
-  const activeLabel = navGroups(hosts.length).flatMap((g) => g.items).find((n) => n.id === view)?.label;
+  const activeLabel = navGroups(hosts.length, backendRows.length)
+    .flatMap((g) => g.items)
+    .find((n) => n.id === view)?.label;
   const connected = !!snapshot && !error;
 
   return (
@@ -1879,7 +1994,7 @@ export default function ObservabilityDashboard() {
             onClose={() => setManaging(false)}
           />
         )}
-        <Sidebar view={view} setView={setView} hostCount={hosts.length} />
+        <Sidebar view={view} setView={setView} hostCount={hosts.length} fleetCount={backendRows.length} />
 
         <div className="flex-1 min-w-0 p-5 overflow-y-auto">
           <div className="flex items-center gap-2 text-[11px] text-[var(--ink-5)] font-mono mb-3">
@@ -1897,8 +2012,10 @@ export default function ObservabilityDashboard() {
           )}
           {view === "fleet" && (
             <FleetView
-              results={fleet}
-              loading={fleetLoading}
+              entries={fleetEntries}
+              loading={usingBackend ? backendLoading : fleetLoading}
+              source={usingBackend ? "backend" : "agents"}
+              sourceError={usingBackend ? backendError : null}
               onOpen={(host) => {
                 setSelectedURL(host.url);
                 // SigNoz opens the host's detail, not a generic overview.

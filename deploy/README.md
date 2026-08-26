@@ -122,10 +122,32 @@ Everything has a working default except the API keys.
 | `AGENTI_CLICKHOUSE_PASSWORD` | — | environment only, never a flag: flags are visible in `ps` |
 | `AGENTI_API_KEYS` | — | `label:key,label:key`. **Unset disables authentication** |
 | `AGENTI_BATCH_ROWS` | `10000` | rows buffered before a flush |
+| `AGENTI_PORT` | `4318` | published port only — compose reads it; the container always listens on 4318 |
 
 Leaving `AGENTI_API_KEYS` unset is right for a laptop and wrong for anything
 with a route to it. The server logs a warning at startup in that case rather
 than accepting the world quietly.
+
+## Seeing it in the dashboard
+
+The dashboard's Fleet view reads this backend, so a host appears there because
+it reported — not because the browser can reach it. Run the two together:
+
+```bash
+cd deploy && docker compose up -d      # backend on 4318 (or $AGENTI_PORT)
+cd ../frontend && npm run dev          # dashboard on 5173
+```
+
+The dev server proxies `/b` to the backend; point it elsewhere with
+`AGENT_I_BACKEND_URL`. **A change to `vite.config.js` needs the dev server
+restarted** — Vite reloads its own config, but a server started before the
+route existed will not have it.
+
+Fleet appears in the sidebar once the backend reports more than one host. Rows
+open a host's detail only when that host is also configured as a direct agent,
+because the detail view reads raw series, logs and spans from the agent itself;
+the rest are listed with nothing to open. That is the honest state of it — the
+fleet no longer needs tunnels, a single host's deep detail still does.
 
 ## Retention
 
@@ -134,6 +156,21 @@ Set by TTL on each table, applied at migration: **30 days** for metrics,
 partition drop rather than a rewrite. Change the `TTL` clauses in
 `internal/store/schema.go` and `ALTER TABLE … MODIFY TTL` to apply it to data
 already stored.
+
+## Upgrading an existing database
+
+The `hosts` table's ordering key changed to include `attr_count`. Without it,
+an export carrying a thin resource — an application on the host sending traces
+tagged with `host.id` and nothing else — permanently erases that machine's OS,
+account and zone when ClickHouse next merges the part. The server refuses to
+start against the old key and prints the fix:
+
+```sql
+DROP TABLE agenti.hosts
+```
+
+Dropping it loses nothing durable: the table is rebuilt from the next export
+each agent sends, which is seconds.
 
 ## What this is not, yet
 

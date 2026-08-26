@@ -236,3 +236,238 @@ func TestHosts_OutsideTheWindowHasNoNumbers(t *testing.T) {
 		t.Errorf("agent_id = %q, want the host still listed", h.AgentID)
 	}
 }
+
+// Load average is a gauge, so the fleet table can read it directly. IOWait is
+// deliberately not here: it is a share of a cumulative counter and needs a
+// rate across two points, which this query does not attempt.
+func TestHosts_ReadsLoadAverage(t *testing.T) {
+	c := testClient(t)
+	const id = "i-load"
+	writeHost(t, c, id, "load-1")
+	writeMetric(t, c, id, "system.cpu.load_average.15m", 1.75, nil)
+
+	hosts, err := c.Hosts(context.Background(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Hosts: %v", err)
+	}
+	h := hostByID(t, hosts, id)
+	if h.Load15 == nil || *h.Load15 != 1.75 {
+		t.Errorf("load15 = %v, want 1.75", h.Load15)
+	}
+}
+
+// An unloaded machine reports 0.00, which is a reading like any other.
+func TestHosts_ZeroLoadIsAReading(t *testing.T) {
+	c := testClient(t)
+	const id = "i-noload"
+	writeHost(t, c, id, "noload-1")
+	writeMetric(t, c, id, "system.cpu.load_average.15m", 0, nil)
+
+	hosts, err := c.Hosts(context.Background(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Hosts: %v", err)
+	}
+	if h := hostByID(t, hosts, id); h.Load15 == nil {
+		t.Fatal("a load of 0.00 came back as no reading")
+	}
+}
+
+// A host with no load metric leaves the column empty rather than showing 0.
+func TestHosts_AbsentLoadIsEmpty(t *testing.T) {
+	c := testClient(t)
+	const id = "i-cpuonly"
+	writeHost(t, c, id, "cpuonly-1")
+	writeMetric(t, c, id, "host.cpu.used_pct", 20, nil)
+
+	hosts, err := c.Hosts(context.Background(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Hosts: %v", err)
+	}
+	if h := hostByID(t, hosts, id); h.Load15 != nil {
+		t.Errorf("load15 = %v, want empty", *h.Load15)
+	}
+}
+
+// writeHostAttrs writes an inventory row with an explicit attribute set.
+func writeHostAttrs(t *testing.T, c *Client, host, agent string, seen time.Time, attrs map[string]string) {
+	t.Helper()
+	ts := seen.UTC().Format("2006-01-02 15:04:05.000")
+	row := map[string]any{
+		"host_id": host, "agent_id": agent,
+		"last_seen": ts, "first_seen": ts, "attributes": attrs,
+	}
+	if err := c.Insert(context.Background(), "hosts", []map[string]any{row}); err != nil {
+		t.Fatalf("insert host: %v", err)
+	}
+}
+
+// A later export carrying a thinner resource must not erase what a richer one
+// established. ReplacingMergeTree keeps the newest row, so without the query
+// preferring the fullest description, one sparse export blanks the OS,
+// account and zone columns for that host — with no error anywhere.
+func TestHosts_SparseExportDoesNotEraseTheDescription(t *testing.T) {
+	c := testClient(t)
+	const id = "i-sparse"
+	now := time.Now()
+	writeHostAttrs(t, c, id, "rich-1", now.Add(-time.Minute), map[string]string{
+		"host.id":                 id,
+		"host.name":               "rich-1",
+		"os.description":          "Ubuntu 24.04.4 LTS",
+		"cloud.account.id":        "123456789012",
+		"cloud.availability_zone": "us-east-1d",
+	})
+	// An application on the same host sending its own telemetry, which knows
+	// the host id and nothing else about the machine.
+	writeHostAttrs(t, c, id, "rich-1", now, map[string]string{"host.id": id})
+
+	hosts, err := c.Hosts(context.Background(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Hosts: %v", err)
+	}
+	h := hostByID(t, hosts, id)
+	if got := h.Attributes["os.description"]; got != "Ubuntu 24.04.4 LTS" {
+		t.Errorf("os.description = %q, want it to survive the sparse export", got)
+	}
+	if got := h.Attributes["cloud.account.id"]; got != "123456789012" {
+		t.Errorf("cloud.account.id = %q, want it to survive", got)
+	}
+}
+
+// Liveness must still come from the newest row, not from the row the
+// description was taken from — otherwise a host whose fullest export is an
+// hour old would read as an hour stale while actively reporting.
+func TestHosts_LastSeenTracksTheNewestRowNotTheRichest(t *testing.T) {
+	c := testClient(t)
+	const id = "i-liveness"
+	now := time.Now().UTC().Truncate(time.Second)
+	writeHostAttrs(t, c, id, "live-1", now.Add(-time.Hour), map[string]string{
+		"host.id": id, "os.description": "Debian GNU/Linux 12", "host.arch": "amd64",
+	})
+	writeHostAttrs(t, c, id, "live-1", now, map[string]string{"host.id": id})
+
+	hosts, err := c.Hosts(context.Background(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Hosts: %v", err)
+	}
+	h := hostByID(t, hosts, id)
+	if want := now.Format("2006-01-02T15:04:05Z"); h.LastSeen != want {
+		t.Errorf("last_seen = %q, want %q (the newest row)", h.LastSeen, want)
+	}
+	if h.Attributes["os.description"] != "Debian GNU/Linux 12" {
+		t.Errorf("description was lost while taking last_seen from the newer row")
+	}
+}
+
+// An updated value on an equally complete row is the newer one, not the older.
+func TestHosts_EqualDetailPrefersTheNewerRow(t *testing.T) {
+	c := testClient(t)
+	const id = "i-updated"
+	now := time.Now()
+	writeHostAttrs(t, c, id, "up-1", now.Add(-time.Minute), map[string]string{
+		"host.id": id, "os.description": "Ubuntu 22.04",
+	})
+	writeHostAttrs(t, c, id, "up-1", now, map[string]string{
+		"host.id": id, "os.description": "Ubuntu 24.04",
+	})
+
+	hosts, err := c.Hosts(context.Background(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Hosts: %v", err)
+	}
+	if h := hostByID(t, hosts, id); h.Attributes["os.description"] != "Ubuntu 24.04" {
+		t.Errorf("os.description = %q, want the upgraded value", h.Attributes["os.description"])
+	}
+}
+
+// The display name must come from the same row as the description. A sparse
+// export has no host.name and falls back to the host id, so taking the name
+// from the newest row renames the machine in the table while its OS and
+// account stay right — a row that disagrees with itself.
+func TestHosts_NameAndDescriptionComeFromTheSameRow(t *testing.T) {
+	c := testClient(t)
+	const id = "i-naming"
+	now := time.Now()
+	writeHostAttrs(t, c, id, "web-prod-1", now.Add(-time.Minute), map[string]string{
+		"host.id": id, "host.name": "web-prod-1", "os.description": "Ubuntu 24.04.4 LTS",
+	})
+	// The fallback an id-only resource produces in convert.go.
+	writeHostAttrs(t, c, id, id, now, map[string]string{"host.id": id})
+
+	hosts, err := c.Hosts(context.Background(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Hosts: %v", err)
+	}
+	h := hostByID(t, hosts, id)
+	if h.AgentID != "web-prod-1" {
+		t.Errorf("agent_id = %q, want web-prod-1", h.AgentID)
+	}
+	if h.Attributes["os.description"] != "Ubuntu 24.04.4 LTS" {
+		t.Errorf("description = %q, want it to match the name's row", h.Attributes["os.description"])
+	}
+}
+
+// The one that a query-side fix alone does not survive.
+//
+// ReplacingMergeTree does not merely hide the losing row, it deletes it during
+// a background merge. So a query that prefers the fullest description works
+// only until ClickHouse compacts the part, after which the fuller row does not
+// exist anywhere and no query can recover it. OPTIMIZE FINAL forces that merge
+// immediately rather than waiting for the scheduler to do it at some
+// unpredictable point — which is exactly how this got through the first time.
+func TestHosts_DescriptionSurvivesAMerge(t *testing.T) {
+	c := testClient(t)
+	const id = "i-merged"
+	now := time.Now()
+	writeHostAttrs(t, c, id, "prod-1", now.Add(-time.Minute), map[string]string{
+		"host.id":                 id,
+		"host.name":               "prod-1",
+		"os.description":          "Ubuntu 24.04.4 LTS",
+		"cloud.account.id":        "123456789012",
+		"cloud.availability_zone": "us-east-1d",
+	})
+	writeHostAttrs(t, c, id, id, now, map[string]string{"host.id": id})
+
+	if _, err := c.execRaw(context.Background(), "OPTIMIZE TABLE hosts FINAL", nil, true); err != nil {
+		t.Fatalf("OPTIMIZE: %v", err)
+	}
+
+	hosts, err := c.Hosts(context.Background(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("Hosts: %v", err)
+	}
+	h := hostByID(t, hosts, id)
+	if h.Attributes["os.description"] != "Ubuntu 24.04.4 LTS" {
+		t.Errorf("os.description = %q — the merge destroyed the fuller row",
+			h.Attributes["os.description"])
+	}
+	if h.AgentID != "prod-1" {
+		t.Errorf("agent_id = %q, want prod-1", h.AgentID)
+	}
+}
+
+// Equally complete rows must still collapse, or the table grows without bound:
+// a steady agent writes one of these per flush, forever.
+func TestHosts_EqualRowsStillDeduplicate(t *testing.T) {
+	c := testClient(t)
+	const id = "i-dedup"
+	now := time.Now()
+	attrs := map[string]string{"host.id": id, "host.name": "dedup-1", "os.type": "linux"}
+	for i := 0; i < 5; i++ {
+		writeHostAttrs(t, c, id, "dedup-1", now.Add(time.Duration(i)*time.Second), attrs)
+	}
+	if _, err := c.execRaw(context.Background(), "OPTIMIZE TABLE hosts FINAL", nil, true); err != nil {
+		t.Fatalf("OPTIMIZE: %v", err)
+	}
+
+	var rows []struct {
+		N string `json:"n"`
+	}
+	if err := c.Query(context.Background(),
+		"SELECT toString(count()) AS n FROM hosts WHERE host_id = {id:String}",
+		map[string]string{"id": id}, &rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if len(rows) != 1 || rows[0].N != "1" {
+		t.Errorf("%v rows after a merge of five identical descriptions, want 1", rows)
+	}
+}
