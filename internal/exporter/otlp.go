@@ -382,14 +382,23 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 		attrs = append(attrs, stringAttr("host.name", o.hostName()))
 	}
 
+	// os.type is what a backend's host-inventory view reads to populate its
+	// "OS Type" filter. Without it every host this agent reports lands in an
+	// unnamed, unselectable bucket in that facet.
+	//
+	// Emitted here only when detection did not supply it. runtime.GOOS is a
+	// build constant, so it can say which kernel family the binary was
+	// compiled for and nothing more — it cannot distinguish two hosts, which
+	// is what a fleet view exists to do. The detected value carries the
+	// distribution and version alongside it; this remains as the floor for a
+	// host that could not describe itself. Same precedence as host.name above,
+	// and for the same reason: a duplicated attribute has no defined winner in
+	// OTLP, so the value would depend on the reader.
+	if _, discovered := o.resourceAttrs["os.type"]; !discovered {
+		attrs = append(attrs, stringAttr("os.type", runtime.GOOS))
+	}
+
 	attrs = append(attrs,
-		// os.type is what a backend's host-inventory view
-		// reads to populate its "OS Type" filter. Without it every host
-		// this agent reports lands in an unnamed, unselectable bucket in
-		// that facet. runtime.GOOS already spells the OTel-defined values
-		// ("linux", "darwin", "windows") identically, so no mapping table
-		// is needed for any platform this agent builds for.
-		stringAttr("os.type", runtime.GOOS),
 		// Which build produced this telemetry. Deliberately NOT
 		// service.version: on spans forwarded from an externally
 		// instrumented app, service.name is that app's identity, and

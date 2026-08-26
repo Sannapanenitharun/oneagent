@@ -350,6 +350,7 @@ const EC2 = {
     "cloud.availability_zone": "us-east-1a",
     "host.id": "i-0123456789abcdef0",
     "host.type": "t3.medium",
+    "host.image.id": "ami-0abcdef1234567890",
   },
   series: SNAP.series,
 };
@@ -373,6 +374,39 @@ check(
   "absent instance fields are strings",
   ["instanceID", "instanceType", "zone", "account"].every((k) => bareRow[k] === "")
 );
+
+// OS is read from the host, not asserted. It was the literal string "linux"
+// on every row — the build target rather than an observation — which made the
+// column useless for the only thing a fleet column is for: telling rows apart.
+console.log("host os");
+const UBUNTU = { ...EMPTY, agent_id: "web-1", series: SNAP.series, host: {
+  "os.type": "linux", "os.name": "Ubuntu", "os.version": "24.04",
+  "os.description": "Ubuntu 24.04.1 LTS (Linux 6.8.0-1017-aws)", "host.arch": "amd64",
+}};
+const AMZN = { ...EMPTY, agent_id: "web-2", series: SNAP.series, host: {
+  "os.type": "linux", "os.name": "Amazon Linux", "os.version": "2023", "host.arch": "arm64",
+}};
+check("distribution and version", hostRow(UBUNTU).os === "Ubuntu 24.04");
+check("two distributions differ", hostRow(UBUNTU).os !== hostRow(AMZN).os);
+check("description carried for the tooltip", hostRow(UBUNTU).osDescription.includes("6.8.0-1017-aws"));
+check("arch carried", hostRow(AMZN).arch === "arm64");
+
+// An agent predating OS detection sends os.type only, or nothing at all. It
+// must read as unknown rather than as a confident "linux" the agent never
+// measured.
+const TYPE_ONLY = { ...EMPTY, agent_id: "old", series: SNAP.series, host: { "os.type": "linux" } };
+check("falls back to os.type", hostRow(TYPE_ONLY).os === "linux");
+check("no host object means unknown, not linux", hostRow(BARE).os === "");
+check("unknown os is a string", typeof hostRow(BARE).os === "string");
+
+// The account was derived and then never rendered — the column did not exist —
+// which left a fleet spanning several accounts looking like one flat list.
+console.log("host account");
+check("account is surfaced", hostRow(EC2).account === EC2.host["cloud.account.id"]);
+check("absent account is a string", hostRow(BARE).account === "");
+// The AMI was collected by the agent and dropped on the floor here.
+check("ami is surfaced", hostRow(EC2).imageID === EC2.host["host.image.id"]);
+check("absent ami is a string", hostRow(BARE).imageID === "");
 
 // A malformed trace must not hang the render.
 console.log("malformed input");

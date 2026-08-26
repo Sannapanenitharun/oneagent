@@ -19,6 +19,7 @@ import (
 	"github.com/agent-i/agent/internal/dashboard"
 	"github.com/agent-i/agent/internal/ec2meta"
 	"github.com/agent-i/agent/internal/exporter"
+	"github.com/agent-i/agent/internal/hostinfo"
 	"github.com/agent-i/agent/internal/spans"
 	"github.com/agent-i/agent/internal/version"
 )
@@ -312,19 +313,30 @@ func resolveAgentID(configured string, hostAttrs map[string]string) string {
 }
 
 // detectHostAttributes discovers resource attributes that describe the machine
-// rather than the configuration — currently the EC2 instance identity.
+// rather than the configuration: what operating system this is, and — on EC2 —
+// which instance.
 //
-// Failure is the expected outcome on anything that is not an EC2 instance, so
-// it is reported at info level and the agent continues: telemetry without
-// instance attributes is a smaller loss than an agent that refuses to start on
-// a laptop. The probe is bounded by its own timeout so a blackholed link-local
-// address cannot stall startup.
+// Failure is the expected outcome for the cloud half on anything that is not an
+// EC2 instance, so it is reported at info level and the agent continues:
+// telemetry without instance attributes is a smaller loss than an agent that
+// refuses to start on a laptop. The probe is bounded by its own timeout so a
+// blackholed link-local address cannot stall startup.
 //
 // The instance id, type and region are logged because they are what an operator
 // checks when a host shows up unlabelled. The account id deliberately is not.
 func detectHostAttributes(cfg *config.Config) map[string]string {
+	// OS description first, and unconditionally: it needs no network, works
+	// off EC2, and is the part that distinguishes hosts from each other on any
+	// infrastructure. It used to be asserted rather than read — os.type was
+	// runtime.GOOS, a build constant — so every host in a fleet described
+	// itself identically. See internal/hostinfo.
+	attrs := hostinfo.Detect().ResourceAttributes()
+	if d := attrs["os.description"]; d != "" {
+		log.Printf("host: %s (%s)", d, attrs["host.arch"])
+	}
+
 	if !cfg.EC2Metadata.DetectionEnabled() {
-		return nil
+		return attrs
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.EC2Metadata.Timeout)
 	defer cancel()
@@ -332,10 +344,23 @@ func detectHostAttributes(cfg *config.Config) map[string]string {
 	md, err := ec2meta.NewDetector(cfg.EC2Metadata.Timeout).Detect(ctx)
 	if err != nil {
 		log.Printf("ec2 metadata: no instance identity available (%v) — continuing without EC2 attributes", err)
-		return nil
+		return attrs
 	}
 	log.Printf("ec2 metadata: instance %s (%s) in %s", md.InstanceID, md.InstanceType, md.Region)
-	return md.ResourceAttributes()
+	// Cloud identity wins on any key they share. IMDS describes the instance
+	// authoritatively; the local filesystem only describes the image running
+	// on it.
+	for k, v := range md.ResourceAttributes() {
+		attrs[k] = v
+	}
+	if md.Name == "" {
+		// The single most common reason a fleet shows up as a wall of i-0abc…
+		// rows. Tags are not exposed through IMDS by default, and nothing else
+		// tells the operator that is why.
+		log.Printf("ec2 metadata: no Name tag visible — enable instance metadata tags to label this host by name "+
+			"(aws ec2 modify-instance-metadata-options --instance-id %s --instance-metadata-tags enabled)", md.InstanceID)
+	}
+	return attrs
 }
 
 // resolveExporterHeaders merges headers_env (env var references) into

@@ -694,8 +694,24 @@ export function hostRow(snap) {
     // instance that reports one without the other.
     zone: host["cloud.availability_zone"] || host["cloud.region"] || "",
     account: host["cloud.account.id"] || "",
+    // The AMI. Collected by the agent since EC2 detection landed and never
+    // surfaced anywhere until now — the same oversight as the account above.
+    // It is what answers "are these two hosts even running the same image",
+    // which is the first question when one of a pair misbehaves.
+    imageID: host["host.image.id"] || "",
     version: snap.version || "",
-    os: "linux", // the agent reads /proc and builds only for Linux
+    // Read from the host, not asserted. This was the literal string "linux"
+    // for every row, which is the build target rather than an observation and
+    // told you nothing you could act on: a fleet is worth a column here only
+    // if the column can differ between rows.
+    //
+    // os.name/os.version are the distribution ("Ubuntu 24.04"); os.type is the
+    // kernel family and is the floor for a host whose /etc/os-release could
+    // not be read. Empty rather than guessed when the agent predates the
+    // detection, so an old agent reads as unknown instead of as Linux.
+    os: [host["os.name"], host["os.version"]].filter(Boolean).join(" ") || host["os.type"] || "",
+    osDescription: host["os.description"] || "",
+    arch: host["host.arch"] || "",
     active: ageSec <= 600,
     ageSec,
     cpu: base.cpu,

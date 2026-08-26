@@ -1146,6 +1146,9 @@ function InfrastructureView({ snap, d }) {
     return <NotWired title="Infrastructure" why="No host metrics received. Set metrics.enabled: true in the agent config." needs="metrics.enabled" />;
   }
   const n = d.infra[0];
+  // The same derivation the fleet table uses, so a host cannot be described one
+  // way in the list and another way on its own page.
+  const hostFacts = useMemo(() => hostRow(snap) || {}, [snap]);
   const retainMin = snap?.retain_sec ? Math.round(snap.retain_sec / 60) : null;
 
   return (
@@ -1162,12 +1165,46 @@ function InfrastructureView({ snap, d }) {
             <span className="flex items-center"><StatusDot status={n.status} />
               <span style={{ color: statusColor[n.status] }}>{n.status}</span></span>
           </Fact>
-          {/* The agent reads /proc for every metric here and only builds for
-              Linux, so this is a property of the binary, not a guess. */}
-          <Fact label="Operating system">linux</Fact>
+          {/* Read from the host rather than asserted. This said "linux" for
+              every machine on the grounds that the agent only builds for
+              Linux — true of the binary, and useless as a description of the
+              server you opened this page to look at. */}
+          <Fact label="Operating system">
+            <span title={hostFacts.osDescription || ""}>{hostFacts.os || "unknown"}</span>
+          </Fact>
           <Fact label="CPU usage"><GaugeBar value={n.cpu} /></Fact>
           <Fact label="Memory usage"><GaugeBar value={n.mem} /></Fact>
         </div>
+
+        {/* Cloud identity, and only when there is some: off EC2 every one of
+            these is empty, and a row of four em-dashes describes the page
+            rather than the host. */}
+        {(hostFacts.instanceID || hostFacts.zone || hostFacts.account) && (
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-3 mt-3 pt-3 border-t border-[var(--n2)]">
+            <Fact label="Instance ID">
+              <span className="font-mono text-[11.5px]">{hostFacts.instanceID || "—"}</span>
+            </Fact>
+            <Fact label="Instance type">
+              <span className="font-mono text-[11.5px]">{hostFacts.instanceType || "—"}</span>
+            </Fact>
+            <Fact label="Zone">
+              <span className="font-mono text-[11.5px]">{hostFacts.zone || "—"}</span>
+            </Fact>
+            <Fact label="Account">
+              <span className="font-mono text-[11.5px]">{hostFacts.account || "—"}</span>
+            </Fact>
+            {hostFacts.imageID && (
+              <Fact label="AMI">
+                <span className="font-mono text-[11.5px]">{hostFacts.imageID}</span>
+              </Fact>
+            )}
+            {hostFacts.arch && (
+              <Fact label="Architecture">
+                <span className="font-mono text-[11.5px]">{hostFacts.arch}</span>
+              </Fact>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex items-end justify-between gap-4">
@@ -1309,6 +1346,16 @@ const HOST_COLUMNS = [
   // bad day" — both of which mean grouping rows, not reading one.
   { id: "instance", label: "Instance", get: (r) => r.instanceType || "", align: "left" },
   { id: "zone", label: "Zone", get: (r) => r.zone || "", align: "left" },
+  // The account is the coarsest grouping there is and the one that decides who
+  // can even reach a box. It was being derived and then discarded — the column
+  // never existed — which left a fleet spanning several accounts looking like
+  // one flat list. Sortable, because the question is "show me everything in
+  // this account", which means grouping rows rather than reading one.
+  { id: "account", label: "Account", get: (r) => r.account || "", align: "left" },
+  // Distro and version, read from the host. Sortable for the same reason: the
+  // question is "which boxes are still on the old image", not "what is this
+  // one running".
+  { id: "os", label: "OS", get: (r) => r.os || "", align: "left" },
   { id: "cpu", label: "CPU Usage", get: (r) => r.cpu, align: "left", bar: true },
   { id: "mem", label: "Memory Usage", get: (r) => r.mem, align: "left", bar: true },
   { id: "iowait", label: "IOWait", get: (r) => r.iowait, align: "right" },
@@ -1337,7 +1384,7 @@ function FleetView({ results, loading, onOpen }) {
           // is all we know about it, and omitting it would hide the outage.
           row: row || {
             host: host.name || host.url.replace(/^https?:\/\//, ""),
-            active: false, os: "—", version: "",
+            active: false, os: "", osDescription: "", arch: "", version: "",
             // Strings, not undefined: these columns sort with localeCompare and
             // an absent value would take the numeric path instead.
             instanceID: "", instanceType: "", zone: "", account: "",
@@ -1356,7 +1403,7 @@ function FleetView({ results, loading, onOpen }) {
     // one of them.
     const filtered = q
       ? rows.filter(({ row }) =>
-          [row.host, row.instanceID, row.instanceType, row.zone]
+          [row.host, row.instanceID, row.instanceType, row.zone, row.account, row.os]
             .some((field) => (field || "").toLowerCase().includes(q))
         )
       : rows;
@@ -1458,6 +1505,18 @@ function FleetView({ results, loading, onOpen }) {
                 <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)]">
                   {row.zone || "—"}
                 </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)] whitespace-nowrap">
+                  {row.account || "—"}
+                </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)] whitespace-nowrap">
+                  {/* The full description, including the kernel, is on hover:
+                      it is what you want once you have found the odd row out,
+                      and too long to give a column to. */}
+                  <span title={row.osDescription || ""}>{row.os || "—"}</span>
+                  {row.arch && (
+                    <span className="block text-[10px] font-mono text-[var(--ink-5)]">{row.arch}</span>
+                  )}
+                </td>
                 <td className="px-3 py-2.5 w-[14%]"><UsageBar value={row.cpu} /></td>
                 <td className="px-3 py-2.5 w-[14%]"><UsageBar value={row.mem} /></td>
                 <td className="px-3 py-2.5 text-right font-mono text-[11.5px] tabular-nums">
@@ -1475,8 +1534,9 @@ function FleetView({ results, loading, onOpen }) {
 
       <p className="text-[10.5px] font-mono text-[var(--ink-5)]">
         Select a host to open its infrastructure detail. Status is ACTIVE when a metric
-        arrived in the last 10 minutes. Instance and Zone come from the host's own
-        cloud metadata, and are empty off EC2.
+        arrived in the last 10 minutes. Instance, Zone and Account come from the host's
+        own cloud metadata and are empty off EC2; OS is read from the host itself, and
+        is empty on agents older than the release that started reporting it.
       </p>
     </div>
   );

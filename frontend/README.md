@@ -79,7 +79,11 @@ only seeds an empty list on first run; after that the browser's copy wins.
 "Restore from AGENT_I_HOSTS" in the manager goes back to it.
 
 Two hosts or more turns on the Fleet view: one row per server, sortable, with
-instance id, type and zone read from each host's own cloud metadata. Everything
+instance id, type, zone and account from each host's own cloud metadata, and the
+distribution and kernel read from the host itself. Account and OS are both
+sortable because the questions they answer are grouping questions — "show me
+everything in this account", "which boxes are still on the old image" — not
+questions about one row. Everything
 else — metrics, traces, logs — stays one host at a time, because each agent
 answers only for itself. A genuinely aggregated view needs a backend that
 collects from all of them, which is what the `otlp_http` exporter is for.
