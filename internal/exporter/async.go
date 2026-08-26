@@ -404,3 +404,12 @@ func (a *asyncExporter) Close() error {
 	}
 	return a.inner.Close()
 }
+
+// SetResourceAttributes forwards to the wrapped exporter. Without this the
+// async wrapper — which is what every network exporter is returned inside —
+// would hide the capability from the daemon.
+func (a *asyncExporter) SetResourceAttributes(attrs map[string]string) {
+	if inner, ok := a.inner.(ResourceRefresher); ok {
+		inner.SetResourceAttributes(attrs)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -44,6 +45,10 @@ type Daemon struct {
 	agentID    string
 	collectors []collector.Collector
 	exp        exporter.Exporter
+	// hostAttrs is what startup discovered about the machine. Kept so the
+	// background IMDS re-probe can tell whether it has anything to add, and so
+	// a refresh merges into what is already known rather than replacing it.
+	hostAttrs map[string]string
 	// agg is nil unless aggregation is enabled. When set it sits between the
 	// drain loop and the exporter, absorbing per-request events and emitting
 	// interval summaries in their place.
@@ -99,6 +104,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 	// per-host startup cost from being paid repeatedly for a value that cannot
 	// change while the process runs.
 	hostAttrs := detectHostAttributes(cfg)
+	d.hostAttrs = hostAttrs
 	d.agentID = resolveAgentID(cfg.AgentID, hostAttrs)
 
 	var collectors []collector.Collector
@@ -397,6 +403,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.dashSrv != nil {
 		go d.dashSrv.Serve()
 	}
+
+	go d.refreshHostAttributes(ctx)
 
 	defer func() {
 		for _, c := range d.collectors {
@@ -706,4 +714,106 @@ func (d *Daemon) drain(out <-chan collector.Envelope) {
 			return
 		}
 	}
+}
+
+// hostAttributeRetries is how many times the IMDS probe is retried in the
+// background, and how long to wait before each.
+//
+// The schedule covers a slow boot rather than an outage. An instance that has
+// not answered IMDS within a couple of minutes of the agent starting is not
+// having a timing problem, and continuing to ask would be a poll against an
+// address that is not going to answer — on a non-EC2 host, forever.
+var hostAttributeRetries = []time.Duration{
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
+
+// refreshHostAttributes re-probes IMDS in the background and publishes anything
+// new it learns.
+//
+// The problem it solves is a race at boot. systemd can start the agent before
+// the network stack answers, and the startup probe is bounded by a deliberately
+// short timeout so that a non-EC2 host is not delayed. A host that lost that
+// race reported no instance identity — blank instance id, type, zone and
+// account, everywhere — for the entire life of the process, and the only fix
+// was for somebody to notice and restart the agent.
+//
+// What it does NOT do is rename the agent. agent_id is resolved once at startup
+// and handed to every collector; changing it here would split this host's
+// series in two at an arbitrary moment, so a host that came up unidentified
+// keeps the name it started with until it restarts. Attributes are additive,
+// which is the part that can be corrected safely.
+func (d *Daemon) refreshHostAttributes(ctx context.Context) {
+	if !d.cfg.EC2Metadata.DetectionEnabled() {
+		return
+	}
+	// Nothing to wait for: the instance already identified itself, and the
+	// Name tag — the one field that can appear later, when someone enables
+	// instance metadata tags — is already here.
+	if d.hostAttrs["host.id"] != "" && d.hostAttrs["host.name"] != "" {
+		return
+	}
+
+	for _, wait := range hostAttributeRetries {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+
+		probe, cancel := context.WithTimeout(ctx, d.cfg.EC2Metadata.Timeout)
+		md, err := ec2meta.NewDetector(d.cfg.EC2Metadata.Timeout).Detect(probe)
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		merged, added := mergeHostAttributes(d.hostAttrs, md.ResourceAttributes())
+		if len(added) == 0 {
+			// Answered, but told us nothing we did not already have. Retrying
+			// would ask the same question and get the same answer.
+			return
+		}
+		sort.Strings(added)
+		log.Printf("ec2 metadata: instance identity resolved after startup, adding %s — "+
+			"agent_id stays %q, since renaming a running agent would split its series",
+			strings.Join(added, ", "), d.agentID)
+
+		d.hostAttrs = merged
+		if d.dash != nil {
+			d.dash.SetHostAttributes(merged)
+		}
+		if r, ok := d.exp.(exporter.ResourceRefresher); ok {
+			r.SetResourceAttributes(merged)
+		}
+		if md.Name != "" {
+			// Everything that can still arrive has arrived.
+			return
+		}
+	}
+}
+
+// mergeHostAttributes returns the union of what is known and what was just
+// discovered, plus the keys the discovery actually contributed.
+//
+// Existing values win. A key already present came from the startup probe or
+// from the local OS description, and a later probe that disagreed would mean
+// the machine changed underneath us — which it did not; far more likely is a
+// partial read, and overwriting good data with it would be the worse outcome.
+func mergeHostAttributes(have, discovered map[string]string) (map[string]string, []string) {
+	merged := make(map[string]string, len(have)+len(discovered))
+	for k, v := range have {
+		merged[k] = v
+	}
+	var added []string
+	for k, v := range discovered {
+		if v == "" || merged[k] != "" {
+			continue
+		}
+		merged[k] = v
+		added = append(added, k)
+	}
+	return merged, added
 }

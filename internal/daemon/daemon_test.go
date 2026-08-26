@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -231,4 +232,137 @@ func TestRetire_IsSafeWithoutATailRegistry(t *testing.T) {
 		Source: "/a.log",
 		Labels: map[string]string{collector.LabelTailID: "dev:1", collector.LabelTailEnd: "10"},
 	})
+}
+
+// mergeHostAttributes is what decides whether a late IMDS answer is allowed to
+// change what this host says about itself, so its precedence rules are pinned
+// here rather than left to the caller to get right.
+func TestMergeHostAttributes_AddsWhatWasMissing(t *testing.T) {
+	have := map[string]string{"os.type": "linux", "os.name": "Ubuntu"}
+	discovered := map[string]string{
+		"host.id":          "i-0123456789abcdef0",
+		"host.type":        "t3.medium",
+		"cloud.account.id": "123456789012",
+	}
+
+	merged, added := mergeHostAttributes(have, discovered)
+
+	if merged["host.id"] != "i-0123456789abcdef0" {
+		t.Errorf("host.id not added: %v", merged)
+	}
+	if merged["os.name"] != "Ubuntu" {
+		t.Errorf("existing OS description lost: %v", merged)
+	}
+	if len(added) != 3 {
+		t.Errorf("added = %v, want the three discovered keys", added)
+	}
+}
+
+// A later probe that disagrees means a partial read far more often than it
+// means the machine changed, and overwriting good data with it is the worse
+// outcome.
+func TestMergeHostAttributes_ExistingValuesWin(t *testing.T) {
+	have := map[string]string{"host.name": "prod-web-1", "host.id": "i-original"}
+	discovered := map[string]string{"host.name": "something-else", "host.id": "i-different"}
+
+	merged, added := mergeHostAttributes(have, discovered)
+
+	if merged["host.name"] != "prod-web-1" || merged["host.id"] != "i-original" {
+		t.Fatalf("a later probe overwrote known values: %v", merged)
+	}
+	if len(added) != 0 {
+		t.Errorf("added = %v, want nothing — none of it was new", added)
+	}
+}
+
+// An empty discovered value must not count as an answer, or a probe that
+// half-succeeded would look like it had contributed something.
+func TestMergeHostAttributes_IgnoresEmptyValues(t *testing.T) {
+	merged, added := mergeHostAttributes(
+		map[string]string{"os.type": "linux"},
+		map[string]string{"host.name": "", "host.id": "i-abc"},
+	)
+	if _, ok := merged["host.name"]; ok {
+		t.Errorf("an empty value became an attribute: %v", merged)
+	}
+	if len(added) != 1 || added[0] != "host.id" {
+		t.Errorf("added = %v, want [host.id]", added)
+	}
+}
+
+func TestMergeHostAttributes_EmptyInputs(t *testing.T) {
+	merged, added := mergeHostAttributes(nil, nil)
+	if len(merged) != 0 || len(added) != 0 {
+		t.Fatalf("invented something from nothing: %v / %v", merged, added)
+	}
+	merged, added = mergeHostAttributes(nil, map[string]string{"host.id": "i-abc"})
+	if merged["host.id"] != "i-abc" || len(added) != 1 {
+		t.Fatalf("a nil starting set should still accept a discovery: %v / %v", merged, added)
+	}
+}
+
+// The re-probe must not run when there is nothing it could learn, or every
+// correctly-identified EC2 host would spend two minutes asking IMDS questions
+// it already has the answers to.
+func TestRefreshHostAttributes_ReturnsWhenAlreadyComplete(t *testing.T) {
+	d := &Daemon{
+		cfg:       &config.Config{},
+		hostAttrs: map[string]string{"host.id": "i-abc", "host.name": "prod-web-1"},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		d.refreshHostAttributes(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refreshHostAttributes kept probing for a host that is already fully identified")
+	}
+}
+
+// Detection turned off means turned off, including for the retry.
+func TestRefreshHostAttributes_RespectsDetectionDisabled(t *testing.T) {
+	off := false
+	d := &Daemon{
+		cfg:       &config.Config{EC2Metadata: config.EC2MetadataConfig{Enabled: &off}},
+		hostAttrs: map[string]string{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		d.refreshHostAttributes(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refreshHostAttributes probed despite ec2_metadata.enabled being false")
+	}
+}
+
+// A cancelled context has to stop the retry schedule, or shutdown would wait
+// out the remaining backoff.
+func TestRefreshHostAttributes_StopsOnContextCancel(t *testing.T) {
+	d := &Daemon{
+		cfg:       &config.Config{EC2Metadata: config.EC2MetadataConfig{Timeout: 50 * time.Millisecond}},
+		hostAttrs: map[string]string{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.refreshHostAttributes(ctx)
+		close(done)
+	}()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refreshHostAttributes ignored context cancellation")
+	}
 }

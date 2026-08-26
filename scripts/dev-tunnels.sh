@@ -110,6 +110,9 @@ SPEC=()
 COUNT=0
 
 while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line%$'\r'}"                     # a hosts.txt written on Windows carries CRLF, and a
+                                           # trailing carriage return would end up inside the ssh
+                                           # target or the key path, where the error names neither
   line="${line%%#*}"                       # strip comments
   line="$(echo "$line" | xargs)"           # collapse whitespace, trim
   [[ -z "$line" ]] && continue

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent-i/agent/internal/collector"
@@ -208,9 +209,29 @@ type otlpHTTPExporter struct {
 	hostIDOnce sync.Once
 	hostIDVal  string
 
-	// resourceAttrs are runtime-discovered attributes describing the host
-	// (EC2 instance identity). Fixed for the life of the process.
-	resourceAttrs map[string]string
+	// resourceAttrs are runtime-discovered attributes describing the host: the
+	// OS description, and on EC2 the instance identity.
+	//
+	// Held behind an atomic pointer because they are not necessarily final at
+	// startup. IMDS can be unreachable for the first seconds of a boot — the
+	// agent may well start before the network stack is ready — and a host that
+	// lost that race used to report no instance identity for the entire life
+	// of the process, until somebody noticed and restarted it. The daemon
+	// re-probes in the background and publishes the result here.
+	//
+	// The map itself is never mutated after being stored; a refresh swaps in a
+	// new one, so readers need no lock.
+	resourceAttrs atomic.Pointer[map[string]string]
+}
+
+// SetResourceAttributes publishes a refined set of host attributes. It is safe
+// to call while exports are in flight.
+func (o *otlpHTTPExporter) SetResourceAttributes(attrs map[string]string) {
+	copied := make(map[string]string, len(attrs))
+	for k, v := range attrs {
+		copied[k] = v
+	}
+	o.resourceAttrs.Store(&copied)
 }
 
 func newOTLPHTTPExporter(cfg config.ExporterConfig) (*otlpHTTPExporter, error) {
@@ -238,9 +259,9 @@ func newOTLPHTTPExporter(cfg config.ExporterConfig) (*otlpHTTPExporter, error) {
 		maxBatchBytes: resolveMaxBatchBytes(cfg.MaxBatchBytes),
 		flushInterval: flushInterval,
 		maxRetries:    maxRetries,
-		resourceAttrs: cfg.ResourceAttributes,
 		stopCh:        make(chan struct{}),
 	}
+	o.SetResourceAttributes(cfg.ResourceAttributes)
 	o.flushWg.Add(1)
 	go o.flushLoop()
 	return o, nil
@@ -369,6 +390,10 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	attrs := []otlpKeyValue{
 		stringAttr("service.name", serviceName),
 	}
+	// Loaded once per resource so every attribute below sees the same
+	// snapshot. Reading the pointer per lookup would let a refresh land
+	// mid-build and produce a resource that is half old and half new.
+	ra := *o.resourceAttrs.Load()
 
 	// host.name is emitted here, immediately after service.name, only when
 	// discovery did not supply one. For a while it was emitted unconditionally
@@ -378,7 +403,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	// name depended on the reader. The discovered one wins, for the same
 	// reason it does for host.id below: the Name tag is what the instance is
 	// actually called, while this is the agent's own configured id.
-	if _, discovered := o.resourceAttrs["host.name"]; !discovered {
+	if _, discovered := ra["host.name"]; !discovered {
 		attrs = append(attrs, stringAttr("host.name", o.hostName()))
 	}
 
@@ -394,7 +419,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	// host that could not describe itself. Same precedence as host.name above,
 	// and for the same reason: a duplicated attribute has no defined winner in
 	// OTLP, so the value would depend on the reader.
-	if _, discovered := o.resourceAttrs["os.type"]; !discovered {
+	if _, discovered := ra["os.type"]; !discovered {
 		attrs = append(attrs, stringAttr("os.type", runtime.GOOS))
 	}
 
@@ -419,7 +444,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	// define host.id as the instance id, and that is what links this telemetry
 	// to the instance in a backend. machine-id remains the fallback everywhere
 	// else.
-	if _, discovered := o.resourceAttrs["host.id"]; !discovered {
+	if _, discovered := ra["host.id"]; !discovered {
 		if id := o.hostID(); id != "" {
 			attrs = append(attrs, stringAttr("host.id", id))
 		}
@@ -427,14 +452,14 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 
 	// Emitted in sorted order so a resource is byte-identical between flushes
 	// and between processes, which keeps diffs and tests stable.
-	if len(o.resourceAttrs) > 0 {
-		keys := make([]string, 0, len(o.resourceAttrs))
-		for k := range o.resourceAttrs {
+	if len(ra) > 0 {
+		keys := make([]string, 0, len(ra))
+		for k := range ra {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			attrs = append(attrs, stringAttr(k, o.resourceAttrs[k]))
+			attrs = append(attrs, stringAttr(k, ra[k]))
 		}
 	}
 	return otlpResource{Attributes: attrs}

@@ -353,3 +353,27 @@ func gzipCompress(data []byte) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// ResourceRefresher is implemented by exporters whose host attributes are not
+// necessarily final when the process starts.
+//
+// It exists for IMDS: a boot can have the agent running before the network
+// stack answers, and the instance identity discovered a few seconds later is
+// still the right identity for everything sent afterwards. Without a way to
+// publish it, a host that lost that race reported no instance attributes until
+// somebody restarted the agent.
+//
+// Optional by design — stdout and file exporters have no resource to refresh —
+// so callers type-assert rather than depending on every Exporter to implement
+// it.
+type ResourceRefresher interface {
+	SetResourceAttributes(map[string]string)
+}
+
+// SetResourceAttributes forwards to the wrapped exporter when it supports it,
+// so the wrapping does not hide the capability from the daemon.
+func (r *retiringExporter) SetResourceAttributes(attrs map[string]string) {
+	if inner, ok := r.inner.(ResourceRefresher); ok {
+		inner.SetResourceAttributes(attrs)
+	}
+}
