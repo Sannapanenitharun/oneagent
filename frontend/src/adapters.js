@@ -526,18 +526,34 @@ export function flattenFields(value, prefix = "", depth = 0, out = []) {
   return out;
 }
 
+// normalizeLevel maps the many spellings of a severity onto the five the UI
+// filters by. Returns "" for anything unrecognised, so a caller can tell an
+// absent level from one it could not read.
+function normalizeLevel(raw) {
+  const tok = String(raw || "").trim().toUpperCase();
+  if (!tok) return "";
+  if (tok === "FATAL" || tok === "CRITICAL" || tok === "CRIT" || tok === "ERR") return "ERROR";
+  if (tok === "WARNING") return "WARN";
+  if (["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].includes(tok)) return tok;
+  return "";
+}
+
 export function deriveLogs(snap) {
   return (snap?.logs || [])
     .slice()
     .reverse()
     .map((l) => {
-      const m = LEVEL_RE.exec(l.message || "");
-      let lvl = "INFO";
-      if (m) {
-        const tok = m[1].toUpperCase();
-        if (tok === "FATAL" || tok === "CRITICAL" || tok === "ERR") lvl = "ERROR";
-        else if (tok === "WARNING") lvl = "WARN";
-        else if (["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].includes(tok)) lvl = tok;
+      // A severity the record actually carries beats one guessed from its
+      // text. Lines tailed from a file have none — which is why the regex
+      // below exists — but an OTLP record has a severity the application set,
+      // and preferring the guess over it would classify a line the writer
+      // explicitly marked WARN as INFO because the word does not appear in the
+      // message.
+      const reported = normalizeLevel(l.labels?.level);
+      let lvl = reported || "INFO";
+      if (!reported) {
+        const m = LEVEL_RE.exec(l.message || "");
+        if (m) lvl = normalizeLevel(m[1]) || "INFO";
       }
       return {
         t: new Date(l.t).toLocaleTimeString([], { hour12: false }),
@@ -554,7 +570,7 @@ export function deriveLogs(snap) {
         // depending on where the pattern anchors. Stamping the adapter version
         // means a severity that later looks wrong can be traced to the
         // classifier that produced it, instead of being assumed authoritative.
-        lvlSource: `client:${ADAPTER_VERSION}`,
+        lvlSource: reported ? "record" : `client:${ADAPTER_VERSION}`,
         // Source is the file the line was tailed from; its basename is the
         // most useful short identifier available.
         svc: (l.source || "").split(/[\\/]/).pop() || "log",
@@ -562,11 +578,12 @@ export function deriveLogs(snap) {
         labels: l.labels || null,
         msg: l.message || "",
         structured: parseLogBody(l.message || ""),
-        // Trace/log correlation needs the app to emit trace_id into its log
-        // line AND the agent to parse it. Neither exists yet, so this stays
-        // null and the UI hides the jump-to-trace affordance rather than
-        // offering one that goes nowhere.
-        traceId: null,
+        // Correlation, when the record carries it. An OTLP log record has a
+        // trace id field and the backend passes it through; a line tailed from
+        // a file has nothing to correlate on and stays null, so the UI hides
+        // the jump-to-trace affordance rather than offering one that goes
+        // nowhere.
+        traceId: l.labels?.trace_id || null,
       };
     });
 }

@@ -18,3 +18,7 @@ hosts.txt
 # Compose reads this automatically and it holds the ingest API keys and the
 # ClickHouse password. Never commit it.
 deploy/.env
+
+# Build artifacts from `go build ./cmd/...` in the repo root.
+server
+server.exe

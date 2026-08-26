@@ -186,6 +186,28 @@ func registerQueryAPI(mux *http.ServeMux, db *store.Client) {
 		writeJSON(w, map[string]any{"host": host, "name": name, "points": points})
 	})
 
+	// One host's whole window, in the agent's own payload shape.
+	//
+	// The same shape on purpose: the dashboard's logs view, trace waterfall,
+	// flame graph, service map and every percentile in front of them are
+	// written against it, and a second shape would mean all of that existing
+	// twice. A host the browser has no route to renders through exactly the
+	// code that renders one it does.
+	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		host := r.URL.Query().Get("host")
+		if host == "" {
+			http.Error(w, "host is required", http.StatusBadRequest)
+			return
+		}
+		snap, err := db.Snapshot(r.Context(), host, durationParam(r, "window", 15*time.Minute))
+		if err != nil {
+			apiError(w, err)
+			return
+		}
+		store.SortSeries(snap.Series)
+		writeJSON(w, snap)
+	})
+
 	mux.HandleFunc("/api/metrics/names", func(w http.ResponseWriter, r *http.Request) {
 		host := r.URL.Query().Get("host")
 		if host == "" {

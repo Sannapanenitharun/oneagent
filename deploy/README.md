@@ -82,6 +82,7 @@ curl -s localhost:4318/api/hosts | jq '.hosts[] | {host_id, agent_id, cpu_pct}'
 | `POST /v1/metrics`, `/v1/logs`, `/v1/traces` | OTLP ingest, JSON or protobuf, gzip optional |
 | `GET /api/hosts?window=10m` | fleet inventory with latest CPU/memory/disk |
 | `GET /api/series?host=&name=&window=&step=` | one metric, bucketed server-side |
+| `GET /api/snapshot?host=&window=` | one host's series, logs and spans, in the agent's own payload shape |
 | `GET /api/metrics/names?host=` | what a host has reported |
 | `GET /healthz` | process **and** database |
 
@@ -143,11 +144,21 @@ The dev server proxies `/b` to the backend; point it elsewhere with
 restarted** — Vite reloads its own config, but a server started before the
 route existed will not have it.
 
-Fleet appears in the sidebar once the backend reports more than one host. Rows
-open a host's detail only when that host is also configured as a direct agent,
-because the detail view reads raw series, logs and spans from the agent itself;
-the rest are listed with nothing to open. That is the honest state of it — the
-fleet no longer needs tunnels, a single host's deep detail still does.
+Fleet appears in the sidebar once the backend reports more than one host. Open
+any row, or pick a host from the header dropdown under "Via backend", and every
+view works: metrics, logs, traces, the waterfall, the service map.
+
+That works because `/api/snapshot` returns the **agent's own payload shape**,
+assembled from stored rows. The dashboard's adapters, percentiles and views are
+written against that shape, so a host this browser has no route to renders
+through exactly the code that renders one it does. A second payload shape would
+have meant all of it existing twice and drifting apart from the first day.
+
+What is different when reading the backend: numbers are as fresh as the last
+export the host sent rather than as fresh as a poll of it, the window is the
+retention rather than the agent's in-memory 15 minutes, and Pause is disabled
+because there is no live poll to pause. The header says "via backend" so you
+are never guessing which one you are looking at.
 
 ## Retention
 

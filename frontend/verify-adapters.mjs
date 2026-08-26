@@ -416,5 +416,47 @@ const CYCLE = { ...EMPTY, spans: [
 ]};
 check("parent cycle terminates", deriveTraces(CYCLE)[0].spans.length === 2);
 
+// A severity the record carries beats one guessed from its text.
+//
+// Lines tailed from a file have no severity, which is why the text classifier
+// exists. An OTLP record - every log the backend stores - has one the writer
+// set, and preferring the guess over it marks a line explicitly written as
+// WARN as INFO because the word does not appear in the message.
+console.log("log severity");
+const REPORTED = { ...EMPTY, logs: [
+  { t: T0, source: "app", message: "connection pool at 80% capacity", labels: { level: "WARN" } },
+  { t: T0 + 1, source: "app", message: "upstream timeout", labels: { level: "ERROR" } },
+  { t: T0 + 2, source: "app", message: "starting", labels: { level: "warning" } },
+  { t: T0 + 3, source: "app", message: "ERROR retrying is fine", labels: { level: "INFO" } },
+  { t: T0 + 4, source: "app", message: "plain line with no label" },
+  { t: T0 + 5, source: "app", message: "ERROR something broke" },
+  { t: T0 + 6, source: "app", message: "labelled with nonsense", labels: { level: "SEVERE" } },
+]};
+const rl = deriveLogs(REPORTED).slice().reverse(); // deriveLogs reverses
+check("reported WARN is used", rl[0].lvl === "WARN", rl[0].lvl);
+check("reported ERROR is used", rl[1].lvl === "ERROR", rl[1].lvl);
+check("reported level is normalised", rl[2].lvl === "WARN", rl[2].lvl);
+// The case the text classifier gets wrong on its own.
+check("reported level beats the text guess", rl[3].lvl === "INFO", rl[3].lvl);
+check("reported level is marked as reported", rl[0].lvlSource === "record", rl[0].lvlSource);
+check("unlabelled line still falls back to INFO", rl[4].lvl === "INFO", rl[4].lvl);
+check("unlabelled line still reads its text", rl[5].lvl === "ERROR", rl[5].lvl);
+check("guessed level is stamped with the adapter version",
+  rl[5].lvlSource === `client:${ADAPTER_VERSION}`, rl[5].lvlSource);
+// An unrecognised label must not be trusted blindly, and must not blank the
+// level either.
+check("unrecognised label falls back", rl[6].lvl === "INFO", rl[6].lvl);
+
+// Correlation, when the record carries it. A tailed file line has nothing to
+// correlate on and must stay null so the UI hides the affordance.
+console.log("log correlation");
+const CORR = { ...EMPTY, logs: [
+  { t: T0, source: "app", message: "handled", labels: { trace_id: "5b8efff798038103" } },
+  { t: T0 + 1, source: "/var/log/syslog", message: "no trace here" },
+]};
+const cl = deriveLogs(CORR).slice().reverse();
+check("trace id is surfaced", cl[0].traceId === "5b8efff798038103", cl[0].traceId);
+check("absent trace id stays null", cl[1].traceId === null, String(cl[1].traceId));
+
 console.log(failed === 0 ? "\nOK — all adapter checks passed" : `\n${failed} check(s) failed`);
 process.exit(failed ? 1 : 0);

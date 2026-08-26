@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 
 import { useSnapshot, useHostHealth, useAllSnapshots } from "./api";
-import { useBackendFleet } from "./backend";
+import { useBackendFleet, useBackendSnapshot } from "./backend";
 import { loadHosts, saveHosts, parseHostSpec, toHostSpec, hostLabel, configuredHosts } from "./hosts";
 import { useTheme } from "./useTheme";
 import {
@@ -1527,16 +1527,13 @@ function FleetView({ entries, loading, source, sourceError, onOpen }) {
             {visible.map(({ key, host, row, error }) => (
               <tr
                 key={key}
-                onClick={host ? () => onOpen(host) : undefined}
-                // Only clickable when there is an agent to open. A host the
-                // backend knows about but this browser cannot reach has no
-                // detail view to go to, and a row that looks clickable and
-                // silently does nothing is worse than one that does not.
-                title={host ? "" : "No direct route to this host — add it under Manage hosts to open its detail."}
-                className={
-                  "border-b border-[var(--n2)] last:border-b-0 " +
-                  (host ? "cursor-pointer hover:bg-[var(--surface)]" : "cursor-default")
-                }
+                // Every row opens now. Where there is a configured agent the
+                // detail comes from it live; where there is not, it comes from
+                // the backend's stored copy — same payload shape either way,
+                // so the views downstream do not know which they are reading.
+                onClick={() => onOpen(host, row)}
+                title={host ? "" : "Read from the backend — this browser has no route to the machine."}
+                className="border-b border-[var(--n2)] last:border-b-0 cursor-pointer hover:bg-[var(--surface)]"
               >
                 <td className="px-3 py-2.5">
                   <span className="font-mono text-[12.5px] text-[var(--accent)]">{row.host}</span>
@@ -1601,9 +1598,9 @@ function FleetView({ entries, loading, source, sourceError, onOpen }) {
           <>
             Read from the backend, so a host appears because it reported — from any
             account or region, with no route from this browser to the machine itself.
-            Rows with a direct agent configured open their infrastructure detail;
-            the rest have nothing to open, because that detail still comes from the
-            agent. IOWait is not computed here.
+            Open any row for its metrics, logs and traces; where no direct agent is
+            configured those come from the backend's stored copy rather than live
+            from the machine. IOWait is not computed here.
           </>
         ) : (
           <>
@@ -1630,29 +1627,71 @@ function FleetView({ entries, loading, source, sourceError, onOpen }) {
 // The dot is the host's own reachability, not the selected host's. Its whole
 // purpose is to tell you a host is unreachable BEFORE you switch to it and
 // wonder why the dashboard went blank.
-function HostPicker({ hosts, selectedURL, setSelectedURL, health, agentID, onManage }) {
+// Values are prefixed because the two kinds of host are addressed differently
+// — an agent by URL, a backend host by id — and a bare value could not say
+// which. A host that is both appears once, under the agent, because a live
+// agent gives full resolution and the backend gives a stored copy of it.
+const AGENT_OPT = "a:";
+const BACKEND_OPT = "b:";
+
+function HostPicker({
+  hosts, selectedURL, setSelectedURL, health, agentID, onManage,
+  backendRows = [], backendHostID = "", setBackendHostID = () => {},
+}) {
   const dot = (state) =>
     state === "up" ? "var(--good)" : state === "down" ? "var(--crit)" : "var(--ink-3)";
+
+  // Hosts the backend knows about that are not already in the configured list,
+  // matched on the id the agent reports rather than on its display name, which
+  // is editable and duplicable.
+  const configuredIDs = new Set(Object.values({ [selectedURL]: agentID }).filter(Boolean));
+  const backendOnly = backendRows.filter((r) => r.instanceID && !configuredIDs.has(r.instanceID));
+
+  const value = backendHostID ? BACKEND_OPT + backendHostID : AGENT_OPT + selectedURL;
+  const onChange = (e) => {
+    const v = e.target.value;
+    if (v.startsWith(BACKEND_OPT)) {
+      setBackendHostID(v.slice(BACKEND_OPT.length));
+    } else {
+      setBackendHostID("");
+      setSelectedURL(v.slice(AGENT_OPT.length));
+    }
+  };
 
   return (
     <div className="flex items-center gap-2 pl-3 ml-1 border-l border-[var(--n2)]">
       <span
         className="w-2 h-2 rounded-full shrink-0"
-        style={{ background: dot(health[selectedURL]) }}
+        // A backend host has no reachability to report — that is the point of
+        // it — so it takes the neutral dot rather than a red one that would
+        // read as an outage.
+        style={{ background: backendHostID ? "var(--accent)" : dot(health[selectedURL]) }}
         aria-hidden="true"
       />
       <select
         aria-label="Select host"
-        value={selectedURL}
-        onChange={(e) => setSelectedURL(e.target.value)}
-        className="text-[11px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded px-2 py-1 text-[var(--ink)] cursor-pointer max-w-[14rem]"
+        value={value}
+        onChange={onChange}
+        className="text-[11px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded px-2 py-1 text-[var(--ink)] cursor-pointer max-w-[16rem]"
       >
-        {hosts.map((host) => (
-          <option key={host.url} value={host.url}>
-            {health[host.url] === "down" ? "○ " : "● "}
-            {hostLabel(host, host.url === selectedURL ? agentID : "")}
-          </option>
-        ))}
+        <optgroup label="Direct agents">
+          {hosts.map((host) => (
+            <option key={host.url} value={AGENT_OPT + host.url}>
+              {health[host.url] === "down" ? "○ " : "● "}
+              {hostLabel(host, !backendHostID && host.url === selectedURL ? agentID : "")}
+            </option>
+          ))}
+        </optgroup>
+        {backendOnly.length > 0 && (
+          <optgroup label="Via backend">
+            {backendOnly.map((r) => (
+              <option key={r.instanceID} value={BACKEND_OPT + r.instanceID}>
+                {r.active ? "● " : "○ "}
+                {r.host}
+              </option>
+            ))}
+          </optgroup>
+        )}
       </select>
       <button
         onClick={onManage}
@@ -1816,7 +1855,24 @@ export default function ObservabilityDashboard() {
     }
   }, [hosts, selectedURL]);
 
-  const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000, selectedHost);
+  // A host selected from the fleet that this browser has no route to. When
+  // set, every view reads the backend instead of an agent — the payload shape
+  // is identical, so nothing downstream of here knows the difference.
+  const [backendHostID, setBackendHostID] = useState("");
+
+  const agentPoll = useSnapshot(5000, backendHostID ? null : selectedHost);
+  const backendPoll = useBackendSnapshot(backendHostID, 10000);
+
+  // One of the two is live at a time. Reading from a database is slower to
+  // change than reading from an agent's memory, hence the slower interval
+  // above, but neither is a stream and the views cannot tell them apart.
+  const readingBackend = !!backendHostID;
+  const snapshot = readingBackend ? backendPoll.snapshot : agentPoll.snapshot;
+  const error = readingBackend ? backendPoll.error : agentPoll.error;
+  const loading = readingBackend ? backendPoll.loading : agentPoll.loading;
+  const paused = readingBackend ? false : agentPoll.paused;
+  const setPaused = agentPoll.setPaused;
+
   const hostHealth = useHostHealth(hosts);
 
   // The backend poll runs whether or not the fleet view is open, because its
@@ -1845,10 +1901,10 @@ export default function ObservabilityDashboard() {
   // polled — which is enough: pairing exists to keep a row clickable, and the
   // fallback to matching on name covers the rest.
   const agentIDs = useMemo(
-    () => (selectedHost && snapshot?.host?.["host.id"]
+    () => (!readingBackend && selectedHost && snapshot?.host?.["host.id"]
       ? { [selectedHost.url]: snapshot.host["host.id"] }
       : {}),
-    [selectedHost, snapshot]
+    [readingBackend, selectedHost, snapshot]
   );
 
   const fleetEntries = useMemo(
@@ -1900,8 +1956,14 @@ export default function ObservabilityDashboard() {
           <div>
             <h1 className="font-mono text-sm tracking-wide">AGENT-I</h1>
             <p className="text-[10px] text-[var(--ink-3)] font-mono">
-              {hosts.length > 1 ? `${hosts.length} hosts` : snapshot?.agent_id || "—"} ·{" "}
-              {now.toLocaleTimeString()}
+              {snapshot?.agent_id || (hosts.length > 1 ? `${hosts.length} hosts` : "—")}
+              {readingBackend && (
+                // Named, because "live" in the status light means something
+                // different here: these numbers are as fresh as the last
+                // export the host sent, not as fresh as a poll of it.
+                <span className="text-[var(--accent)]"> · via backend</span>
+              )}{" "}
+              · {now.toLocaleTimeString()}
             </p>
           </div>
           {/* Always rendered, unlike before. With one host it was chrome
@@ -1915,6 +1977,9 @@ export default function ObservabilityDashboard() {
             health={hostHealth}
             agentID={snapshot?.agent_id}
             onManage={() => setManaging(true)}
+            backendRows={backendRows}
+            backendHostID={backendHostID}
+            setBackendHostID={setBackendHostID}
           />
         </div>
         <div className="flex items-center gap-3">
@@ -1926,8 +1991,15 @@ export default function ObservabilityDashboard() {
               {loading ? "connecting…" : connected ? "live" : error.message}
             </span>
           </div>
-          <button onClick={() => setPaused(!paused)}
-            className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1.5 rounded bg-[var(--surface)] border border-[var(--n4)] text-[var(--ink-3)]">
+          {/* Pausing stops the agent poll. There is no agent poll to stop
+              while reading the backend, so the control is disabled rather
+              than left looking operable and doing nothing. */}
+          <button
+            onClick={() => setPaused(!paused)}
+            disabled={readingBackend}
+            title={readingBackend ? "Reading stored data from the backend — nothing to pause" : ""}
+            className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1.5 rounded bg-[var(--surface)] border border-[var(--n4)] text-[var(--ink-3)] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
             {paused ? <Play size={12} /> : <Pause size={12} />}{paused ? "Resume" : "Pause"}
           </button>
           <ThemeSwitch theme={theme} setTheme={setTheme} />
@@ -2016,8 +2088,16 @@ export default function ObservabilityDashboard() {
               loading={usingBackend ? backendLoading : fleetLoading}
               source={usingBackend ? "backend" : "agents"}
               sourceError={usingBackend ? backendError : null}
-              onOpen={(host) => {
-                setSelectedURL(host.url);
+              onOpen={(host, row) => {
+                if (host) {
+                  setBackendHostID("");
+                  setSelectedURL(host.url);
+                } else {
+                  // No route to the machine, so its telemetry comes from the
+                  // backend. This is the case the backend exists for and the
+                  // one that used to dead-end at a row you could not open.
+                  setBackendHostID(row.instanceID);
+                }
                 // SigNoz opens the host's detail, not a generic overview.
                 setView("infra");
               }}

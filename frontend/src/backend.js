@@ -183,3 +183,63 @@ export function useBackendFleet(intervalMs = 10000, enabled = true, windowSpec =
 
   return { rows, error, loading };
 }
+
+// useBackendSnapshot polls one host's telemetry from the backend.
+//
+// The payload is the agent's own /api/snapshot shape, produced by the backend
+// from stored rows. That is what lets the logs view, the trace waterfall, the
+// flame graph, the service map and every derived percentile render a host this
+// browser has no route to, through exactly the code that renders one it does —
+// see internal/store/snapshot.go for the other half of that contract.
+//
+// hostID is a backend host id, not a URL. Passing an empty one disables the
+// poll, which is how the dashboard switches back to reading an agent directly.
+export function useBackendSnapshot(hostID, intervalMs = 10000, windowSpec = "15m") {
+  const [snapshot, setSnapshot] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(!!hostID);
+
+  useEffect(() => {
+    if (!hostID) {
+      // Clearing rather than leaving the last host on screen: keeping it would
+      // show one machine's logs and traces under another machine's name.
+      setSnapshot(null);
+      setError(null);
+      setLoading(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+    setSnapshot(null);
+    setError(null);
+    setLoading(true);
+
+    async function tick() {
+      try {
+        const data = await getJSON(
+          `/api/snapshot?host=${encodeURIComponent(hostID)}&window=${encodeURIComponent(windowSpec)}`,
+          controller.signal
+        );
+        if (cancelled) return;
+        setSnapshot(data);
+        setError(null);
+      } catch (err) {
+        if (cancelled || err.name === "AbortError") return;
+        setError({ kind: "unreachable", message: err.message, detail: err.detail || "" });
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    tick();
+    const id = setInterval(tick, intervalMs);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(id);
+    };
+  }, [hostID, intervalMs, windowSpec]);
+
+  return { snapshot, error, loading };
+}
