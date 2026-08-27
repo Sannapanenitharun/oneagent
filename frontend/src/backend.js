@@ -91,6 +91,11 @@ export function backendHostRow(h, nowMs) {
   // distinction is only worth anything if it survives to here.
   const num = (v) => (typeof v === "number" ? v : NaN);
 
+  const cpu = num(h.cpu_pct);
+  const mem = num(h.mem_pct);
+  const disk = num(h.disk_pct);
+  const load15 = num(h.load15);
+
   return {
     host: h.agent_id || h.host_id,
     instanceID: a["host.id"] || h.host_id || "",
@@ -112,10 +117,22 @@ export function backendHostRow(h, nowMs) {
     arch: a["host.arch"] || "",
     active: ageSec <= ACTIVE_WINDOW_SEC,
     ageSec,
-    cpu: num(h.cpu_pct),
-    mem: num(h.mem_pct),
-    disk: num(h.disk_pct),
-    load15: num(h.load15),
+    cpu,
+    mem,
+    disk,
+    load15,
+    // Whether this host has actually sent telemetry, as distinct from having a
+    // row in the inventory.
+    //
+    // The two come apart more often than you would expect. A host is recorded
+    // the moment anything arrives carrying its identity — including an export
+    // that carried resource attributes and no data points at all — so the
+    // fleet can list machines with nothing behind them. Treating a row as
+    // proof of telemetry is what makes the UI say a host is "reporting" and
+    // then open an empty view, which reads as a broken dashboard rather than
+    // as an empty host.
+    hasMetrics:
+      Number.isFinite(cpu) || Number.isFinite(mem) || Number.isFinite(disk) || Number.isFinite(load15),
     // IOWait is a share of a cumulative CPU-time counter and needs a rate
     // across two points. The fleet query does not compute one, so this is
     // absent rather than 0 — an empty cell says "not measured here", and 0
@@ -143,18 +160,45 @@ export function backendHostRow(h, nowMs) {
 // differently so the offer never claims to be the same machine when that has
 // not been established.
 //
+// When there is no name match, the pick is the best row rather than the first.
+// Offering row zero meant offering whichever host the query happened to sort
+// first, which on a fleet whose inventory outlives its telemetry is reliably a
+// host with nothing to show — you click the offer, get an empty view, and
+// conclude the backend is broken when it is simply empty. Preferring a host
+// that is both recent and carrying data makes the offer worth taking.
+//
 // Pure, and separate from the component, so the decision can be tested
 // without a browser. See verify-backend.mjs.
 export function chooseBackendFallback({ readingBackend, error, backendRows, selectedHost }) {
   if (readingBackend || !error) return null;
-  const rows = backendRows || [];
+  const rows = (backendRows || []).filter((r) => r && r.instanceID);
   if (rows.length === 0) return null;
 
   const name = (selectedHost?.name || "").trim().toLowerCase();
   const match = name ? rows.find((r) => (r.host || "").trim().toLowerCase() === name) : null;
-  const target = match || rows[0];
-  if (!target || !target.instanceID) return null;
-  return { hostID: target.instanceID, label: target.host, matched: !!match };
+
+  // A name match wins outright even with no data behind it: the user asked for
+  // that specific machine, and silently substituting a different one because it
+  // looks healthier would answer a question nobody asked.
+  const target =
+    match ||
+    rows.find((r) => r.active && r.hasMetrics) ||
+    rows.find((r) => r.hasMetrics) ||
+    rows.find((r) => r.active) ||
+    rows[0];
+  if (!target) return null;
+
+  return {
+    hostID: target.instanceID,
+    label: target.host,
+    matched: !!match,
+    // Lets the offer say what it is actually offering. Without this the banner
+    // can only count rows, and a count of rows is not a count of hosts that
+    // have reported anything.
+    hasData: !!target.hasMetrics,
+    reporting: rows.filter((r) => r.active && r.hasMetrics).length,
+    total: rows.length,
+  };
 }
 
 // useBackendFleet polls the backend's host inventory.

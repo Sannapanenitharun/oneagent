@@ -196,5 +196,75 @@ console.log("chooseBackendFallback");
   check("a row with no id is not offered", idless === null, JSON.stringify(idless));
 }
 
+// A row in the inventory is not proof of telemetry. A host is recorded the
+// moment anything arrives carrying its identity, so the fleet can list machines
+// that have never sent a data point — and calling those "reporting" is what
+// makes the UI open an empty view and look broken.
+console.log("hasMetrics");
+{
+  const withData = backendHostRow(HOST, NOW);
+  check("a host with readings has metrics", withData.hasMetrics === true);
+
+  const empty = backendHostRow(
+    { ...HOST, cpu_pct: null, mem_pct: null, disk_pct: null, load15: null },
+    NOW
+  );
+  check("a host with every reading null has none", empty.hasMetrics === false);
+
+  // Zero is a reading. Treating it as absent would hide a genuinely idle host.
+  const idle = backendHostRow(
+    { ...HOST, cpu_pct: 0, mem_pct: null, disk_pct: null, load15: null },
+    NOW
+  );
+  check("zero counts as a reading", idle.hasMetrics === true);
+}
+
+console.log("chooseBackendFallback - picks a host worth opening");
+{
+  const err = { message: "agent not reachable" };
+  const call = (backendRows, selectedHost = null) =>
+    chooseBackendFallback({ readingBackend: false, error: err, backendRows, selectedHost });
+
+  // The case this exists for: the empty fixture sorts first, and offering it
+  // sends you to a blank view.
+  const mixed = [
+    { instanceID: "i-empty", host: "teleport", active: true, hasMetrics: false },
+    { instanceID: "i-live", host: "web", active: true, hasMetrics: true },
+  ];
+  const picked = call(mixed);
+  check("skips a registered-but-silent host for one with data", picked?.hostID === "i-live", picked?.hostID);
+  check("reports the offer has data", picked?.hasData === true);
+  check("counts only hosts actually reporting", picked?.reporting === 1, String(picked?.reporting));
+  check("counts every known host separately", picked?.total === 2, String(picked?.total));
+
+  // A name match wins outright. Substituting a healthier machine because the
+  // requested one looks empty would answer a question nobody asked.
+  const matched = call(mixed, { url: "http://127.0.0.1:8089", name: "teleport" });
+  check("a name match beats a livelier host", matched?.hostID === "i-empty", matched?.hostID);
+  check("and is reported as having no data", matched?.hasData === false);
+
+  // Nothing to prefer: still offer something, but say what it is.
+  const allEmpty = [
+    { instanceID: "i-a", host: "a", active: true, hasMetrics: false },
+    { instanceID: "i-b", host: "b", active: true, hasMetrics: false },
+  ];
+  const none = call(allEmpty);
+  check("still offers when nothing has data", none?.hostID === "i-a", none?.hostID);
+  check("and does not claim any are reporting", none?.reporting === 0, String(none?.reporting));
+
+  // A host with data that has gone quiet beats one that never had any.
+  const stale = [
+    { instanceID: "i-never", host: "never", active: true, hasMetrics: false },
+    { instanceID: "i-stale", host: "stale", active: false, hasMetrics: true },
+  ];
+  check("stale data beats no data", call(stale)?.hostID === "i-stale", call(stale)?.hostID);
+
+  // Rows predating hasMetrics must not all be treated as empty.
+  const legacy = [{ instanceID: "i-old", host: "old", active: true }];
+  const legacyPick = call(legacy);
+  check("a row without the field is still offered", legacyPick?.hostID === "i-old");
+  check("and is not counted as reporting", legacyPick?.reporting === 0, String(legacyPick?.reporting));
+}
+
 console.log(failed === 0 ? "\nOK - all backend checks passed" : `\n${failed} check(s) failed`);
 process.exit(failed ? 1 : 0);

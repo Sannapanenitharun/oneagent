@@ -1567,16 +1567,37 @@ function FleetView({ entries, loading, source, sourceError, onOpen }) {
                 <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)] whitespace-nowrap">
                   {row.instanceID || "—"}
                 </td>
+                {/* Three states, not two. A host that is listed but has never
+                    sent a data point is not the same as one that reported and
+                    went quiet: the first usually means the agent is exporting
+                    to somewhere else or its export carries identity and no
+                    metrics, and the second means the machine or its agent is
+                    down. Collapsing both into INACTIVE sends you looking at
+                    the wrong end of the pipeline. Only rows sourced from the
+                    backend carry hasMetrics; an agent-sourced row leaves it
+                    undefined and keeps the original two states. */}
                 <td className="px-3 py-2.5">
-                  <span className="inline-flex items-center gap-1.5 text-[10.5px] font-mono">
-                    <span
-                      className="w-1.5 h-1.5 rounded-full"
-                      style={{ background: row.active ? "var(--good)" : "var(--crit)" }}
-                    />
-                    <span style={{ color: row.active ? "var(--ink-3)" : "var(--crit)" }}>
-                      {row.active ? "ACTIVE" : "INACTIVE"}
-                    </span>
-                  </span>
+                  {(() => {
+                    const registeredOnly = row.hasMetrics === false;
+                    const tone = row.active ? "var(--good)" : registeredOnly ? "var(--warn)" : "var(--crit)";
+                    const label = registeredOnly ? "NO DATA" : row.active ? "ACTIVE" : "INACTIVE";
+                    return (
+                      <span
+                        className="inline-flex items-center gap-1.5 text-[10.5px] font-mono"
+                        title={
+                          registeredOnly
+                            ? "The backend has this host in its inventory but no telemetry from it. " +
+                              "Check that the agent's exporter points here and that its ingest key is accepted."
+                            : undefined
+                        }
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full" style={{ background: tone }} />
+                        <span style={{ color: row.active && !registeredOnly ? "var(--ink-3)" : tone }}>
+                          {label}
+                        </span>
+                      </span>
+                    );
+                  })()}
                   {error && (
                     <span className="block text-[10px] font-mono text-[var(--ink-5)] mt-0.5">
                       {error.message}
@@ -2144,11 +2165,22 @@ export default function ObservabilityDashboard() {
                 copy that does not need reaching. */}
             {backendFallback && (
               <>
+                {/* Counting rows and calling them "reporting" was a claim the
+                    inventory cannot support: a host is listed the moment
+                    anything arrives carrying its identity, so a fleet can hold
+                    machines that have never sent a data point. Saying they are
+                    reporting and then opening an empty view reads as a broken
+                    dashboard rather than an empty host, so the wording follows
+                    what is actually there. */}
                 <span className="text-[var(--ink-4)]">
                   {" "}
                   {backendFallback.matched
-                    ? "This host is also reporting to the backend."
-                    : `${backendRows.length} host${backendRows.length === 1 ? " is" : "s are"} reporting to the backend.`}
+                    ? backendFallback.hasData
+                      ? "This host is also reporting to the backend."
+                      : "The backend knows this host but has no telemetry from it."
+                    : backendFallback.reporting > 0
+                      ? `${backendFallback.reporting} host${backendFallback.reporting === 1 ? " is" : "s are"} reporting to the backend.`
+                      : `${backendFallback.total} host${backendFallback.total === 1 ? " is" : "s are"} registered with the backend, none reporting.`}
                 </span>{" "}
                 <button
                   onClick={() => setBackendHostID(backendFallback.hostID)}
@@ -2157,7 +2189,9 @@ export default function ObservabilityDashboard() {
                 >
                   {backendFallback.matched
                     ? `Read ${backendFallback.label} from the backend`
-                    : `Open ${backendFallback.label}`}
+                    : backendFallback.hasData
+                      ? `Open ${backendFallback.label}`
+                      : `Open ${backendFallback.label} (no data yet)`}
                 </button>
               </>
             )}
