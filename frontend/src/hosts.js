@@ -134,14 +134,28 @@ export function loadHosts() {
     // session; it just will not survive a reload.
     return seedHosts();
   }
-  if (!stored) return seedHosts();
+  // No key at all is a genuine first run, and only then does the seed apply.
+  if (stored === null) return seedHosts();
   try {
-    const parsed = normalizeHosts(JSON.parse(stored));
-    // An empty stored list is a real choice — "I removed them all" — but it
-    // leaves the UI with nothing to talk to, so fall back to the seed rather
-    // than rendering a dashboard with no host.
-    return parsed.length > 0 ? parsed : seedHosts();
+    // An empty stored list is a real choice — "I removed them all" — and it is
+    // honoured.
+    //
+    // This used to fall back to the seed, on the reasoning that an empty list
+    // leaves the UI with nothing to talk to. The effect was that removing the
+    // last host could not be done: the entry came back on the next reload,
+    // from an AGENT_I_HOSTS the dev server had read at startup and that the
+    // person deleting it usually did not know was set. A host pointing at a
+    // tunnel that no longer exists then reappeared indefinitely, failing every
+    // poll, and the UI insisted on it.
+    //
+    // Nothing is lost by honouring it. The dashboard renders the no-hosts case
+    // deliberately, the backend still supplies the fleet without any agent
+    // being reachable, and "Restore from AGENT_I_HOSTS" in the host manager
+    // brings the seed back on request — which is the difference that matters:
+    // asked for, not imposed.
+    return normalizeHosts(JSON.parse(stored));
   } catch {
+    // Corrupt JSON is not a choice, so the seed is the better recovery.
     return seedHosts();
   }
 }

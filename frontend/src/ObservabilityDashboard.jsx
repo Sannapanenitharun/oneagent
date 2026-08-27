@@ -1889,10 +1889,20 @@ export default function ObservabilityDashboard() {
   // persisted in the browser after that. See hosts.js.
   const [hosts, setHostsState] = useState(loadHosts);
   const [managing, setManaging] = useState(false);
+  // Removing the last host is allowed.
+  //
+  // This used to substitute the current list for an empty one, which made
+  // deleting the only entry a no-op: the row stayed, the removal never reached
+  // storage, and there was no message saying why. Together with the seed
+  // fallback in loadHosts, a host pointing at a dead tunnel could not be got
+  // rid of at all.
+  //
+  // An empty list is a supported state — the dashboard renders it, and the
+  // backend still supplies the fleet with no agent reachable — so there is
+  // nothing here to protect the user from.
   const setHosts = (next) => {
-    const applied = next.length > 0 ? next : hosts;
-    setHostsState(applied);
-    saveHosts(applied);
+    setHostsState(next);
+    saveHosts(next);
   };
 
   // Selection is by URL, not by index. The list is editable while the UI is
