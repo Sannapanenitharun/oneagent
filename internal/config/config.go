@@ -18,15 +18,16 @@ type Config struct {
 	// see daemon.resolveAgentID. It is not defaulted here because Load must
 	// stay a pure function of the file, and any useful default depends on the
 	// host rather than the configuration.
-	AgentID    string          `yaml:"agent_id"`
-	Interval   time.Duration   `yaml:"interval"`
-	Metrics    MetricsConfig   `yaml:"metrics"`
-	Logs       LogsConfig      `yaml:"logs"`
-	Journald   JournaldConfig  `yaml:"journald"`
-	AccessLogs AccessLogConfig `yaml:"access_logs"`
-	Tailing    TailingConfig   `yaml:"tailing"`
-	Traces     TracesConfig    `yaml:"traces"`
-	Exporter   ExporterConfig  `yaml:"exporter"`
+	AgentID    string           `yaml:"agent_id"`
+	Interval   time.Duration    `yaml:"interval"`
+	Metrics    MetricsConfig    `yaml:"metrics"`
+	Logs       LogsConfig       `yaml:"logs"`
+	Journald   JournaldConfig   `yaml:"journald"`
+	Containers ContainersConfig `yaml:"containers"`
+	AccessLogs AccessLogConfig  `yaml:"access_logs"`
+	Tailing    TailingConfig    `yaml:"tailing"`
+	Traces     TracesConfig     `yaml:"traces"`
+	Exporter   ExporterConfig   `yaml:"exporter"`
 
 	Aggregation AggregationConfig `yaml:"aggregation"`
 	Dashboard   DashboardConfig   `yaml:"dashboard"`
@@ -215,6 +216,53 @@ type JournaldConfig struct {
 	// resumes instead of skipping or replaying. Defaults beside the tail
 	// registry in the state directory.
 	CursorPath string `yaml:"cursor_path"`
+}
+
+// ContainersConfig controls per-container metrics and container log collection
+// on a Docker host.
+//
+// Off by default. On a host with no containers it would cost a cgroup stat
+// every interval to learn that repeatedly, and on a host that does run
+// containers, turning it on multiplies the series count by however many are
+// running — which is the operator's decision to make, not an upgrade side
+// effect. The shipped container image enables it explicitly.
+type ContainersConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// DockerEndpoint is the Engine API socket, used only to resolve container
+	// names and images. Metrics come from cgroups and do not need it; an
+	// unreachable socket costs the labels, not the data.
+	DockerEndpoint string `yaml:"docker_endpoint"`
+	// Interval defaults to the agent's top-level interval. Separable because
+	// container counts change far more slowly than a busy host's CPU, and on a
+	// host running hundreds of containers a longer container interval is a
+	// cheap way to cut series volume without blunting host metrics.
+	Interval time.Duration `yaml:"interval"`
+	// ExcludeImages and ExcludeNames drop containers whose image reference or
+	// name contains any of these substrings. The agent's own container is
+	// always excluded and does not need listing.
+	ExcludeImages []string `yaml:"exclude_images"`
+	ExcludeNames  []string `yaml:"exclude_names"`
+
+	Logs ContainerLogsConfig `yaml:"logs"`
+}
+
+// ContainerLogsConfig controls collection of container stdout/stderr from the
+// json-file log driver's files.
+type ContainerLogsConfig struct {
+	// Enabled is a pointer so an absent block means on whenever containers are
+	// enabled at all. Someone who turns on container monitoring and gets
+	// metrics but no logs has to go and find out why; the reverse — getting
+	// logs they did not want — is one setting away and visible immediately.
+	Enabled *bool `yaml:"enabled"`
+	// Root is the json-file driver's directory. Override it for a host with a
+	// relocated Docker data-root.
+	Root string `yaml:"root"`
+}
+
+// CollectLogs reports whether container logs should be collected, treating an
+// unset value as true.
+func (c ContainersConfig) CollectLogs() bool {
+	return c.Logs.Enabled == nil || *c.Logs.Enabled
 }
 
 type TracesConfig struct {
@@ -444,6 +492,20 @@ func Load(path string) (*Config, error) {
 
 	if cfg.Journald.CursorPath == "" {
 		cfg.Journald.CursorPath = "/var/lib/agent-i/journald.cursor"
+	}
+
+	// Container defaults. Applied unconditionally rather than under
+	// cfg.Containers.Enabled so the effective values are the same whichever
+	// way the block was written, and so turning the feature on later does not
+	// also change what it points at.
+	if cfg.Containers.DockerEndpoint == "" {
+		cfg.Containers.DockerEndpoint = "/var/run/docker.sock"
+	}
+	if cfg.Containers.Interval <= 0 {
+		cfg.Containers.Interval = cfg.Interval
+	}
+	if cfg.Containers.Logs.Root == "" {
+		cfg.Containers.Logs.Root = "/var/lib/docker/containers"
 	}
 
 	// Spool defaults. Alongside the tailing registry and the journald cursor,

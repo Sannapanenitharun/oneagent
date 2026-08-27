@@ -151,7 +151,7 @@ func (h *HostMetricsCollector) deltaCPU(cur cpuStat) (float64, bool) {
 
 // readMemory returns (used, total) in KB from /proc/meminfo.
 func readMemory() (used, total float64, err error) {
-	f, err := os.Open("/proc/meminfo")
+	f, err := os.Open(hostPath("/proc/meminfo"))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -183,7 +183,7 @@ func readMemory() (used, total float64, err error) {
 type cpuStat struct{ idle, total float64 }
 
 func readCPUStat() (cpuStat, error) {
-	f, err := os.Open("/proc/stat")
+	f, err := os.Open(hostPath("/proc/stat"))
 	if err != nil {
 		return cpuStat{}, err
 	}

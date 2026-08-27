@@ -122,7 +122,8 @@ func New(cfg *config.Config) (*Daemon, error) {
 	// pointed at the same path would overwrite each other's offsets on every
 	// flush, so this is constructed once here rather than per collector.
 	var tailOpts collector.TailingOptions
-	if cfg.Logs.Enabled || cfg.AccessLogs.Enabled {
+	containerLogs := cfg.Containers.Enabled && cfg.Containers.CollectLogs()
+	if cfg.Logs.Enabled || cfg.AccessLogs.Enabled || containerLogs {
 		reg, err := collector.NewOffsetRegistry(cfg.Tailing.RegistryPath)
 		if err != nil {
 			return nil, fmt.Errorf("initializing offset registry: %w", err)
@@ -171,6 +172,29 @@ func New(cfg *config.Config) (*Daemon, error) {
 		collectors = append(collectors, jc)
 	}
 
+	// Containers. Two separate collectors rather than one, because the two
+	// halves fail independently and for different reasons: metrics need the
+	// cgroup mount, logs need the json-file driver's directory, and a host that
+	// has one without the other should get the half that works.
+	if cfg.Containers.Enabled {
+		collectors = append(collectors, collector.NewContainerCollector(d.agentID, collector.ContainerOptions{
+			Interval:       cfg.Containers.Interval,
+			DockerEndpoint: cfg.Containers.DockerEndpoint,
+			ExcludeImages:  cfg.Containers.ExcludeImages,
+			ExcludeNames:   cfg.Containers.ExcludeNames,
+		}))
+		if containerLogs {
+			collectors = append(collectors, collector.NewDockerLogCollector(d.agentID,
+				collector.ContainerLogOptions{
+					Root:         cfg.Containers.Logs.Root,
+					ExcludeNames: cfg.Containers.ExcludeNames,
+				},
+				tailOpts,
+				cfg.Containers.DockerEndpoint,
+			))
+		}
+	}
+
 	if cfg.AccessLogs.Enabled {
 		format := collector.FormatCombined
 		if cfg.AccessLogs.Format == "json" {
@@ -207,7 +231,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 	}
 
 	if len(collectors) == 0 {
-		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, access_logs.enabled, traces.enabled")
+		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, access_logs.enabled, containers.enabled, traces.enabled")
 	}
 
 	// Built after the registry so the exporter can report which lines are
@@ -317,7 +341,25 @@ func resolveAgentID(configured string, hostAttrs map[string]string) string {
 	}
 	if h, err := os.Hostname(); err == nil {
 		if h = strings.TrimSpace(h); h != "" {
-			log.Printf("agent_id: not set in config — using the hostname %q", h)
+			// Inside a container the hostname is the container's own id unless
+			// the operator overrode it, and that id changes every time the
+			// container is recreated — so this host would arrive at the backend
+			// as a brand new machine on each restart, and its history would
+			// fragment into a pile of one-off hosts.
+			//
+			// Reported rather than worked around, because it cannot be worked
+			// around from in here: the hostname lives in the UTS namespace,
+			// which the /proc and cgroup mounts do not reach into, and the one
+			// route that would (reading pid 1's root) needs SYS_PTRACE — a
+			// capability this deployment deliberately does not take.
+			if id := collector.SelfContainerID(); id != "" && strings.HasPrefix(id, h) {
+				log.Printf("agent_id: not set in config, and the hostname %q is this CONTAINER's id — "+
+					"it changes every time the container is recreated, so this host will report as a "+
+					"new machine on each restart. Set agent_id in the config, or run the container "+
+					"with --uts=host so it sees the host's own name.", h)
+			} else {
+				log.Printf("agent_id: not set in config — using the hostname %q", h)
+			}
 			return h
 		}
 	}

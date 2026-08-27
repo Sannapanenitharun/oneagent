@@ -14,6 +14,11 @@ The direction is the whole point. Agents connect **outbound** over one port, so
 adding the fiftieth server is identical to adding the second — no inbound
 rules, no NAT traversal, no per-host wiring, and cross-account is a non-event.
 
+This file is about the **backend**. For running the agent as a container to
+monitor a Docker host, see [DOCKER.md](DOCKER.md) — that is a different process
+with a different lifecycle: one backend serves many hosts, and an agent runs on
+each host that has containers worth watching.
+
 ## Run it
 
 ```bash

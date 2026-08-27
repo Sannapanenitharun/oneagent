@@ -1,0 +1,77 @@
+# The agent, packaged to monitor a Docker host from inside a container.
+#
+# This is the Datadog deployment model, not the Dynatrace one, and the
+# difference matters. Dynatrace's OneAgent container mounts the host root at
+# /mnt/root, runs the ordinary full-stack installer, and leaves the real agent
+# installed on the host — the container is a bootstrap wrapper needing fourteen
+# capabilities including SYS_ADMIN and SYS_PTRACE, because it injects into
+# running processes. Nothing here installs anything on the host or injects into
+# anything: the agent stays in this container, reads the host through read-only
+# bind mounts, and needs no capabilities at all.
+#
+#   docker run -d --name agent-i \
+#     --pid host --cgroupns host --uts host \
+#     -v /proc:/host/proc:ro \
+#     -v /sys/fs/cgroup:/host/sys/fs/cgroup:ro \
+#     -v /var/run/docker.sock:/var/run/docker.sock:ro \
+#     -v /var/lib/docker/containers:/host/var/lib/docker/containers:ro \
+#     -v agent-i-state:/var/lib/agent-i \
+#     -e AGENT_I_HOST_ROOT=/host \
+#     -p 4318:4318 \
+#     agent-i:latest
+#
+# See deploy/README.md for what each of those is for and what is lost by
+# omitting it.
+
+# Build
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY . .
+# CGO off and a static link, matching how the agent ships as a host binary. The
+# image is only a delivery mechanism; the artifact inside it is the same single
+# static file you would scp onto a host.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags "-s -w -X github.com/agent-i/agent/internal/version.Version=$(cat VERSION 2>/dev/null || echo dev)" \
+    -o /out/agent-i ./cmd/agent
+
+# Run
+FROM alpine:3.20
+# ca-certificates because the exporter posts to an HTTPS backend in any real
+# deployment and a scratch image has nothing to verify it with. tzdata so log
+# timestamps in a configured local zone are not silently UTC.
+RUN apk add --no-cache ca-certificates tzdata
+
+COPY --from=build /out/agent-i /usr/local/bin/agent-i
+COPY deploy/agent-container.yaml /etc/agent-i/agent.yaml
+
+# Runs as root, deliberately and unlike the backend image.
+#
+# Container logs under /var/lib/docker/containers are mode 0700 root-only, and
+# the cgroup and proc entries of processes owned by other users are not readable
+# by an unprivileged uid either. A non-root user here would produce an agent
+# that starts cleanly, reports the containers it can see, and silently omits
+# every one it cannot — which is the failure mode this codebase treats as worse
+# than not starting.
+#
+# What makes that acceptable is what is NOT granted: no --privileged, no added
+# capabilities, and every host mount read-only. The agent issues GETs to the
+# Docker socket and opens files for reading; it has no code path that writes to
+# the host at all.
+USER root
+
+# State: tail offsets and the spool. Mount a volume here or a restart re-reads
+# or skips log files rather than resuming where it left off.
+VOLUME ["/var/lib/agent-i"]
+
+# The OTLP receiver, so application containers on the same network can send
+# traces to http://agent-i:4318 — which is the point of running the agent as a
+# container rather than on the host. An app container cannot reach a receiver
+# bound to the host's 127.0.0.1, and that is the single most common reason
+# traces never arrive.
+EXPOSE 4318
+# The local dashboard. Loopback-bound inside the container; publish it
+# explicitly with -p 127.0.0.1:8088:8088 if you want it.
+EXPOSE 8088
+
+ENTRYPOINT ["/usr/local/bin/agent-i"]
+CMD ["-config", "/etc/agent-i/agent.yaml"]

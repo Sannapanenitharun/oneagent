@@ -87,6 +87,36 @@ journald:
   # has taken the entry — the same rule the file tailer's offsets follow.
   cursor_path: "/var/lib/agent-i/journald.cursor"
 
+# Per-container metrics and container stdout/stderr, on a Docker host.
+#
+# Off by default: on a host with no containers this would learn that again every
+# interval, and on one that runs them it multiplies the series count by however
+# many are running. The container image ships with it on — see deploy/README.md.
+#
+# Metrics are read from the cgroup v2 filesystem, not from the Docker daemon.
+# The socket below is used only to turn container ids into names and images; an
+# unreachable socket costs you the labels, not the data. cgroup v1 hosts are
+# detected and reported at startup rather than silently collecting nothing.
+containers:
+  enabled: false
+  # Engine API socket. Mount it read-only — the agent only ever issues GETs.
+  docker_endpoint: "/var/run/docker.sock"
+  # Defaults to the top-level interval. Worth raising on a host running
+  # hundreds of containers: their count changes far more slowly than CPU does.
+  # interval: 30s
+  # Substring matches against the image reference and the container name. The
+  # agent's own container is always excluded and does not need listing here.
+  # exclude_images: ["pause", "k8s.gcr.io/"]
+  # exclude_names: ["buildkit"]
+  logs:
+    # Absent means on whenever containers.enabled is true.
+    enabled: true
+    # The json-file log driver's directory. Change it only on a host with a
+    # relocated Docker data-root. A host using the journald or a remote log
+    # driver has no files here, and the agent says so rather than appearing to
+    # watch containers that never log.
+    root: "/var/lib/docker/containers"
+
 logs:
   enabled: true
   paths:

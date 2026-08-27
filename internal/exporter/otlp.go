@@ -515,6 +515,19 @@ var cumulativeMetrics = map[string]bool{
 	"system.disk.io":             true,
 	"system.disk.operations":     true,
 	"system.disk.operation_time": true,
+
+	// Container counters. These reset when a container restarts rather than
+	// when the host boots, which is why their envelopes carry the container's
+	// own creation time as the start time (see containers.go) — a Sum whose
+	// start time is the host's boot would make a fresh container's first
+	// reading look like a step change from a value it never had.
+	"container.cpu.usage.total":                    true,
+	"container.cpu.usage.usermode":                 true,
+	"container.cpu.usage.kernelmode":               true,
+	"container.cpu.throttling_data.throttled_time": true,
+	"container.blockio.io_service_bytes_recursive": true,
+	"container.network.io.usage.rx_bytes":          true,
+	"container.network.io.usage.tx_bytes":          true,
 }
 
 // startTimeFor returns the cumulative counter's start time, which OTel requires

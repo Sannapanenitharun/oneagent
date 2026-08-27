@@ -29,6 +29,17 @@
     "JournalctlPath": "",
     "CursorPath": "/var/lib/agent-i/journald.cursor"
   },
+  "Containers": {
+    "Enabled": false,
+    "DockerEndpoint": "/var/run/docker.sock",
+    "Interval": 15000000000,
+    "ExcludeImages": null,
+    "ExcludeNames": null,
+    "Logs": {
+      "Enabled": true,
+      "Root": "/var/lib/docker/containers"
+    }
+  },
   "AccessLogs": {
     "Enabled": false,
     "Paths": [
