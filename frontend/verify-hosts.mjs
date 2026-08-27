@@ -25,7 +25,7 @@ globalThis.window = {
 
 import {
   normalizeURL, parseHostSpec, normalizeHosts, hostLabel, toHostSpec,
-  loadHosts, saveHosts, resetHosts, configuredHosts,
+  loadHosts, saveHosts, resetHosts, configuredHosts, readHostSpec,
 } from "./src/hosts.js";
 
 let failed = 0;
@@ -151,6 +151,37 @@ console.log("loadHosts / saveHosts");
   saveHosts([{ name: "x", url: "http://127.0.0.1:9999" }]); // must not throw
   check("saving against unavailable storage does not throw", true);
   globalThis.window.localStorage = real;
+}
+
+// The host manager's textarea is the only control that removes a host, so what
+// it does with an empty box decides whether removal is possible at all. This is
+// the third guard in that flow to have blocked it; the first two were invisible
+// because nothing tested them.
+console.log("readHostSpec");
+{
+  const cleared = readHostSpec("");
+  check("an empty box applies an empty list", Array.isArray(cleared.hosts) && cleared.hosts.length === 0);
+  check("and is not an error", cleared.error === "");
+
+  const whitespace = readHostSpec("   \n\n  ");
+  check("whitespace only counts as cleared", Array.isArray(whitespace.hosts) && whitespace.hosts.length === 0);
+  check("whitespace is not an error either", whitespace.error === "");
+
+  // A typo must still be refused, or a mistyped address silently wipes the list.
+  const typo = readHostSpec("not a url at all");
+  check("unparseable text is refused", typo.hosts === null);
+  check("and explains itself", typo.error.includes("No usable addresses"));
+
+  const good = readHostSpec("web=127.0.0.1:8089");
+  check("a normal spec applies", good.hosts?.length === 1 && good.hosts[0].name === "web");
+  check("a normal spec has no error", good.error === "");
+
+  // Mixed input keeps what parsed rather than refusing the lot: the box is
+  // pasted into, and one bad line should not discard the good ones.
+  const mixed = readHostSpec("web=127.0.0.1:8089\n???");
+  check("a good line survives a bad one", mixed.hosts?.length === 1, JSON.stringify(mixed.hosts));
+
+  check("null input is treated as cleared", readHostSpec(null).hosts?.length === 0);
 }
 
 console.log(failed === 0 ? "\nOK — all host checks passed" : `\n${failed} check(s) failed`);

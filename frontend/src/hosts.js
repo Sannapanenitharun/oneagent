@@ -85,6 +85,32 @@ export function parseHostSpec(text) {
     .filter((h) => h.url);
 }
 
+// readHostSpec decides what the host manager should do with what was typed.
+//
+// The distinction it exists to make: an empty box and an unparseable one are
+// not the same input. Clearing the textarea is how the last host is removed —
+// there is no per-row delete — so refusing an empty result made removal
+// impossible through the only control that offers it, and said "No usable
+// addresses" while doing it, which describes a typo rather than the deliberate
+// clear it actually was.
+//
+// Returning null hosts means "do not apply, show this error". An empty array
+// means "apply an empty list", which is a supported state.
+//
+// This lives here rather than in the component because it is the third guard
+// in this flow to have silently blocked removing a host, and the other two
+// were invisible for the same reason: nothing tested them. See verify-hosts.
+export function readHostSpec(text) {
+  const hosts = parseHostSpec(text);
+  if (hosts.length === 0 && String(text || "").trim() !== "") {
+    return {
+      hosts: null,
+      error: "No usable addresses. Expected one per line, as name=url or a bare host:port.",
+    };
+  }
+  return { hosts, error: "" };
+}
+
 // normalizeHosts cleans a list and drops duplicates.
 //
 // The URL is the identity, not the name: two entries pointing at the same

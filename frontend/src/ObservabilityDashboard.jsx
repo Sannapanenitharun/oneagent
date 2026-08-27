@@ -13,7 +13,7 @@ import {
 
 import { useSnapshot, useHostHealth, useAllSnapshots } from "./api";
 import { useBackendFleet, useBackendSnapshot, chooseBackendFallback } from "./backend";
-import { loadHosts, saveHosts, parseHostSpec, toHostSpec, hostLabel, configuredHosts } from "./hosts";
+import { loadHosts, saveHosts, parseHostSpec, readHostSpec, toHostSpec, hostLabel, configuredHosts } from "./hosts";
 import { useTheme } from "./useTheme";
 import {
   deriveTraces, deriveEdges, layoutTopology, deriveTopologyNodes,
@@ -1776,12 +1776,16 @@ function HostManager({ hosts, setHosts, health, onClose }) {
   const [text, setText] = useState(() => toHostSpec(hosts));
   const [error, setError] = useState("");
 
+  // An emptied box removes every host; only text that was meant to be an
+  // address and is not gets refused. This textarea is the only control that
+  // removes a host, so refusing an empty result meant the last one could not
+  // be removed at all — and the message said "No usable addresses", which
+  // describes a typo rather than the deliberate clear it usually was.
+  // readHostSpec makes that call, where it can be tested.
   const apply = () => {
-    const parsed = parseHostSpec(text);
-    if (parsed.length === 0) {
-      // Refused rather than accepted: an empty list leaves the dashboard with
-      // nothing to talk to and no obvious way back.
-      setError("No usable addresses. Expected one per line, as name=url or a bare host:port.");
+    const { hosts: parsed, error: reason } = readHostSpec(text);
+    if (!parsed) {
+      setError(reason);
       return;
     }
     setHosts(parsed);
