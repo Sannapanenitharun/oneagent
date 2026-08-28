@@ -243,3 +243,47 @@ func TestDockerLogCollector_GlobCoversAllContainers(t *testing.T) {
 		t.Errorf("glob = %q, want the host-rooted json-file path", globs[0])
 	}
 }
+
+// refreshMetadata runs on the tail manager's goroutine, so the time it spends
+// waiting on the daemon is time the tailer is not reading files. Against a
+// wedged dockerd at the ordinary interval that is a permanent stall of the
+// request timeout every refresh period; backing off after a failure is what
+// keeps it negligible.
+func TestDockerLogCollector_BacksOffAfterAFailedRefresh(t *testing.T) {
+	c, _ := newTestLogCollector(t, 1024) // its endpoint does not exist, so every refresh fails
+
+	c.refreshMetadata()
+	if !c.metaFailed {
+		t.Fatal("a failed refresh was not recorded")
+	}
+	first := c.lastRefresh
+
+	// Well past the ordinary interval, nowhere near the retry interval.
+	c.lastRefresh = time.Now().Add(-(dockerMetaRefresh + time.Second))
+	held := c.lastRefresh
+	c.refreshMetadata()
+	if !c.lastRefresh.Equal(held) {
+		t.Error("retried at the ordinary interval after a failure; the backoff is not being applied")
+	}
+
+	// Past the retry interval, it tries again.
+	c.lastRefresh = time.Now().Add(-(dockerMetaRetry + time.Second))
+	c.refreshMetadata()
+	if c.lastRefresh.Equal(held) || !c.lastRefresh.After(first) {
+		t.Error("did not retry after the backoff elapsed; a daemon that came back would never be noticed")
+	}
+}
+
+// The ordinary interval must still apply when nothing is wrong, or a healthy
+// daemon is polled on every tick — twice a second by default.
+func TestDockerLogCollector_RateLimitsHealthyRefresh(t *testing.T) {
+	c, _ := newTestLogCollector(t, 1024)
+	c.metaFailed = false
+	c.lastRefresh = time.Now()
+	held := c.lastRefresh
+
+	c.refreshMetadata()
+	if !c.lastRefresh.Equal(held) {
+		t.Error("refreshed again immediately; the rate limit is not being applied")
+	}
+}

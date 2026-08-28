@@ -686,6 +686,48 @@ export function fmtAge(sec) {
   return `${Math.round(sec / 86400)}d`;
 }
 
+// hostStatus collapses a fleet row into the single state the table shows.
+//
+// It exists because that state is read in three places — the status cell, the
+// column sort, and the "N active" count — and deriving it three times produced
+// three different answers. A host that had registered with the backend but sent
+// no data, and whose last_seen was recent, rendered a green dot labelled
+// NO DATA, sorted among the healthy hosts, and was counted as active. The dot
+// said one thing and the word beside it said another.
+//
+// The precedence is: having sent no metrics outranks being recent. A row with
+// no readings cannot be called active whatever its timestamp says, because the
+// timestamp only records that something arrived carrying its identity — see
+// backendHostRow's hasMetrics.
+//
+// "no-metrics" and not "no-data", because host metrics are the only thing the
+// fleet query measures: /api/hosts returns cpu, mem, disk and load15 and
+// nothing else, so a host shipping logs with metrics.enabled false looks
+// identical here to one shipping nothing at all. Calling that "no data" would
+// repeat, one level down, exactly the overclaim this state was added to fix.
+//
+// hasMetrics is only set on backend-sourced rows. An agent-sourced row leaves
+// it undefined and keeps the original two states, which is right: reading an
+// agent directly means the data either came back or the poll failed, and there
+// is no third case.
+export function hostStatus(row) {
+  if (row?.hasMetrics === false) return "no-metrics";
+  return row?.active ? "active" : "inactive";
+}
+
+// statusRank orders the states for the sortable Status column, worst first, so
+// one sort direction puts what needs attention at the top.
+export function statusRank(row) {
+  switch (hostStatus(row)) {
+    case "inactive":
+      return 0;
+    case "no-metrics":
+      return 1;
+    default:
+      return 2;
+  }
+}
+
 export function hostRow(snap) {
   const base = deriveInfra(snap)[0];
   if (!base) return null;

@@ -19,6 +19,7 @@ import {
   deriveTraces, deriveEdges, layoutTopology, deriveTopologyNodes,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
   fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow, fmtAge,
+  hostStatus, statusRank,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -1355,7 +1356,9 @@ const HOST_COLUMNS = [
   // it is what you match against an alert or a console tab — that is a lookup,
   // and a lookup wants a column it can be sorted and scanned down.
   { id: "instanceId", label: "Host ID", get: (r) => r.instanceID || "", align: "left" },
-  { id: "status", label: "Status", get: (r) => (r.active ? 1 : 0), align: "left" },
+  // statusRank, not r.active: the column has three states and sorting on two
+  // of them interleaved the hosts that had sent nothing with the healthy ones.
+  { id: "status", label: "Status", get: (r) => statusRank(r), align: "left" },
   // How long since the host last reported.
   //
   // Without this, INACTIVE is a verdict with no evidence: a host that stopped
@@ -1490,7 +1493,10 @@ function FleetView({ entries, loading, source, sourceError, onOpen }) {
 
   const toggle = (id) =>
     setSort((s) => ({ col: id, dir: s.col === id && s.dir === "asc" ? "desc" : "asc" }));
-  const active = rows.filter((r) => r.row.active).length;
+  // Counted the same way the cell labels it. Counting r.active alone put
+  // hosts the table was calling NO DATA into the "N active" total in the line
+  // directly above them.
+  const active = rows.filter((r) => hostStatus(r.row) === "active").length;
 
   return (
     <div className="flex flex-col gap-3">
@@ -1578,21 +1584,28 @@ function FleetView({ entries, loading, source, sourceError, onOpen }) {
                     undefined and keeps the original two states. */}
                 <td className="px-3 py-2.5">
                   {(() => {
-                    const registeredOnly = row.hasMetrics === false;
-                    const tone = row.active ? "var(--good)" : registeredOnly ? "var(--warn)" : "var(--crit)";
-                    const label = registeredOnly ? "NO DATA" : row.active ? "ACTIVE" : "INACTIVE";
+                    // One derivation, used for the dot, the word and the
+                    // tooltip. Deriving the colour and the label separately is
+                    // what produced a green dot labelled NO DATA.
+                    const status = hostStatus(row);
+                    const tone =
+                      status === "no-metrics" ? "var(--warn)" : status === "active" ? "var(--good)" : "var(--crit)";
+                    const label =
+                      status === "no-metrics" ? "NO METRICS" : status === "active" ? "ACTIVE" : "INACTIVE";
                     return (
                       <span
                         className="inline-flex items-center gap-1.5 text-[10.5px] font-mono"
                         title={
-                          registeredOnly
-                            ? "The backend has this host in its inventory but no telemetry from it. " +
-                              "Check that the agent's exporter points here and that its ingest key is accepted."
+                          status === "no-metrics"
+                            ? "No host metrics from this host in the selected window. It may still be " +
+                              "sending logs or traces — the fleet query does not report those, so open it " +
+                              "to see. If it is empty too, the agent's exporter is probably pointing " +
+                              "elsewhere, or its ingest key is being refused."
                             : undefined
                         }
                       >
                         <span className="w-1.5 h-1.5 rounded-full" style={{ background: tone }} />
-                        <span style={{ color: row.active && !registeredOnly ? "var(--ink-3)" : tone }}>
+                        <span style={{ color: status === "active" ? "var(--ink-3)" : tone }}>
                           {label}
                         </span>
                       </span>
@@ -2191,10 +2204,10 @@ export default function ObservabilityDashboard() {
                   {backendFallback.matched
                     ? backendFallback.hasData
                       ? "This host is also reporting to the backend."
-                      : "The backend knows this host but has no telemetry from it."
+                      : "The backend knows this host but has no metrics from it."
                     : backendFallback.reporting > 0
                       ? `${backendFallback.reporting} host${backendFallback.reporting === 1 ? " is" : "s are"} reporting to the backend.`
-                      : `${backendFallback.total} host${backendFallback.total === 1 ? " is" : "s are"} registered with the backend, none reporting.`}
+                      : `${backendFallback.total} host${backendFallback.total === 1 ? " is" : "s are"} registered with the backend, none reporting metrics.`}
                 </span>{" "}
                 <button
                   onClick={() => setBackendHostID(backendFallback.hostID)}
@@ -2205,7 +2218,7 @@ export default function ObservabilityDashboard() {
                     ? `Read ${backendFallback.label} from the backend`
                     : backendFallback.hasData
                       ? `Open ${backendFallback.label}`
-                      : `Open ${backendFallback.label} (no data yet)`}
+                      : `Open ${backendFallback.label} (no metrics yet)`}
                 </button>
               </>
             )}

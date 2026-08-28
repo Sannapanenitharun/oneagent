@@ -37,8 +37,11 @@ type DockerLogCollector struct {
 	partial     map[string]string
 	discarding  map[string]bool
 	lastRefresh time.Time
-	selfID      string
-	send        func(Envelope)
+	// metaFailed remembers whether the last refresh failed, which is what
+	// selects the longer retry interval above.
+	metaFailed bool
+	selfID     string
+	send       func(Envelope)
 }
 
 // ContainerLogOptions configures container log collection.
@@ -65,6 +68,12 @@ const DefaultDockerLogRoot = "/var/lib/docker/containers"
 // refresh, and those lines are labelled by id until it does rather than being
 // dropped.
 const dockerMetaRefresh = 30 * time.Second
+
+// dockerMetaRetry is how long to wait after a failed refresh. Long, because a
+// daemon that just refused to answer is not usually about to start, and every
+// attempt costs the tailer the full request timeout. Container names go stale
+// meanwhile; log lines keep flowing, labelled by id.
+const dockerMetaRetry = 5 * time.Minute
 
 // dockerLogLine is one record as the json-file driver writes it.
 type dockerLogLine struct {
@@ -139,7 +148,20 @@ func (c *DockerLogCollector) Stop() error {
 // unavailable should not blank the labels on every log line meanwhile.
 func (c *DockerLogCollector) refreshMetadata() {
 	now := time.Now()
-	if !c.lastRefresh.IsZero() && now.Sub(c.lastRefresh) < dockerMetaRefresh {
+	// A failed refresh waits far longer than a successful one before trying
+	// again. This call runs on the tail manager's goroutine, so the time it
+	// spends waiting on the daemon is time the tailer is not reading files —
+	// negligible against a healthy local socket answering in milliseconds, but
+	// a wedged dockerd holds it for the full timeout, and at the ordinary
+	// interval that would stall log collection for three seconds out of every
+	// thirty, indefinitely. Backing off turns a permanent 10% stall into a
+	// negligible one while still recovering on its own once the daemon
+	// returns.
+	wait := dockerMetaRefresh
+	if c.metaFailed {
+		wait = dockerMetaRetry
+	}
+	if !c.lastRefresh.IsZero() && now.Sub(c.lastRefresh) < wait {
 		return
 	}
 	c.lastRefresh = now
@@ -148,8 +170,10 @@ func (c *DockerLogCollector) refreshMetadata() {
 	defer cancel()
 	listed, err := c.docker.Containers(ctx)
 	if err != nil {
+		c.metaFailed = true
 		return
 	}
+	c.metaFailed = false
 	next := make(map[string]dockerContainer, len(listed))
 	for _, ct := range listed {
 		next[ct.ID] = ct

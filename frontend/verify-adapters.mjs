@@ -16,6 +16,7 @@ import {
   alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
   parseLogBody, flattenFields, ADAPTER_VERSION, CONTRACT, contractMatches,
   hostRow, deriveTopologyNodes, peerName, peerType, fmtAge,
+  hostStatus, statusRank,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -519,6 +520,37 @@ console.log("envelope rate");
   // A zero or negative started_at is not a timestamp.
   const bogus = globalStats({ now: T0, started_at: 0, retain_sec: 900, counts: { a: 900 }, series: [], logs: [], spans: [] });
   check("a zero started_at falls through to the window", bogus.rateBasis === "over the window", bogus.rateBasis);
+}
+
+// The fleet table reads a host's state in three places — the status cell, the
+// column sort, and the "N active" count. Deriving it three times gave three
+// answers: a host that had registered with the backend and sent nothing, whose
+// last_seen was recent, drew a green dot labelled NO DATA, sorted among the
+// healthy hosts, and was counted as active.
+console.log("hostStatus");
+{
+  check("no metrics outranks a recent timestamp",
+    hostStatus({ active: true, hasMetrics: false }) === "no-metrics");
+  check("reporting and recent is active",
+    hostStatus({ active: true, hasMetrics: true }) === "active");
+  check("reporting but stale is inactive",
+    hostStatus({ active: false, hasMetrics: true }) === "inactive");
+  check("silent and stale is still no-metrics",
+    hostStatus({ active: false, hasMetrics: false }) === "no-metrics");
+
+  // Agent-sourced rows have no hasMetrics at all and must keep the original
+  // two states: a direct poll either returned data or failed, with no third
+  // case to represent.
+  check("an agent row with no field is active", hostStatus({ active: true }) === "active");
+  check("an agent row with no field is inactive", hostStatus({ active: false }) === "inactive");
+  check("a missing row does not throw", hostStatus(undefined) === "inactive");
+
+  // Worst first, so one sort direction puts what needs attention on top.
+  check("inactive sorts worst", statusRank({ active: false, hasMetrics: true }) === 0);
+  check("no-metrics sorts between", statusRank({ active: true, hasMetrics: false }) === 1);
+  check("active sorts best", statusRank({ active: true, hasMetrics: true }) === 2);
+  check("no-metrics does not sort with the healthy hosts",
+    statusRank({ active: true, hasMetrics: false }) < statusRank({ active: true, hasMetrics: true }));
 }
 
 console.log(failed === 0 ? "\nOK — all adapter checks passed" : `\n${failed} check(s) failed`);
