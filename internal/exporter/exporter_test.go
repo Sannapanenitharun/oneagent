@@ -1,11 +1,14 @@
 package exporter
 
 import (
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -206,5 +209,64 @@ func TestHTTPExporter_CloseFlushesRemainingBuffer(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not flush the buffered envelopes")
+	}
+}
+
+// The stdout exporter is the shipped default, so a fresh install collects
+// correctly, reports healthy, and delivers nothing. On a systemd host the
+// envelopes land in the journal and are rotated away, which means the evidence
+// that collection works is also the reason the missing delivery goes unnoticed.
+// It has to announce itself.
+func TestNew_StdoutExporterAnnouncesThatItSendsNowhere(t *testing.T) {
+	for _, tc := range []struct{ name, typ, want string }{
+		{"explicit", "stdout", `"stdout"`},
+		// An unset value is worth distinguishing: the operator never chose it.
+		{"unset", "", `"stdout (unset)"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := log.Writer()
+			log.SetOutput(&buf)
+			defer log.SetOutput(prev)
+
+			exp, err := New(config.ExporterConfig{Type: tc.typ}, nil)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer exp.Close()
+
+			out := buf.String()
+			if !strings.Contains(out, "sent NOWHERE") {
+				t.Errorf("startup said nothing about telemetry going nowhere; got %q", out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("message does not name the configured type %s; got %q", tc.want, out)
+			}
+			// The message is useless without the way out of it.
+			if !strings.Contains(out, "otlp_http") {
+				t.Errorf("message does not say what to set instead; got %q", out)
+			}
+		})
+	}
+}
+
+// A configured sink must not be told it is going nowhere — a false warning on
+// a working deployment trains people to ignore the real one.
+func TestNew_ConfiguredExporterIsNotWarnedAbout(t *testing.T) {
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	exp, err := New(config.ExporterConfig{
+		Type: "otlp_http", Endpoint: "http://127.0.0.1:4318", QueueSize: 4,
+	}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer exp.Close()
+
+	if strings.Contains(buf.String(), "sent NOWHERE") {
+		t.Errorf("an otlp_http exporter was warned about as if it were stdout: %q", buf.String())
 	}
 }

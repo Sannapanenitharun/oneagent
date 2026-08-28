@@ -39,6 +39,25 @@ type Exporter interface {
 func New(cfg config.ExporterConfig, retire func(collector.Envelope)) (Exporter, error) {
 	switch cfg.Type {
 	case "stdout", "":
+		// Said out loud, because this is the configuration that looks most like
+		// a working one and is not.
+		//
+		// stdout is the shipped default, so a fresh install collects correctly,
+		// reports healthy, prints every envelope — and delivers nothing. On a
+		// systemd host those envelopes go to the journal and are discarded by
+		// its rotation, so the evidence that it was working is also the reason
+		// nobody notices it is not. Diagnosing it means reading the journal
+		// closely enough to realise the JSON in it IS the telemetry rather than
+		// a debug trace of it, which is not an obvious leap.
+		//
+		// A warning rather than an error: stdout is genuinely the right choice
+		// for a local run or a container you are watching, and refusing to
+		// start would break that. But it should never be silent, which is the
+		// same rule the spool applies a few lines below.
+		log.Printf("exporter: type is %q — telemetry is written to this process's standard output and "+
+			"sent NOWHERE. On a systemd host it lands in the journal and is rotated away. Set "+
+			"exporter.type to \"otlp_http\" with an endpoint to ship it to a backend.",
+			exporterTypeLabel(cfg.Type))
 		return withRetire(&stdoutExporter{}, retire), nil
 	case "file":
 		f, err := newFileExporter(cfg.Path)
@@ -74,6 +93,16 @@ func New(cfg config.ExporterConfig, retire func(collector.Envelope)) (Exporter, 
 	default:
 		return nil, fmt.Errorf("unknown exporter type %q", cfg.Type)
 	}
+}
+
+// exporterTypeLabel names the type in a message, distinguishing a deliberate
+// "stdout" from an absent value that defaulted to it — the second is worth
+// separating because the operator never chose it.
+func exporterTypeLabel(t string) string {
+	if t == "" {
+		return "stdout (unset)"
+	}
+	return t
 }
 
 // openConfiguredSpool builds the disk spool, if one is wanted.
