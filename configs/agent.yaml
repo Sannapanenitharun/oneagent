@@ -319,7 +319,12 @@ traces:
 exporter:
   type: "stdout"   # "stdout" | "file" | "http" (our own JSON format) | "otlp_http" (real OTLP — use this for any OTLP-native backend)
   # path: "/var/log/agent-i/export.jsonl"                    # file exporter
-  # endpoint: "http://169.58.93.233:4318"                           # otlp_http: base URL of the OTLP receiver — no trailing /v1/... path, that's added automatically per signal type
+  # A documentation address on purpose. example.com is IANA-reserved and
+  # resolves to nothing anyone runs, so uncommenting this line without editing
+  # it fails loudly instead of shipping this host's metrics, logs and trace
+  # contents to a stranger. It previously named a real routable IP, which is
+  # exactly the line an operator uncomments when switching off stdout.
+  # endpoint: "http://backend.example.com:4318"                      # otlp_http: base URL of the OTLP receiver — no trailing /v1/... path, that's added automatically per signal type
   # headers_env:                                                    # otlp_http/http: header name -> env var holding its value (never put the key directly in this file)
   #   x-ingestion-key: "OTLP_INGESTION_KEY"
   # batch_size: 100          # envelopes per POST before a count-triggered flush

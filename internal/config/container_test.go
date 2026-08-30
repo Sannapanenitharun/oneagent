@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"net"
+	"os"
+	"regexp"
+	"testing"
+)
 
 // The container image bakes deploy/agent-container.yaml in at build time, so a
 // typo in it does not surface until someone runs the image and the agent exits
@@ -51,5 +56,39 @@ func TestLoad_ContainerConfigParses(t *testing.T) {
 	if cfg.Exporter.Spool.Dir != "/var/lib/agent-i/spool" {
 		t.Errorf("exporter.spool.dir = %q, want it under the /var/lib/agent-i volume",
 			cfg.Exporter.Spool.Dir)
+	}
+}
+
+// The shipped config must not name a routable address in its examples.
+//
+// It used to. The commented endpoint carried a real public IP, sitting one line
+// under the type: field — which is precisely the line an operator uncomments
+// when switching an agent off stdout. Uncommenting it without also editing it
+// ships that host's metrics, logs and trace contents to a machine its owner has
+// no relationship with, and nothing about the agent's behaviour would look
+// wrong while it happened.
+//
+// Loopback, link-local (IMDS) and RFC1918 are fine: none of them leaves the
+// operator's own network. Anything else is not an example, it is a destination.
+func TestShippedConfig_HasNoRoutableExampleAddress(t *testing.T) {
+	raw, err := os.ReadFile("../../configs/agent.yaml")
+	if err != nil {
+		t.Fatalf("reading shipped config: %v", err)
+	}
+
+	// Any dotted quad appearing in a URL.
+	re := regexp.MustCompile(`https?://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+	for _, m := range re.FindAllStringSubmatch(string(raw), -1) {
+		ip := net.ParseIP(m[1])
+		if ip == nil {
+			t.Errorf("unparseable address in the shipped config: %q", m[1])
+			continue
+		}
+		if ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		t.Errorf("shipped config names the routable address %s — an operator who uncomments "+
+			"that line without editing it sends this host's telemetry to a stranger. Use a "+
+			"reserved documentation name such as backend.example.com instead.", m[1])
 	}
 }
