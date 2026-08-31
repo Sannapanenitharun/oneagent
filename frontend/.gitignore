@@ -4,3 +4,9 @@ dist/
 # Snapshot payloads captured from a live agent for local debugging. Real host
 # data (mount points, hostnames, log lines) — not something to commit.
 .snapshot-sample.json
+
+# Dev server output, when vite is started detached rather than in a terminal
+# you are watching. Machine-specific paths and whatever the run happened to
+# log; useful locally, noise in a diff.
+.vite-dev.log
+.vite-dev.err.log

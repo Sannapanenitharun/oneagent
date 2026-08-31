@@ -50,6 +50,44 @@ layer that failed: a proxy that cannot reach its upstream is reported as such,
 never as an error from the agent, which returns 200 on this endpoint or
 nothing at all.
 
+## Watching several servers at once
+
+The host list lives in the browser and is edited in the UI — the picker in the
+header, then the button beside it. Add a server while the dashboard is running;
+no restart, and no rebuild.
+
+For a handful of servers, especially across different accounts, bring the
+tunnels up together:
+
+```bash
+cat > hosts.txt <<'EOF'
+# name        ssh target                identity (optional)
+prod-web-1    ec2-user@54.209.31.122    ~/.ssh/prod.pem
+prod-web-2    ec2-user@54.210.11.9      ~/.ssh/prod.pem
+staging-api   ubuntu@18.201.4.7         ~/.ssh/staging.pem
+EOF
+
+scripts/dev-tunnels.sh hosts.txt
+```
+
+Local ports are assigned in order from 8089, and the script prints the list in
+the format the host manager accepts — paste it in and every server appears. The
+per-host identity column is what makes several AWS accounts work from one file.
+
+`AGENT_I_HOSTS` still works and still takes the same `name=url` form, but it
+only seeds an empty list on first run; after that the browser's copy wins.
+"Restore from AGENT_I_HOSTS" in the manager goes back to it.
+
+Two hosts or more turns on the Fleet view: one row per server, sortable, with
+instance id, type, zone and account from each host's own cloud metadata, and the
+distribution and kernel read from the host itself. Account and OS are both
+sortable because the questions they answer are grouping questions — "show me
+everything in this account", "which boxes are still on the old image" — not
+questions about one row. Everything
+else — metrics, traces, logs — stays one host at a time, because each agent
+answers only for itself. A genuinely aggregated view needs a backend that
+collects from all of them, which is what the `otlp_http` exporter is for.
+
 ## What is live and what is not
 
 Everything is derived client-side in `src/adapters.js` from the raw snapshot.

@@ -1,5 +1,5 @@
 {
-  "AgentID": "host-001",
+  "AgentID": "",
   "Interval": 15000000000,
   "Metrics": {
     "Enabled": true,
@@ -18,6 +18,26 @@
       "StartPattern": "^\\d{4}-\\d{2}-\\d{2}",
       "MaxLines": 500,
       "Timeout": 2000000000
+    }
+  },
+  "Journald": {
+    "Enabled": false,
+    "Units": null,
+    "ExcludeUnits": null,
+    "Priority": "",
+    "Since": "",
+    "JournalctlPath": "",
+    "CursorPath": "/var/lib/agent-i/journald.cursor"
+  },
+  "Containers": {
+    "Enabled": false,
+    "DockerEndpoint": "/var/run/docker.sock",
+    "Interval": 15000000000,
+    "ExcludeImages": null,
+    "ExcludeNames": null,
+    "Logs": {
+      "Enabled": true,
+      "Root": "/var/lib/docker/containers"
     }
   },
   "AccessLogs": {
@@ -45,6 +65,8 @@
     "ListenAddr": "127.0.0.1:4319",
     "MaxRequestBytes": 4194304,
     "AuthTokenEnv": "",
+    "AcceptLogs": true,
+    "AcceptMetrics": true,
     "Sampling": {
       "Enabled": false,
       "Rate": 1,
@@ -70,7 +92,14 @@
     "MaxRetries": 0,
     "MaxBatchBytes": 0,
     "QueueSize": 0,
-    "ShutdownTimeout": 0
+    "ShutdownTimeout": 0,
+    "Spool": {
+      "Enabled": true,
+      "Dir": "/var/lib/agent-i/spool",
+      "MaxBytes": 134217728,
+      "SegmentBytes": 8388608,
+      "SyncInterval": 1000000000
+    }
   },
   "Aggregation": {
     "Enabled": false,

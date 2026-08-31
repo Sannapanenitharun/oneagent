@@ -55,7 +55,7 @@ func (alwaysFailExporter) Close() error                    { return nil }
 
 func TestAsyncExporter_RetiresOnSuccessfulDelivery(t *testing.T) {
 	rec := &retireRecorder{}
-	a := newAsyncExporter(&okExporter{}, 16, time.Second, rec.fn())
+	a := newAsyncExporter(&okExporter{}, 16, time.Second, rec.fn(), nil)
 	defer a.Close()
 
 	for i := 0; i < 5; i++ {
@@ -70,7 +70,7 @@ func TestAsyncExporter_RetiresOnSuccessfulDelivery(t *testing.T) {
 // reported as settled, so the line behind it is read again next time.
 func TestAsyncExporter_DoesNotRetireFailedSends(t *testing.T) {
 	rec := &retireRecorder{}
-	a := newAsyncExporter(alwaysFailExporter{}, 16, 50*time.Millisecond, rec.fn())
+	a := newAsyncExporter(alwaysFailExporter{}, 16, 50*time.Millisecond, rec.fn(), nil)
 	defer a.Close()
 
 	if err := a.Export(collector.Envelope{Source: "doomed"}); err != nil {
@@ -91,7 +91,7 @@ func TestAsyncExporter_RetiresShedEnvelopes(t *testing.T) {
 	rec := &retireRecorder{}
 	// A blocking inner exporter keeps the sender busy so the queue really fills.
 	block := make(chan struct{})
-	a := newAsyncExporter(blockingExporter{release: block}, 2, 50*time.Millisecond, rec.fn())
+	a := newAsyncExporter(blockingExporter{release: block}, 2, 50*time.Millisecond, rec.fn(), nil)
 
 	for i := 0; i < 20; i++ {
 		if err := a.Export(collector.Envelope{Source: "flood"}); err != nil {

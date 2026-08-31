@@ -6,13 +6,29 @@
 # it could not apply. A file that fails to parse is reported and ignored; the
 # agent keeps running on the configuration it already has.
 
-agent_id: "host-001"
+# How this agent names itself in every signal it emits.
+#
+# Left empty, it is worked out at startup from the machine itself, in order:
+# the EC2 instance's Name tag, then the EC2 instance id, then the hostname.
+# That default is the useful one for an unattended install — a fixed value
+# shipped here would make every host in a fleet report under the same name.
+#
+# Set it to override, when the machine should be known by something other than
+# what it calls itself. Changing it needs a restart, not a reload.
+agent_id: ""
 interval: 15s
 
 # Label telemetry with the EC2 instance it came from, so a backend shows this
 # host as a specific instance rather than an anonymous Linux box. Adds the
 # standard OTel attributes: cloud.provider, cloud.platform, cloud.account.id,
 # cloud.region, cloud.availability_zone, host.type, host.image.id.
+#
+# Also adds host.name, the instance's Name tag — but only where the instance
+# exposes tags through IMDS, which is off by default. Turn it on per instance
+# at launch with --metadata-options InstanceMetadataTags=enabled, or after the
+# fact with `aws ec2 modify-instance-metadata-options --instance-metadata-tags
+# enabled`. Without it the tag is simply absent; nothing else changes, and the
+# agent does not fall back to querying the EC2 API for it.
 #
 # This needs NO AWS credentials and no IAM permission. It reads the Instance
 # Metadata Service at 169.254.169.254 — a link-local address reachable only
@@ -33,6 +49,73 @@ ec2_metadata:
 metrics:
   enabled: true
   collect: ["cpu", "memory"]
+
+# The systemd journal — the operating system's own logs (sshd, the kernel, unit
+# failures, authentication). These are not files, so the paths above cannot
+# reach them: journald keeps its own compressed binary store.
+#
+# Off by default, the same way Datadog and Dynatrace make it opt-in, because it
+# needs the agent user in the systemd-journal group. The installers add that
+# group, so on a host installed by them enabling this is the only step.
+#
+# Read by running journalctl and parsing its JSON, rather than by linking
+# libsystemd the way the commercial agents do. That would need cgo, and this
+# agent ships as a single static binary with no runtime dependencies — the
+# property that lets get.sh drop one file onto a host. The OpenTelemetry
+# Collector's journald receiver makes the same trade.
+#
+# With enabled: true and journalctl missing, the agent fails to start rather
+# than running without OS logs. Silently collecting nothing is the failure this
+# exists to prevent.
+journald:
+  enabled: false
+  # Limit to specific units. Empty collects the whole journal, which is usually
+  # what you want — the interesting entry tends to come from a unit nobody
+  # thought to list.
+  # units: ["sshd.service", "kubelet.service"]
+  # Drop named units. journalctl has no exclusion flag, so this is applied by
+  # the agent after reading.
+  # exclude_units: ["session-*.scope"]
+  # Keep this syslog level and more severe: emerg, alert, crit, err, warning,
+  # notice, info, debug. Empty keeps everything.
+  # priority: "warning"
+  # Where to start on a host with no stored position. Empty starts at the end
+  # of the journal rather than replaying however much history it retains.
+  # since: "-1h"
+  # Position of the last entry known to have been exported, so a restart
+  # resumes instead of skipping or repeating. Committed only once the exporter
+  # has taken the entry — the same rule the file tailer's offsets follow.
+  cursor_path: "/var/lib/agent-i/journald.cursor"
+
+# Per-container metrics and container stdout/stderr, on a Docker host.
+#
+# Off by default: on a host with no containers this would learn that again every
+# interval, and on one that runs them it multiplies the series count by however
+# many are running. The container image ships with it on — see deploy/README.md.
+#
+# Metrics are read from the cgroup v2 filesystem, not from the Docker daemon.
+# The socket below is used only to turn container ids into names and images; an
+# unreachable socket costs you the labels, not the data. cgroup v1 hosts are
+# detected and reported at startup rather than silently collecting nothing.
+containers:
+  enabled: false
+  # Engine API socket. Mount it read-only — the agent only ever issues GETs.
+  docker_endpoint: "/var/run/docker.sock"
+  # Defaults to the top-level interval. Worth raising on a host running
+  # hundreds of containers: their count changes far more slowly than CPU does.
+  # interval: 30s
+  # Substring matches against the image reference and the container name. The
+  # agent's own container is always excluded and does not need listing here.
+  # exclude_images: ["pause", "k8s.gcr.io/"]
+  # exclude_names: ["buildkit"]
+  logs:
+    # Absent means on whenever containers.enabled is true.
+    enabled: true
+    # The json-file log driver's directory. Change it only on a host with a
+    # relocated Docker data-root. A host using the journald or a remote log
+    # driver has no files here, and the agent says so rather than appearing to
+    # watch containers that never log.
+    root: "/var/lib/docker/containers"
 
 logs:
   enabled: true
@@ -175,12 +258,23 @@ dashboard:
   # the view is incomplete instead of quietly showing a subset.
   max_series: 500
 
+# Despite the name, this block configures the whole OTLP receiver, not only
+# traces. One listener serves all three signals, because an SDK configured with
+# OTEL_EXPORTER_OTLP_ENDPOINT — which is what auto-instrument.sh sets — sends
+# every signal to one base URL:
+#
+#   POST /v1/traces    spans from instrumented apps
+#   POST /v1/logs      application logs (accept_logs)
+#   POST /v1/metrics   application metrics (accept_metrics)
+#
+# The block is still called "traces" because renaming it would break every
+# existing config file for a cosmetic gain.
 traces:
   enabled: true
-  # OTLP/HTTP endpoint: POST /v1/traces, accepting both JSON and binary
-  # protobuf. Loopback by default: apps instrumented by auto-instrument.sh
-  # always send to localhost, and a receiver on 0.0.0.0 lets anything that can
-  # reach this host inject spans into your backend.
+  # OTLP/HTTP endpoint, accepting both JSON and binary protobuf. Loopback by
+  # default: apps instrumented by auto-instrument.sh always send to localhost,
+  # and a receiver on 0.0.0.0 lets anything that can reach this host inject
+  # telemetry into your backend.
   listen_addr: "127.0.0.1:4319"
   # Cap on a single request body. The protobuf path must read the whole body
   # into memory before it can decode it.
@@ -189,6 +283,18 @@ traces:
   # "Authorization: Bearer <token>". Set this if you ever move listen_addr off
   # loopback; put the value in /etc/agent-i/env.
   # auth_token_env: "AGENT_I_TRACE_TOKEN"
+
+  # The other two signals on this same listener. Both default to true: before
+  # they existed an auto-instrumented app posted its metrics and logs here and
+  # got 404s, so its traces arrived and the other two were silently lost.
+  #
+  # Turn one off and its path stops being served entirely — the app's exporter
+  # gets a 404 for that signal, exactly as before. Worth considering for
+  # metrics on a host with a large number of application series, since the
+  # local dashboard retains a bounded number of them and reports the rest as
+  # dropped.
+  accept_logs: true
+  accept_metrics: true
 
   # RED metrics (count, errors, latency distribution) computed over 100% of
   # spans. Computed BEFORE sampling, so these counts stay exact no matter how
@@ -213,7 +319,12 @@ traces:
 exporter:
   type: "stdout"   # "stdout" | "file" | "http" (our own JSON format) | "otlp_http" (real OTLP — use this for any OTLP-native backend)
   # path: "/var/log/agent-i/export.jsonl"                    # file exporter
-  # endpoint: "http://169.58.93.233:4318"                           # otlp_http: base URL of the OTLP receiver — no trailing /v1/... path, that's added automatically per signal type
+  # A documentation address on purpose. example.com is IANA-reserved and
+  # resolves to nothing anyone runs, so uncommenting this line without editing
+  # it fails loudly instead of shipping this host's metrics, logs and trace
+  # contents to a stranger. It previously named a real routable IP, which is
+  # exactly the line an operator uncomments when switching off stdout.
+  # endpoint: "http://backend.example.com:4318"                      # otlp_http: base URL of the OTLP receiver — no trailing /v1/... path, that's added automatically per signal type
   # headers_env:                                                    # otlp_http/http: header name -> env var holding its value (never put the key directly in this file)
   #   x-ingestion-key: "OTLP_INGESTION_KEY"
   # batch_size: 100          # envelopes per POST before a count-triggered flush
@@ -239,3 +350,19 @@ exporter:
   # backend cannot stall collection. These bound that buffer:
   # queue_size: 4096         # envelopes buffered before the oldest are dropped (drops are logged)
   # shutdown_timeout: 5s     # bound on the final flush attempt at SIGTERM
+
+  # That buffer is in memory, so on its own it bounds an outage to queue_size
+  # envelopes and loses everything in it on restart. The spool moves the
+  # overflow to disk, which is what makes an outage or a restart survivable
+  # rather than merely brief. It matters most for spans, logs and metrics
+  # pushed into the OTLP receiver: unlike a tailed file or the journal, the
+  # application will not offer them a second time.
+  #
+  # Nothing is written while the backend is keeping up — envelopes reach the
+  # disk only once the queue above has overflowed, or at shutdown.
+  spool:
+    enabled: true
+    dir: "/var/lib/agent-i/spool"
+    max_bytes: 134217728     # 128 MiB; past this the oldest segment is discarded, so a backlog can never fill the disk
+    segment_bytes: 8388608   # 8 MiB per file; a fully-delivered file is deleted outright, so nothing is ever rewritten
+    sync_interval: 1s        # how long a written envelope may sit in the page cache before fsync — the power-loss window

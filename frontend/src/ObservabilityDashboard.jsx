@@ -8,15 +8,18 @@ import {
   Cpu, MemoryStick, Gauge, Search, Bell, ChevronRight,
   LayoutDashboard, ScrollText, Waypoints, HardDrive,
   Network, PlugZap, Pause, Play, Sun, Moon, Monitor,
-  ChevronUp, ChevronDown, X, Braces,
+  ChevronUp, ChevronDown, X, Braces, Settings,
 } from "lucide-react";
 
-import { useSnapshot, useHostHealth, useAllSnapshots, HOSTS } from "./api";
+import { useSnapshot, useHostHealth, useAllSnapshots } from "./api";
+import { useBackendFleet, useBackendSnapshot, chooseBackendFallback } from "./backend";
+import { loadHosts, saveHosts, parseHostSpec, readHostSpec, toHostSpec, hostLabel, configuredHosts } from "./hosts";
 import { useTheme } from "./useTheme";
 import {
-  deriveTraces, deriveEdges, layoutTopology,
+  deriveTraces, deriveEdges, layoutTopology, deriveTopologyNodes,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
-  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow,
+  fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow, fmtAge,
+  hostStatus, statusRank,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -227,36 +230,94 @@ function ThemeSwitch({ theme, setTheme }) {
   );
 }
 
-function TopologyGraph({ services, edges, positions, selected, onSelect }) {
-  if (!services.length) return <EmptyHint>no services — send spans to the agent's OTLP receiver</EmptyHint>;
+// TopologyGraph draws the derived service map.
+//
+// Three things are encoded, because a map where every dependency looks
+// identical answers none of the questions a map is opened to answer:
+//
+//   thickness  call volume, relative to the busiest edge — which path
+//              carries the traffic
+//   colour     failure, on the edge and on the node it points at — which
+//              path is breaking, following the convention every commercial
+//              map uses of colouring the failing call rather than only the
+//              failing service
+//   shape      whether the far side is instrumented. A dashed node is an
+//              inferred dependency: a database, queue or third-party API
+//              that never reported a span and is known only because
+//              something called it.
+function TopologyGraph({ nodes, edges, positions, height, selected, onSelect }) {
+  if (!nodes.length) return <EmptyHint>no services — send spans to the agent&apos;s OTLP receiver</EmptyHint>;
+  const maxCalls = Math.max(1, ...edges.map((e) => e.calls));
+
   return (
-    <svg viewBox="0 0 460 190" className="w-full h-[220px]">
+    <svg viewBox={`0 0 460 ${height}`} className="w-full" style={{ height: Math.max(220, height + 30) }}>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
           <path d="M0,0 L8,4 L0,8 z" fill="var(--n5)" />
         </marker>
+        <marker id="arrow-bad" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path d="M0,0 L8,4 L0,8 z" fill="var(--crit)" />
+        </marker>
       </defs>
-      {edges.map(([from, to], i) => {
-        const a = positions[from], b = positions[to];
+
+      {edges.map((e, i) => {
+        const a = positions[e.from], b = positions[e.to];
         if (!a || !b) return null;
-        return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="var(--n5)" strokeWidth="1.5" markerEnd="url(#arrow)" />;
+        const failing = e.errPct > 1;
+        // Square-rooted so one very busy edge does not flatten every other
+        // one to a hairline; the eye reads area, not magnitude.
+        const w = 1 + 3 * Math.sqrt(e.calls / maxCalls);
+        const dim = selected && e.from !== selected && e.to !== selected;
+        return (
+          <line
+            key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+            stroke={failing ? "var(--crit)" : "var(--n5)"}
+            strokeWidth={w}
+            strokeDasharray={e.virtual ? "4 3" : undefined}
+            opacity={dim ? 0.25 : 1}
+            markerEnd={failing ? "url(#arrow-bad)" : "url(#arrow)"}
+          >
+            <title>
+              {`${e.from} → ${e.to}\n${e.calls} call${e.calls === 1 ? "" : "s"}, ${e.errPct}% errors\np50 ${e.p50}ms · p99 ${e.p99}ms${e.virtual ? "\ninferred — the far side is not instrumented" : ""}`}
+            </title>
+          </line>
+        );
       })}
-      {services.map((s) => {
+
+      {nodes.map((s) => {
         const p = positions[s.id];
         if (!p) return null;
         const isSelected = selected === s.id;
+        const tone = statusColor[s.status] || statusColor.healthy;
+        const dim = selected && !isSelected &&
+          !edges.some((e) => (e.from === selected && e.to === s.id) || (e.to === selected && e.from === s.id));
         return (
-          <g key={s.id} transform={`translate(${p.x},${p.y})`} className="cursor-pointer" onClick={() => onSelect(s.id)}>
+          <g key={s.id} transform={`translate(${p.x},${p.y})`} className="cursor-pointer"
+             opacity={dim ? 0.35 : 1} onClick={() => onSelect(s.id)}>
+            <title>
+              {s.virtual
+                ? `${s.label}\ninferred ${s.type} dependency — never reported a span\n${s.calls} inbound call${s.calls === 1 ? "" : "s"}, ${s.err}% errors`
+                : `${s.label}\n${fmtRps(s.rps)} rps · ${s.err}% errors · p99 ${s.p99}ms`}
+            </title>
             {s.status !== "healthy" && (
-              <circle r="20" fill={statusColor[s.status]} opacity="0.15">
+              <circle r="20" fill={tone} opacity="0.15">
                 <animate attributeName="r" values="14;24;14" dur="2s" repeatCount="indefinite" />
                 <animate attributeName="opacity" values="0.25;0;0.25" dur="2s" repeatCount="indefinite" />
               </circle>
             )}
-            <circle r="13" fill="var(--n2)" stroke={isSelected ? "var(--accent)" : statusColor[s.status]} strokeWidth={isSelected ? 2.5 : 1.5} />
-            <circle r="3.5" fill={statusColor[s.status]} />
-            <text y="26" textAnchor="middle" className="font-mono" fontSize="9.5" fill={isSelected ? "var(--accent)" : "var(--ink-3)"}>
-              {s.label}
+            <circle
+              r="13"
+              fill="var(--n2)"
+              stroke={isSelected ? "var(--accent)" : tone}
+              strokeWidth={isSelected ? 2.5 : 1.5}
+              strokeDasharray={s.virtual ? "3 2" : undefined}
+            />
+            {s.virtual
+              ? <VirtualGlyph type={s.type} tone={tone} />
+              : <circle r="3.5" fill={tone} />}
+            <text y="26" textAnchor="middle" className="font-mono" fontSize="9.5"
+                  fill={isSelected ? "var(--accent)" : "var(--ink-3)"}>
+              {s.label.length > 22 ? `${s.label.slice(0, 21)}…` : s.label}
             </text>
           </g>
         );
@@ -265,9 +326,31 @@ function TopologyGraph({ services, edges, positions, selected, onSelect }) {
   );
 }
 
+// VirtualGlyph marks an inferred node by what it is, so a datastore is
+// distinguishable from a queue at a glance rather than only by reading labels.
+function VirtualGlyph({ type, tone }) {
+  if (type === "database") {
+    return (
+      <g fill="none" stroke={tone} strokeWidth="1.2">
+        <ellipse cx="0" cy="-3" rx="4.5" ry="1.8" />
+        <path d="M-4.5,-3 L-4.5,3 A4.5,1.8 0 0 0 4.5,3 L4.5,-3" />
+      </g>
+    );
+  }
+  if (type === "messaging") {
+    return (
+      <g fill="none" stroke={tone} strokeWidth="1.2">
+        <rect x="-5" y="-3.5" width="10" height="7" rx="1" />
+        <path d="M-5,-3.5 L0,0.5 L5,-3.5" />
+      </g>
+    );
+  }
+  return <circle r="3.5" fill="none" stroke={tone} strokeWidth="1.2" />;
+}
+
 function ServiceDetail({ svc, edges }) {
   if (!svc) return <EmptyHint>no service selected</EmptyHint>;
-  const related = (edges || []).filter(([f, t]) => f === svc.id || t === svc.id);
+  const related = (edges || []).filter((e) => e.from === svc.id || e.to === svc.id);
   return (
     <>
       <div className="flex items-center justify-between mb-3">
@@ -286,11 +369,27 @@ function ServiceDetail({ svc, edges }) {
         <>
           <div className="text-[10px] text-[var(--ink-3)] font-mono uppercase mb-1.5">Upstream / Downstream</div>
           <div className="flex flex-col gap-1">
-            {related.map(([from, to], i) => (
+            {related.map((e, i) => (
               <div key={i} className="flex items-center gap-1.5 text-[11px] font-mono text-[var(--ink-2)]">
-                <span className={from === svc.id ? "text-[var(--accent)]" : ""}>{from}</span>
+                <span className={e.from === svc.id ? "text-[var(--accent)]" : ""}>{e.from}</span>
                 <ChevronRight size={11} className="text-[var(--ink-5)]" />
-                <span className={to === svc.id ? "text-[var(--accent)]" : ""}>{to}</span>
+                <span className={e.to === svc.id ? "text-[var(--accent)]" : ""}>{e.to}</span>
+                {/* The traffic on the dependency, not just its existence —
+                    which of a service's callees is busy, and which is failing,
+                    is the question this list is read to answer. */}
+                <span className="ml-auto tabular-nums text-[10px] text-[var(--ink-4)]">
+                  {e.calls}×
+                </span>
+                <span className="tabular-nums text-[10px]"
+                      style={{ color: e.errPct > 1 ? "var(--crit)" : "var(--ink-4)" }}>
+                  {e.errPct}%
+                </span>
+                <span className="tabular-nums text-[10px] text-[var(--ink-4)]">p99 {e.p99}ms</span>
+                {e.virtual && (
+                  <span className="text-[9px] uppercase tracking-wide text-[var(--ink-5)]" title="not instrumented — inferred from the caller's span attributes">
+                    inferred
+                  </span>
+                )}
               </div>
             ))}
           </div>
@@ -341,6 +440,32 @@ function ServiceTable({ services, selected, setSelected }) {
 // Views
 // ---------------------------------------------------------------------------
 
+// TracesEmpty replaces the span-derived panels on a host that has never had a
+// span, which is the ordinary state until someone instruments an application.
+//
+// The copy it replaced said "enable traces.enabled and point an app at the
+// agent's OTLP receiver" — advice that is wrong half the time it is shown,
+// because traces.enabled is true by default and the receiver is already
+// listening. What is actually missing is a producer, so this says that, and
+// gives the address to point one at rather than making it the reader's job to
+// find it in a config file.
+function TracesEmpty() {
+  return (
+    <Panel title="Traces" className="lg:col-span-2">
+      <div className="flex flex-col gap-2 py-0.5">
+        <div className="text-[12.5px] font-mono text-[var(--ink-3)]">No spans received.</div>
+        <div className="text-[11.5px] font-mono text-[var(--ink-4)] leading-relaxed">
+          Rate, errors, duration and service health are all derived from spans.
+          They appear here once an instrumented application sends to:
+        </div>
+        <div className="text-[11.5px] font-mono text-[var(--accent)] break-all">
+          {window.location.origin}/v1/traces
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
 // Overview summarises; it does not re-host other views' tables. Where a panel
 // shows the same entity another view owns, clicking it navigates there rather
 // than selecting in place — a selection that changes nothing on screen is a
@@ -348,6 +473,11 @@ function ServiceTable({ services, selected, setSelected }) {
 function OverviewView({ snap, d, openService, openHost, openLogs }) {
   const healthy = d.services.filter((s) => s.status === "healthy").length;
   const infra = d.infra[0];
+  // Whether there is anything span-derived to draw at all. Not the same as
+  // "this window is quiet": a host with no instrumented application never has
+  // spans, and showing it four empty panels forever is not a state, it is a
+  // permanent condition the page should name once and move on from.
+  const hasTraces = (snap?.spans?.length || 0) > 0 || d.services.length > 0;
 
   return (
     <>
@@ -362,7 +492,16 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
           sub={`in the last ${Math.round((snap?.retain_sec || 900) / 60)} min`} />
         <KpiTile icon={Gauge} label="Series" value={d.allSeries.length.toLocaleString()}
           tone={d.seriesDropped > 0 ? "warn" : "normal"} sub={d.seriesDropped > 0 ? `${d.seriesDropped} refused` : "metric streams held"} />
-        <KpiTile icon={Activity} label="Envelopes" value={d.envelopes.toLocaleString()} sub={`${d.envelopesPerSec}/s since start`} />
+        <KpiTile
+          icon={Activity}
+          label="Envelopes"
+          value={d.envelopes.toLocaleString()}
+          sub={
+            Number.isFinite(d.envelopesPerSec)
+              ? `${d.envelopesPerSec}/s ${d.rateBasis}`
+              : "rate unavailable"
+          }
+        />
       </div>
 
       {d.seriesDropped > 0 && (
@@ -372,12 +511,17 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
         </div>
       )}
 
+      {/* Everything in the RED row and in Service Health is derived from spans,
+          so with none received they are four panels of empty axes — most of a
+          screen spent saying nothing. Collapsed into one honest notice
+          instead, and restored the moment a span arrives. */}
       {/* RED hero row. Rate and errors on the left, duration on the right —
           the convention every platform surveyed follows, and the order an
           operator actually asks the questions in: is it serving, is it
           broken, is it slow. These are taller than everything below them so
           the layout itself says which panels matter; a uniform grid makes you
           scan all of them equally, every time. */}
+      {hasTraces && (
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
         <Panel title="Rate" className="lg:col-span-2" right={<span className="text-[10px] font-mono text-[var(--ink-5)]">req/s</span>}>
           {d.traffic.rps.length > 1 ? (
@@ -427,9 +571,11 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
           ) : <EmptyHint>needs spans</EmptyHint>}
         </Panel>
       </div>
+      )}
 
       {/* Secondary: context for the row above, deliberately shorter. */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-4">
+        {hasTraces ? (
         <Panel title="Service Health" className="lg:col-span-2">
           {d.services.length ? (
             <div className="flex flex-col gap-1.5">
@@ -446,11 +592,12 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
               ))}
             </div>
           ) : (
-            <EmptyHint>
-              no services yet — enable <span className="text-[var(--accent)]">traces.enabled</span> and point an app at the agent's OTLP receiver
-            </EmptyHint>
+            <EmptyHint>no services seen in this window</EmptyHint>
           )}
         </Panel>
+        ) : (
+          <TracesEmpty />
+        )}
 
         <Panel title="This Host" right={infra && (<button onClick={openHost} className="text-[10px] font-mono text-[var(--accent)]">open ↗</button>)}>
           {infra ? (
@@ -910,13 +1057,32 @@ function TracesView({ traces }) {
 }
 
 function TopologyView({ d, selected, setSelected }) {
-  const positions = useMemo(() => layoutTopology(d.services, d.edges), [d.services, d.edges]);
-  const svc = d.services.find((s) => s.id === selected) || d.services[0];
+  // Inferred dependencies are nodes on the map but not services, so they are
+  // added here rather than in deriveServices — see deriveTopologyNodes.
+  const nodes = useMemo(() => deriveTopologyNodes(d.services, d.edges), [d.services, d.edges]);
+
+  // Laid out twice on purpose. The height a graph needs depends on how many
+  // nodes share its busiest column, and that is only known once it has been
+  // laid out — so the first pass measures and the second uses the answer.
+  // Cheap: these graphs are a handful of nodes, and it is memoised.
+  const { positions, height } = useMemo(() => {
+    const probe = layoutTopology(nodes, d.edges);
+    const perColumn = {};
+    for (const id of Object.keys(probe)) {
+      const col = Math.round(probe[id].x);
+      perColumn[col] = (perColumn[col] || 0) + 1;
+    }
+    const rows = Math.max(1, ...Object.values(perColumn));
+    const h = Math.max(190, rows * 46);
+    return { positions: layoutTopology(nodes, d.edges, 460, h), height: h };
+  }, [nodes, d.edges]);
+
+  const svc = nodes.find((s) => s.id === selected) || nodes[0];
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
       <Panel title="Service Topology" className="lg:col-span-2">
-        <TopologyGraph services={d.services} edges={d.edges} positions={positions} selected={svc?.id} onSelect={setSelected} />
+        <TopologyGraph nodes={nodes} edges={d.edges} positions={positions} height={height} selected={svc?.id} onSelect={setSelected} />
         <div className="flex items-center justify-between mt-3 pt-3 border-t border-[var(--n3)]">
           <div className="flex items-center gap-4">
             {["healthy", "degraded"].map((s) => (
@@ -925,9 +1091,13 @@ function TopologyView({ d, selected, setSelected }) {
                 <span className="text-[10px] text-[var(--ink-3)] font-mono uppercase">{s}</span>
               </div>
             ))}
+            <div className="flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full border border-dashed" style={{ borderColor: "var(--ink-4)" }} />
+              <span className="text-[10px] text-[var(--ink-3)] font-mono uppercase">inferred</span>
+            </div>
           </div>
           <span className="text-[10px] font-mono text-[var(--ink-5)]">
-            {d.edges.length} edge{d.edges.length === 1 ? "" : "s"} derived from span parent links
+            {d.edges.length} edge{d.edges.length === 1 ? "" : "s"} · thickness is call volume, red is failing
           </span>
         </div>
       </Panel>
@@ -987,6 +1157,9 @@ function InfrastructureView({ snap, d }) {
     return <NotWired title="Infrastructure" why="No host metrics received. Set metrics.enabled: true in the agent config." needs="metrics.enabled" />;
   }
   const n = d.infra[0];
+  // The same derivation the fleet table uses, so a host cannot be described one
+  // way in the list and another way on its own page.
+  const hostFacts = useMemo(() => hostRow(snap) || {}, [snap]);
   const retainMin = snap?.retain_sec ? Math.round(snap.retain_sec / 60) : null;
 
   return (
@@ -1003,12 +1176,46 @@ function InfrastructureView({ snap, d }) {
             <span className="flex items-center"><StatusDot status={n.status} />
               <span style={{ color: statusColor[n.status] }}>{n.status}</span></span>
           </Fact>
-          {/* The agent reads /proc for every metric here and only builds for
-              Linux, so this is a property of the binary, not a guess. */}
-          <Fact label="Operating system">linux</Fact>
+          {/* Read from the host rather than asserted. This said "linux" for
+              every machine on the grounds that the agent only builds for
+              Linux — true of the binary, and useless as a description of the
+              server you opened this page to look at. */}
+          <Fact label="Operating system">
+            <span title={hostFacts.osDescription || ""}>{hostFacts.os || "unknown"}</span>
+          </Fact>
           <Fact label="CPU usage"><GaugeBar value={n.cpu} /></Fact>
           <Fact label="Memory usage"><GaugeBar value={n.mem} /></Fact>
         </div>
+
+        {/* Cloud identity, and only when there is some: off EC2 every one of
+            these is empty, and a row of four em-dashes describes the page
+            rather than the host. */}
+        {(hostFacts.instanceID || hostFacts.zone || hostFacts.account) && (
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-3 mt-3 pt-3 border-t border-[var(--n2)]">
+            <Fact label="Instance ID">
+              <span className="font-mono text-[11.5px]">{hostFacts.instanceID || "—"}</span>
+            </Fact>
+            <Fact label="Instance type">
+              <span className="font-mono text-[11.5px]">{hostFacts.instanceType || "—"}</span>
+            </Fact>
+            <Fact label="Zone">
+              <span className="font-mono text-[11.5px]">{hostFacts.zone || "—"}</span>
+            </Fact>
+            <Fact label="Account">
+              <span className="font-mono text-[11.5px]">{hostFacts.account || "—"}</span>
+            </Fact>
+            {hostFacts.imageID && (
+              <Fact label="AMI">
+                <span className="font-mono text-[11.5px]">{hostFacts.imageID}</span>
+              </Fact>
+            )}
+            {hostFacts.arch && (
+              <Fact label="Architecture">
+                <span className="font-mono text-[11.5px]">{hostFacts.arch}</span>
+              </Fact>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex items-end justify-between gap-4">
@@ -1062,11 +1269,19 @@ function Fact({ label, children }) {
 
 // ---------------------------------------------------------------------------
 
-const NAV_GROUPS = [
+// A function rather than a constant because the host list is now editable
+// while the UI is running: adding a second server has to make the Fleet tab
+// appear without a reload.
+// showFleet is separate from hostCount because the two no longer mean the same
+// thing. hostCount is how many agents this browser has an address for; the
+// backend knows about hosts it does not. A fleet of ten reporting through the
+// backend with none configured locally is the normal case now, and gating the
+// tab on hostCount hid the tab from exactly that setup.
+const navGroups = (hostCount, fleetCount = 0) => [
   { label: "Monitor", items: [
-    // Only meaningful with more than one agent configured, and hidden
-    // otherwise — a "Fleet" of one is a worse Overview.
-    ...(HOSTS.length > 1 ? [{ id: "fleet", label: "Fleet", icon: Server }] : []),
+    // Still hidden for a single host with no backend — a "Fleet" of one is a
+    // worse Overview.
+    ...(hostCount > 1 || fleetCount > 1 ? [{ id: "fleet", label: "Fleet", icon: Server }] : []),
     { id: "overview", label: "Overview", icon: LayoutDashboard },
     { id: "topology", label: "Service Topology", icon: Network },
   ]},
@@ -1082,12 +1297,12 @@ const NAV_GROUPS = [
     { id: "monitors", label: "Monitors", icon: Bell },
   ]},
 ];
-const NAV_ITEMS = NAV_GROUPS.flatMap((g) => g.items);
 
-function Sidebar({ view, setView, snap }) {
+function Sidebar({ view, setView, hostCount, fleetCount }) {
+  const groups = navGroups(hostCount, fleetCount);
   return (
     <div className="w-[200px] flex-shrink-0 border-r border-[var(--n2)] flex flex-col py-4 overflow-y-auto">
-      {NAV_GROUPS.map((group) => (
+      {groups.map((group) => (
         <nav key={group.label} className="flex flex-col gap-0.5 px-2 mb-3">
           <div className="px-3 pb-1 text-[9.5px] font-mono uppercase tracking-widest text-[var(--ink-5)]">{group.label}</div>
           {group.items.map((item) => {
@@ -1108,22 +1323,6 @@ function Sidebar({ view, setView, snap }) {
           })}
         </nav>
       ))}
-      <div className="mt-auto px-4 pt-4 border-t border-[var(--n2)] mx-2 flex flex-col gap-2">
-        <div className="text-[10px] text-[var(--ink-5)] font-mono leading-relaxed">
-          agent-i {snap?.version || "—"}<br />{snap?.agent_id || "not connected"}
-        </div>
-        {/* Where to point an instrumented app. Every question about this
-            ends up being "what URL do I send to", so it belongs on screen
-            rather than in a config file someone has to go and read. */}
-        <div className="text-[9.5px] text-[var(--ink-5)] font-mono leading-relaxed">
-          <div className="uppercase tracking-widest pb-0.5">send traces to</div>
-          <div className="text-[var(--ink-4)] break-all">{window.location.origin}/v1/traces</div>
-        </div>
-        <a href="/agent" target="_blank" rel="noreferrer"
-           className="text-[9.5px] font-mono text-[var(--ink-5)] hover:text-[var(--accent)] underline decoration-dotted">
-          agent's built-in page ↗
-        </a>
-      </div>
     </div>
   );
 }
@@ -1152,7 +1351,41 @@ function UsageBar({ value }) {
 // know how a cell is rendered.
 const HOST_COLUMNS = [
   { id: "host", label: "Hostname", get: (r) => r.host, align: "left" },
-  { id: "status", label: "Status", get: (r) => (r.active ? 1 : 0), align: "left" },
+  // Its own column rather than a sub-line under Instance. The id is the only
+  // identifier on the row that is guaranteed unique and cannot be renamed, so
+  // it is what you match against an alert or a console tab — that is a lookup,
+  // and a lookup wants a column it can be sorted and scanned down.
+  { id: "instanceId", label: "Host ID", get: (r) => r.instanceID || "", align: "left" },
+  // statusRank, not r.active: the column has three states and sorting on two
+  // of them interleaved the hosts that had sent nothing with the healthy ones.
+  { id: "status", label: "Status", get: (r) => statusRank(r), align: "left" },
+  // How long since the host last reported.
+  //
+  // Without this, INACTIVE is a verdict with no evidence: a host that stopped
+  // ten minutes ago and one that stopped last week look identical, and an
+  // empty metrics row reads as a broken dashboard rather than as a quiet
+  // machine. It is the first thing you want when a row is not green, and the
+  // difference between "the agent just restarted" and "nobody has touched
+  // this box in a month".
+  //
+  // Sorted by age rather than by the rendered string, so "2m" and "3h" order
+  // correctly instead of alphabetically.
+  { id: "seen", label: "Last Seen", get: (r) => (Number.isFinite(r.ageSec) ? r.ageSec : Infinity), align: "right" },
+  // Sortable rather than tucked under the hostname, because at fleet sizes the
+  // useful questions are "which instance type is this" and "is one AZ having a
+  // bad day" — both of which mean grouping rows, not reading one.
+  { id: "instance", label: "Instance", get: (r) => r.instanceType || "", align: "left" },
+  { id: "zone", label: "Zone", get: (r) => r.zone || "", align: "left" },
+  // The account is the coarsest grouping there is and the one that decides who
+  // can even reach a box. It was being derived and then discarded — the column
+  // never existed — which left a fleet spanning several accounts looking like
+  // one flat list. Sortable, because the question is "show me everything in
+  // this account", which means grouping rows rather than reading one.
+  { id: "account", label: "Account", get: (r) => r.account || "", align: "left" },
+  // Distro and version, read from the host. Sortable for the same reason: the
+  // question is "which boxes are still on the old image", not "what is this
+  // one running".
+  { id: "os", label: "OS", get: (r) => r.os || "", align: "left" },
   { id: "cpu", label: "CPU Usage", get: (r) => r.cpu, align: "left", bar: true },
   { id: "mem", label: "Memory Usage", get: (r) => r.mem, align: "left", bar: true },
   { id: "iowait", label: "IOWait", get: (r) => r.iowait, align: "right" },
@@ -1160,35 +1393,82 @@ const HOST_COLUMNS = [
   { id: "load15", label: "Load Avg", get: (r) => r.load15, align: "right" },
 ];
 
-function FleetView({ results, loading, onOpen }) {
+// The two mappings onto the fleet row shape.
+//
+// fleetFromAgents is the original path: poll every configured agent and derive
+// a row from its snapshot. It can only ever show hosts this browser can reach.
+//
+// fleetFromBackend reads the backend's inventory, which lists every host that
+// has reported regardless of whether there is a route to it from here. Where a
+// backend host matches a configured agent, the two are paired so the row stays
+// clickable — matching on instance id first, because that is the identifier
+// that cannot be renamed, and on the configured name second.
+function fleetFromAgents(results) {
+  return results.map(({ host, snapshot: snap, error }) => {
+    const row = snap ? hostRow(snap) : null;
+    return {
+      key: host.url,
+      host,
+      error,
+      // A host that never answered still gets a row: its configured name is
+      // all we know about it, and omitting it would hide the outage.
+      row: row || {
+        host: host.name || host.url.replace(/^https?:\/\//, ""),
+        active: false, os: "", osDescription: "", arch: "", version: "",
+        // Strings, not undefined: these columns sort with localeCompare and an
+        // absent value would take the numeric path instead.
+        instanceID: "", instanceType: "", zone: "", account: "",
+        cpu: NaN, mem: NaN, iowait: NaN, disk: NaN, load15: NaN,
+        // Never heard from, as distinct from heard from a long time ago.
+        ageSec: Infinity,
+      },
+    };
+  });
+}
+
+function fleetFromBackend(rows, hosts, agentIDs) {
+  return rows.map((row) => {
+    const match =
+      hosts.find((h) => agentIDs[h.url] && agentIDs[h.url] === row.instanceID) ||
+      hosts.find((h) => h.name && h.name === row.host) ||
+      null;
+    // Keyed on the host id, which the backend guarantees is unique per row and
+    // which survives a rename — unlike the display name, where two machines
+    // called "web" would collapse into one row.
+    return { key: row.instanceID || row.host, host: match, error: null, row };
+  });
+}
+
+// FleetView renders an already-derived set of rows.
+//
+// It takes rows rather than snapshots because there are now two sources for
+// them — the backend's host inventory, and a direct poll of each agent — and
+// the sorting, filtering and formatting here is identical for both. Deriving
+// inside this component would have meant it could only ever render one of
+// them. See fleetFromBackend and fleetFromAgents below for the two mappings.
+//
+// Each entry is { key, host, row, error }. `host` is the configured agent this
+// row can be opened against, and is null for a host the backend knows about
+// but which this browser has no route to — which is most of them, and the
+// reason the backend exists.
+function FleetView({ entries, loading, source, sourceError, onOpen }) {
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState({ col: "host", dir: "asc" });
 
-  // One derivation per host per poll, not per render.
-  const rows = useMemo(
-    () =>
-      HOSTS.map((host, i) => {
-        const snap = results[i]?.snapshot;
-        const row = snap ? hostRow(snap) : null;
-        return {
-          index: i,
-          url: host.url,
-          error: results[i]?.error,
-          // A host that never answered still gets a row: its configured name
-          // is all we know about it, and omitting it would hide the outage.
-          row: row || {
-            host: host.name || host.url.replace(/^https?:\/\//, ""),
-            active: false, os: "—", version: "",
-            cpu: NaN, mem: NaN, iowait: NaN, disk: NaN, load15: NaN,
-          },
-        };
-      }),
-    [results]
-  );
+  const rows = entries;
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const filtered = q ? rows.filter((r) => r.row.host.toLowerCase().includes(q)) : rows;
+    // Matches identity, not just the name. Searching an instance id is how you
+    // get from an alert or a console tab to the right row, and searching a zone
+    // or an instance type is how you check whether a problem is confined to
+    // one of them.
+    const filtered = q
+      ? rows.filter(({ row }) =>
+          [row.host, row.instanceID, row.instanceType, row.zone, row.account, row.os]
+            .some((field) => (field || "").toLowerCase().includes(q))
+        )
+      : rows;
     const col = HOST_COLUMNS.find((c) => c.id === sort.col) || HOST_COLUMNS[0];
     const sign = sort.dir === "asc" ? 1 : -1;
     return [...filtered].sort((a, b) => {
@@ -1204,12 +1484,19 @@ function FleetView({ results, loading, onOpen }) {
   }, [rows, query, sort]);
 
   if (loading) {
-    return <p className="text-[12px] font-mono text-[var(--ink-3)]">polling {HOSTS.length} hosts…</p>;
+    return (
+      <p className="text-[12px] font-mono text-[var(--ink-3)]">
+        {source === "backend" ? "loading the fleet from the backend…" : `polling ${rows.length} hosts…`}
+      </p>
+    );
   }
 
   const toggle = (id) =>
     setSort((s) => ({ col: id, dir: s.col === id && s.dir === "asc" ? "desc" : "asc" }));
-  const active = rows.filter((r) => r.row.active).length;
+  // Counted the same way the cell labels it. Counting r.active alone put
+  // hosts the table was calling NO DATA into the "N active" total in the line
+  // directly above them.
+  const active = rows.filter((r) => hostStatus(r.row) === "active").length;
 
   return (
     <div className="flex flex-col gap-3">
@@ -1219,18 +1506,34 @@ function FleetView({ results, loading, onOpen }) {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="filter by hostname"
-            aria-label="Filter hosts by name"
+            placeholder="filter by name, instance, type or zone"
+            aria-label="Filter hosts by name, instance id, instance type or zone"
             className="text-[11.5px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded pl-7 pr-2.5 py-1.5 text-[var(--ink)] w-[16rem]"
           />
         </div>
         <span className="text-[11px] font-mono text-[var(--ink-4)]">
-          Showing {visible.length} of {rows.length} hosts · {active} active
+          Showing {visible.length} of {rows.length} hosts · {active} active ·{" "}
+          {/* Which source produced this table is not a detail. It decides what
+              an empty row means: from the backend, a host that stopped
+              reporting; from the agents, possibly just a tunnel this laptop
+              cannot open. */}
+          <span style={{ color: source === "backend" ? "var(--accent)" : "var(--ink-5)" }}>
+            {source === "backend" ? "via backend" : "polling agents"}
+          </span>
         </span>
       </div>
 
+      {sourceError && (
+        <div className="border border-[var(--warn)] rounded px-3 py-2">
+          <p className="text-[11.5px] font-mono text-[var(--warn)]">{sourceError.message}</p>
+          {sourceError.detail && (
+            <p className="text-[10.5px] font-mono text-[var(--ink-4)] mt-0.5">{sourceError.detail}</p>
+          )}
+        </div>
+      )}
+
       <div className="border border-[var(--n3)] rounded overflow-x-auto">
-        <table className="w-full min-w-[52rem] border-collapse">
+        <table className="w-full min-w-[80rem] border-collapse">
           <thead>
             <tr className="bg-[var(--surface)]">
               {HOST_COLUMNS.map((c) => (
@@ -1250,11 +1553,16 @@ function FleetView({ results, loading, onOpen }) {
             </tr>
           </thead>
           <tbody>
-            {visible.map(({ index, row, error, url }) => (
+            {visible.map(({ key, host, row, error }) => (
               <tr
-                key={url}
-                onClick={() => onOpen(index)}
-                className="cursor-pointer hover:bg-[var(--surface)] border-b border-[var(--n2)] last:border-b-0"
+                key={key}
+                // Every row opens now. Where there is a configured agent the
+                // detail comes from it live; where there is not, it comes from
+                // the backend's stored copy — same payload shape either way,
+                // so the views downstream do not know which they are reading.
+                onClick={() => onOpen(host, row)}
+                title={host ? "" : "Read from the backend — this browser has no route to the machine."}
+                className="border-b border-[var(--n2)] last:border-b-0 cursor-pointer hover:bg-[var(--surface)]"
               >
                 <td className="px-3 py-2.5">
                   <span className="font-mono text-[12.5px] text-[var(--accent)]">{row.host}</span>
@@ -1262,20 +1570,73 @@ function FleetView({ results, loading, onOpen }) {
                     <span className="block text-[10px] font-mono text-[var(--ink-5)]">{row.version}</span>
                   )}
                 </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)] whitespace-nowrap">
+                  {row.instanceID || "—"}
+                </td>
+                {/* Three states, not two. A host that is listed but has never
+                    sent a data point is not the same as one that reported and
+                    went quiet: the first usually means the agent is exporting
+                    to somewhere else or its export carries identity and no
+                    metrics, and the second means the machine or its agent is
+                    down. Collapsing both into INACTIVE sends you looking at
+                    the wrong end of the pipeline. Only rows sourced from the
+                    backend carry hasMetrics; an agent-sourced row leaves it
+                    undefined and keeps the original two states. */}
                 <td className="px-3 py-2.5">
-                  <span className="inline-flex items-center gap-1.5 text-[10.5px] font-mono">
-                    <span
-                      className="w-1.5 h-1.5 rounded-full"
-                      style={{ background: row.active ? "var(--good)" : "var(--crit)" }}
-                    />
-                    <span style={{ color: row.active ? "var(--ink-3)" : "var(--crit)" }}>
-                      {row.active ? "ACTIVE" : "INACTIVE"}
-                    </span>
-                  </span>
+                  {(() => {
+                    // One derivation, used for the dot, the word and the
+                    // tooltip. Deriving the colour and the label separately is
+                    // what produced a green dot labelled NO DATA.
+                    const status = hostStatus(row);
+                    const tone =
+                      status === "no-metrics" ? "var(--warn)" : status === "active" ? "var(--good)" : "var(--crit)";
+                    const label =
+                      status === "no-metrics" ? "NO METRICS" : status === "active" ? "ACTIVE" : "INACTIVE";
+                    return (
+                      <span
+                        className="inline-flex items-center gap-1.5 text-[10.5px] font-mono"
+                        title={
+                          status === "no-metrics"
+                            ? "No host metrics from this host in the selected window. It may still be " +
+                              "sending logs or traces — the fleet query does not report those, so open it " +
+                              "to see. If it is empty too, the agent's exporter is probably pointing " +
+                              "elsewhere, or its ingest key is being refused."
+                            : undefined
+                        }
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full" style={{ background: tone }} />
+                        <span style={{ color: status === "active" ? "var(--ink-3)" : tone }}>
+                          {label}
+                        </span>
+                      </span>
+                    );
+                  })()}
                   {error && (
                     <span className="block text-[10px] font-mono text-[var(--ink-5)] mt-0.5">
                       {error.message}
                     </span>
+                  )}
+                </td>
+                <td className="px-3 py-2.5 text-right font-mono text-[11.5px] tabular-nums whitespace-nowrap"
+                    style={{ color: row.active ? "var(--ink-3)" : "var(--warn)" }}>
+                  {fmtAge(row.ageSec)}
+                </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)]">
+                  {row.instanceType || "—"}
+                </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)]">
+                  {row.zone || "—"}
+                </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)] whitespace-nowrap">
+                  {row.account || "—"}
+                </td>
+                <td className="px-3 py-2.5 font-mono text-[11.5px] text-[var(--ink-3)] whitespace-nowrap">
+                  {/* The full description, including the kernel, is on hover:
+                      it is what you want once you have found the odd row out,
+                      and too long to give a column to. */}
+                  <span title={row.osDescription || ""}>{row.os || "—"}</span>
+                  {row.arch && (
+                    <span className="block text-[10px] font-mono text-[var(--ink-5)]">{row.arch}</span>
                   )}
                 </td>
                 <td className="px-3 py-2.5 w-[14%]"><UsageBar value={row.cpu} /></td>
@@ -1294,57 +1655,244 @@ function FleetView({ results, loading, onOpen }) {
       </div>
 
       <p className="text-[10.5px] font-mono text-[var(--ink-5)]">
-        Select a host to open its infrastructure detail. Status is ACTIVE when a metric
-        arrived in the last 10 minutes.
+        {source === "backend" ? (
+          <>
+            Read from the backend, so a host appears because it reported — from any
+            account or region, with no route from this browser to the machine itself.
+            Open any row for its metrics, logs and traces; where no direct agent is
+            configured those come from the backend's stored copy rather than live
+            from the machine. IOWait is not computed here.
+          </>
+        ) : (
+          <>
+            Polled from each configured agent directly, which is why every host needs a
+            reachable address. Start the backend and these come from one place instead.
+          </>
+        )}{" "}
+        Status is ACTIVE when a metric arrived in the last 10 minutes. Instance, Zone and
+        Account come from the host's own cloud metadata and are empty off EC2; OS is read
+        from the host itself, and is empty on agents older than the release that started
+        reporting it.
       </p>
     </div>
   );
 }
 
-// HostPicker switches which agent the dashboard is reading.
+// HostPicker switches which agent the dashboard is reading, and is the way in
+// to editing the list.
 //
 // A native <select> rather than a custom dropdown: it is keyboard accessible
 // and screen-reader correct for free, and closes on outside click without any
-// of the listener bookkeeping a div-based menu needs. At fleet sizes this UI
-// is meant for — a handful of hosts you have tunnels open to — there is
-// nothing a custom menu would add.
+// of the listener bookkeeping a div-based menu needs.
 //
 // The dot is the host's own reachability, not the selected host's. Its whole
 // purpose is to tell you a host is unreachable BEFORE you switch to it and
 // wonder why the dashboard went blank.
-function HostPicker({ hostIndex, setHostIndex, health, agentID }) {
+// Values are prefixed because the two kinds of host are addressed differently
+// — an agent by URL, a backend host by id — and a bare value could not say
+// which. A host that is both appears once, under the agent, because a live
+// agent gives full resolution and the backend gives a stored copy of it.
+const AGENT_OPT = "a:";
+const BACKEND_OPT = "b:";
+
+function HostPicker({
+  hosts, selectedURL, setSelectedURL, health, agentID, onManage,
+  backendRows = [], backendHostID = "", setBackendHostID = () => {},
+}) {
   const dot = (state) =>
     state === "up" ? "var(--good)" : state === "down" ? "var(--crit)" : "var(--ink-3)";
 
-  // A configured name always wins: it is the only label available for a host
-  // whose tunnel is down, since an unreachable agent reports no agent_id.
-  // The live agent_id is a fallback for entries given as a bare URL.
-  const labelFor = (host, i) => {
-    if (host.name) return host.name;
-    if (i === hostIndex && agentID) return agentID;
-    return host.url.replace(/^https?:\/\//, "");
+  // Hosts the backend knows about that are not already in the configured list,
+  // matched on the id the agent reports rather than on its display name, which
+  // is editable and duplicable.
+  const configuredIDs = new Set(Object.values({ [selectedURL]: agentID }).filter(Boolean));
+  const backendOnly = backendRows.filter((r) => r.instanceID && !configuredIDs.has(r.instanceID));
+
+  const value = backendHostID ? BACKEND_OPT + backendHostID : AGENT_OPT + selectedURL;
+  const onChange = (e) => {
+    const v = e.target.value;
+    if (v.startsWith(BACKEND_OPT)) {
+      setBackendHostID(v.slice(BACKEND_OPT.length));
+    } else {
+      setBackendHostID("");
+      setSelectedURL(v.slice(AGENT_OPT.length));
+    }
   };
 
   return (
     <div className="flex items-center gap-2 pl-3 ml-1 border-l border-[var(--n2)]">
       <span
         className="w-2 h-2 rounded-full shrink-0"
-        style={{ background: dot(health[hostIndex]) }}
+        // A backend host has no reachability to report — that is the point of
+        // it — so it takes the neutral dot rather than a red one that would
+        // read as an outage.
+        style={{ background: backendHostID ? "var(--accent)" : dot(health[selectedURL]) }}
         aria-hidden="true"
       />
       <select
         aria-label="Select host"
-        value={hostIndex}
-        onChange={(e) => setHostIndex(Number(e.target.value))}
-        className="text-[11px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded px-2 py-1 text-[var(--ink)] cursor-pointer max-w-[14rem]"
+        value={value}
+        onChange={onChange}
+        className="text-[11px] font-mono bg-[var(--surface)] border border-[var(--n4)] rounded px-2 py-1 text-[var(--ink)] cursor-pointer max-w-[16rem]"
       >
-        {HOSTS.map((host, i) => (
-          <option key={host.url} value={i}>
-            {health[i] === "down" ? "○ " : "● "}
-            {labelFor(host, i)}
-          </option>
-        ))}
+        {/* A value matching no option makes a browser display the first one,
+            so an empty host list showed the name of a machine nothing had
+            selected — the picker asserting a selection that did not exist.
+            An explicit placeholder keeps the displayed value honest. */}
+        {!hosts.length && !backendHostID && <option value="">no host selected</option>}
+        {hosts.length > 0 && (
+        <optgroup label="Direct agents">
+          {hosts.map((host) => (
+            <option key={host.url} value={AGENT_OPT + host.url}>
+              {health[host.url] === "down" ? "○ " : "● "}
+              {hostLabel(host, !backendHostID && host.url === selectedURL ? agentID : "")}
+            </option>
+          ))}
+        </optgroup>
+        )}
+        {backendOnly.length > 0 && (
+          <optgroup label="Via backend">
+            {backendOnly.map((r) => (
+              <option key={r.instanceID} value={BACKEND_OPT + r.instanceID}>
+                {r.active ? "● " : "○ "}
+                {r.host}
+              </option>
+            ))}
+          </optgroup>
+        )}
       </select>
+      <button
+        onClick={onManage}
+        title="Add or remove hosts"
+        aria-label="Manage hosts"
+        className="flex items-center gap-1 text-[11px] font-mono px-2 py-1 rounded bg-[var(--surface)] border border-[var(--n4)] text-[var(--ink-3)] hover:text-[var(--ink)]"
+      >
+        <Settings size={12} />
+        {hosts.length}
+      </button>
+    </div>
+  );
+}
+
+// HostManager edits the list of agents.
+//
+// This exists because the list used to be an environment variable Vite froze
+// into the bundle, so adding a server meant stopping the dev server, editing a
+// shell command and starting it again — for a list that changes every time a
+// tunnel comes up. Servers in different accounts get added one at a time, and
+// the place to do that is the UI already showing you the others.
+//
+// The bulk box is the primary input, not a convenience. Ten forwarded ports
+// arrive as a block of text out of a terminal or a runbook; typing them into
+// ten separate fields is the same information entered ten times more slowly.
+function HostManager({ hosts, setHosts, health, onClose }) {
+  const [text, setText] = useState(() => toHostSpec(hosts));
+  const [error, setError] = useState("");
+
+  // An emptied box removes every host; only text that was meant to be an
+  // address and is not gets refused. This textarea is the only control that
+  // removes a host, so refusing an empty result meant the last one could not
+  // be removed at all — and the message said "No usable addresses", which
+  // describes a typo rather than the deliberate clear it usually was.
+  // readHostSpec makes that call, where it can be tested.
+  const apply = () => {
+    const { hosts: parsed, error: reason } = readHostSpec(text);
+    if (!parsed) {
+      setError(reason);
+      return;
+    }
+    setHosts(parsed);
+    onClose();
+  };
+
+  const restore = () => {
+    const seeded = configuredHosts();
+    setText(toHostSpec(seeded.length > 0 ? seeded : hosts));
+    setError(seeded.length > 0 ? "" : "AGENT_I_HOSTS was not set when the dev server started.");
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[8vh] px-4 bg-[color-mix(in_srgb,var(--bg)_75%,transparent)]"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-[560px] rounded border border-[var(--n4)] bg-[var(--surface)] shadow-xl flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--n2)]">
+          <h2 className="font-mono text-[13px]">Hosts</h2>
+          <button onClick={onClose} aria-label="Close" className="text-[var(--ink-3)] hover:text-[var(--ink)]">
+            <XCircle size={16} />
+          </button>
+        </div>
+
+        <div className="px-4 py-3 flex flex-col gap-3">
+          <p className="text-[11px] text-[var(--ink-4)] leading-relaxed">
+            One per line, as <span className="font-mono text-[var(--ink-3)]">name=url</span> or a bare
+            address. Each needs to be reachable from this machine — for agents on other servers that
+            means an SSH forward per host, since the dashboard port binds loopback and has no
+            authentication. See <span className="font-mono text-[var(--ink-3)]">scripts/dev-tunnels.sh</span>.
+          </p>
+
+          <textarea
+            value={text}
+            onChange={(e) => { setText(e.target.value); setError(""); }}
+            spellCheck={false}
+            rows={8}
+            aria-label="Host list"
+            placeholder={"prod-web-1=http://127.0.0.1:8089\nprod-web-2=http://127.0.0.1:8090\n127.0.0.1:8091"}
+            className="w-full font-mono text-[12px] leading-relaxed bg-[var(--bg)] border border-[var(--n4)] rounded px-2.5 py-2 text-[var(--ink)] resize-y"
+          />
+
+          {/* Live preview of what will be saved. Normalisation is forgiving —
+              a missing scheme is added, a pasted /api/snapshot is stripped —
+              and showing the result is how that stays trustworthy rather than
+              surprising. */}
+          <div className="flex flex-col gap-1">
+            {parseHostSpec(text).map((h) => (
+              <div key={h.url} className="flex items-center gap-2 text-[11px] font-mono">
+                <span
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{
+                    background:
+                      health[h.url] === "up" ? "var(--good)"
+                      : health[h.url] === "down" ? "var(--crit)"
+                      : "var(--ink-5)",
+                  }}
+                />
+                <span className="text-[var(--ink-3)] min-w-[8rem]">{h.name || "(unnamed)"}</span>
+                <span className="text-[var(--ink-5)]">{h.url}</span>
+              </div>
+            ))}
+          </div>
+
+          {error && <p className="text-[11px] font-mono text-[var(--crit)]">{error}</p>}
+        </div>
+
+        <div className="flex items-center justify-between px-4 py-3 border-t border-[var(--n2)]">
+          <button
+            onClick={restore}
+            className="text-[11px] font-mono text-[var(--ink-4)] hover:text-[var(--ink-3)]"
+          >
+            Restore from AGENT_I_HOSTS
+          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onClose}
+              className="text-[11px] font-mono px-3 py-1.5 rounded border border-[var(--n4)] text-[var(--ink-3)]"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={apply}
+              className="text-[11px] font-mono px-3 py-1.5 rounded bg-[color-mix(in_srgb,var(--accent)_15%,transparent)] border border-[color-mix(in_srgb,var(--accent)_40%,transparent)] text-[var(--accent)]"
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1353,11 +1901,129 @@ export default function ObservabilityDashboard() {
   const [view, setView] = useState("overview");
   const [selected, setSelected] = useState(null);
   const [now, setNow] = useState(new Date());
-  const [hostIndex, setHostIndex] = useState(0);
-  const { snapshot, error, loading, paused, setPaused } = useSnapshot(5000, hostIndex);
-  const hostHealth = useHostHealth();
-  // Only polls while the fleet view is on screen — see useAllSnapshots.
-  const { results: fleet, loading: fleetLoading } = useAllSnapshots(10000, view === "fleet");
+
+  // The host list is runtime state, seeded from AGENT_I_HOSTS on first run and
+  // persisted in the browser after that. See hosts.js.
+  const [hosts, setHostsState] = useState(loadHosts);
+  const [managing, setManaging] = useState(false);
+  // Removing the last host is allowed.
+  //
+  // This used to substitute the current list for an empty one, which made
+  // deleting the only entry a no-op: the row stayed, the removal never reached
+  // storage, and there was no message saying why. Together with the seed
+  // fallback in loadHosts, a host pointing at a dead tunnel could not be got
+  // rid of at all.
+  //
+  // An empty list is a supported state — the dashboard renders it, and the
+  // backend still supplies the fleet with no agent reachable — so there is
+  // nothing here to protect the user from.
+  const setHosts = (next) => {
+    setHostsState(next);
+    saveHosts(next);
+  };
+
+  // Selection is by URL, not by index. The list is editable while the UI is
+  // running, and an index would silently point at a different machine the
+  // moment a host above it was removed.
+  const [selectedURL, setSelectedURL] = useState(() => loadHosts()[0]?.url || "");
+  const selectedHost =
+    hosts.find((h) => h.url === selectedURL) || hosts[0] || null;
+
+  // A removed host must not leave the dashboard polling an address that is no
+  // longer in the list.
+  useEffect(() => {
+    if (hosts.length > 0 && !hosts.some((h) => h.url === selectedURL)) {
+      setSelectedURL(hosts[0].url);
+    }
+  }, [hosts, selectedURL]);
+
+  // A host selected from the fleet that this browser has no route to. When
+  // set, every view reads the backend instead of an agent — the payload shape
+  // is identical, so nothing downstream of here knows the difference.
+  const [backendHostID, setBackendHostID] = useState("");
+
+  const agentPoll = useSnapshot(5000, backendHostID ? null : selectedHost);
+  const backendPoll = useBackendSnapshot(backendHostID, 10000);
+
+  // One of the two is live at a time. Reading from a database is slower to
+  // change than reading from an agent's memory, hence the slower interval
+  // above, but neither is a stream and the views cannot tell them apart.
+  const readingBackend = !!backendHostID;
+  const snapshot = readingBackend ? backendPoll.snapshot : agentPoll.snapshot;
+  const error = readingBackend ? backendPoll.error : agentPoll.error;
+  const loading = readingBackend ? backendPoll.loading : agentPoll.loading;
+  const paused = readingBackend ? false : agentPoll.paused;
+  const setPaused = agentPoll.setPaused;
+
+  const hostHealth = useHostHealth(hosts);
+
+  // The backend poll runs whether or not the fleet view is open, because its
+  // result decides whether the Fleet tab exists at all — a tab that only
+  // appears once you are already on the view it leads to is no tab. It is one
+  // small request either way, unlike the agent poll below, which transfers
+  // every host's whole retention window and so is gated on the view.
+  const {
+    rows: backendRows,
+    error: backendError,
+    loading: backendLoading,
+  } = useBackendFleet(view === "fleet" ? 10000 : 60000, true);
+
+  // Only polls while the fleet view is on screen, and only when the backend is
+  // not already answering — see useAllSnapshots for why that gate matters.
+  const usingBackend = backendRows.length > 0;
+  const { results: fleet, loading: fleetLoading } = useAllSnapshots(
+    hosts,
+    10000,
+    view === "fleet" && !usingBackend
+  );
+
+  // agentIDs maps a configured agent's URL to the host id it reports, so a
+  // backend row can be paired with an agent this browser can actually reach.
+  // Only the selected host's id is known — that is the only snapshot being
+  // polled — which is enough: pairing exists to keep a row clickable, and the
+  // fallback to matching on name covers the rest.
+  const agentIDs = useMemo(
+    () => (!readingBackend && selectedHost && snapshot?.host?.["host.id"]
+      ? { [selectedHost.url]: snapshot.host["host.id"] }
+      : {}),
+    [readingBackend, selectedHost, snapshot]
+  );
+
+  // What to offer when the selected agent cannot be reached.
+  //
+  // Matched on the configured name against the host the backend knows, since
+  // an unreachable agent has told us nothing about itself — there is no
+  // instance id to match on, precisely because the poll failed. An unmatched
+  // offer is still worth making: any backend host is more useful than an error
+  // with nothing behind it, but it is labelled differently so the offer never
+  // claims to be the same machine when it has not established that.
+  const backendFallback = useMemo(
+    () => chooseBackendFallback({ readingBackend, error, backendRows, selectedHost }),
+    [readingBackend, error, backendRows, selectedHost]
+  );
+
+  const fleetEntries = useMemo(
+    () => (usingBackend ? fleetFromBackend(backendRows, hosts, agentIDs) : fleetFromAgents(fleet)),
+    [usingBackend, backendRows, hosts, agentIDs, fleet]
+  );
+
+  // With no configured agent there is nothing else to show, so a backend host
+  // is selected rather than leaving the dashboard empty next to a fleet table
+  // full of machines. Not a silent source swap — the header says "via
+  // backend" — and it only fires when the alternative is a blank page: an
+  // agent that merely fails is left alone, because switching away from it
+  // would hide the failure the operator needs to see.
+  useEffect(() => {
+    if (hosts.length === 0 && !backendHostID && backendRows.length > 0) {
+      setBackendHostID(backendRows[0].instanceID);
+    }
+  }, [hosts.length, backendHostID, backendRows]);
+
+  // The Fleet tab disappears when there is nothing to compare, so a view that
+  // is no longer reachable in the nav must not stay on screen.
+  useEffect(() => {
+    if (view === "fleet" && hosts.length <= 1 && backendRows.length <= 1) setView("overview");
+  }, [view, hosts.length, backendRows.length]);
   // Charts need no re-render on theme change: their colours are var()
   // references that CSS re-resolves at paint time.
   const { theme, setTheme } = useTheme();
@@ -1382,7 +2048,9 @@ export default function ObservabilityDashboard() {
     };
   }, [snapshot]);
 
-  const activeLabel = NAV_ITEMS.find((n) => n.id === view)?.label;
+  const activeLabel = navGroups(hosts.length, backendRows.length)
+    .flatMap((g) => g.items)
+    .find((n) => n.id === view)?.label;
   const connected = !!snapshot && !error;
 
   return (
@@ -1395,32 +2063,72 @@ export default function ObservabilityDashboard() {
           <div>
             <h1 className="font-mono text-sm tracking-wide">AGENT-I</h1>
             <p className="text-[10px] text-[var(--ink-3)] font-mono">
-              {HOSTS.length > 1 ? `${HOSTS.length} hosts` : snapshot?.agent_id || "—"} ·{" "}
-              {now.toLocaleTimeString()}
+              {snapshot?.agent_id || (hosts.length > 1 ? `${hosts.length} hosts` : "—")}
+              {readingBackend && (
+                // Named, because "live" in the status light means something
+                // different here: these numbers are as fresh as the last
+                // export the host sent, not as fresh as a poll of it.
+                <span className="text-[var(--accent)]"> · via backend</span>
+              )}{" "}
+              · {now.toLocaleTimeString()}
             </p>
           </div>
-          {/* Only rendered for a genuine fleet. A picker with one entry is
-              chrome that implies a choice you do not have. */}
-          {HOSTS.length > 1 && (
-            <HostPicker
-              hostIndex={hostIndex}
-              setHostIndex={setHostIndex}
-              health={hostHealth}
-              agentID={snapshot?.agent_id}
-            />
-          )}
+          {/* Always rendered, unlike before. With one host it was chrome
+              implying a choice you did not have — but it is also the only way
+              to reach the host manager, and "add a second server" is exactly
+              what someone with one host wants to do. */}
+          <HostPicker
+            hosts={hosts}
+            selectedURL={selectedHost?.url || ""}
+            setSelectedURL={setSelectedURL}
+            health={hostHealth}
+            agentID={snapshot?.agent_id}
+            onManage={() => setManaging(true)}
+            backendRows={backendRows}
+            backendHostID={backendHostID}
+            setBackendHostID={setBackendHostID}
+          />
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-[11px] font-mono">
-            <span className="w-2 h-2 rounded-full" style={{ background: connected ? "var(--good)" : "var(--crit)" }} />
+            {/* Red means something failed, not merely that nothing is
+                connected yet. Idle takes the neutral colour, or the header
+                claims an outage on a dashboard that has not been pointed at
+                anything. */}
+            <span
+              className="w-2 h-2 rounded-full"
+              style={{ background: connected ? "var(--good)" : error ? "var(--crit)" : "var(--ink-4)" }}
+            />
             {/* title carries the diagnosis — which layer failed and what to
                 check — without spending header width on it. */}
-            <span style={{ color: connected ? "var(--ink-3)" : "var(--crit)" }} title={error?.detail || ""}>
-              {loading ? "connecting…" : connected ? "live" : error.message}
+            <span
+              style={{ color: connected ? "var(--ink-3)" : error ? "var(--crit)" : "var(--ink-4)" }}
+              title={error?.detail || ""}
+            >
+              {/* Four states, not three. "Not loading, not connected, no
+                  error" is idle — nothing has been asked to connect — and it
+                  used to be unreachable because the poll never stopped
+                  loading when there was no host. Fixing that made this branch
+                  reachable and it read error.message off null, which took the
+                  whole page down rather than showing a status. */}
+              {loading
+                ? "connecting…"
+                : connected
+                  ? readingBackend ? "from backend" : "live"
+                  : error
+                    ? error.message
+                    : "no host selected"}
             </span>
           </div>
-          <button onClick={() => setPaused(!paused)}
-            className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1.5 rounded bg-[var(--surface)] border border-[var(--n4)] text-[var(--ink-3)]">
+          {/* Pausing stops the agent poll. There is no agent poll to stop
+              while reading the backend, so the control is disabled rather
+              than left looking operable and doing nothing. */}
+          <button
+            onClick={() => setPaused(!paused)}
+            disabled={readingBackend}
+            title={readingBackend ? "Reading stored data from the backend — nothing to pause" : ""}
+            className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1.5 rounded bg-[var(--surface)] border border-[var(--n4)] text-[var(--ink-3)] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
             {paused ? <Play size={12} /> : <Pause size={12} />}{paused ? "Resume" : "Pause"}
           </button>
           <ThemeSwitch theme={theme} setTheme={setTheme} />
@@ -1474,12 +2182,60 @@ export default function ObservabilityDashboard() {
             {snapshot && (
               <span className="text-[var(--ink-4)]"> Showing the last successful poll.</span>
             )}
+            {/* The way out of the dead end.
+                An unreachable agent used to leave nothing to do here: the
+                address is a forwarded port, the tunnel is down, and the fix
+                was to go edit the host list. But the backend usually holds
+                this host's telemetry already — it arrives by the host pushing
+                outward, which needs no route from this browser — so the
+                honest response to "cannot reach the agent" is to offer the
+                copy that does not need reaching. */}
+            {backendFallback && (
+              <>
+                {/* Counting rows and calling them "reporting" was a claim the
+                    inventory cannot support: a host is listed the moment
+                    anything arrives carrying its identity, so a fleet can hold
+                    machines that have never sent a data point. Saying they are
+                    reporting and then opening an empty view reads as a broken
+                    dashboard rather than an empty host, so the wording follows
+                    what is actually there. */}
+                <span className="text-[var(--ink-4)]">
+                  {" "}
+                  {backendFallback.matched
+                    ? backendFallback.hasData
+                      ? "This host is also reporting to the backend."
+                      : "The backend knows this host but has no metrics from it."
+                    : backendFallback.reporting > 0
+                      ? `${backendFallback.reporting} host${backendFallback.reporting === 1 ? " is" : "s are"} reporting to the backend.`
+                      : `${backendFallback.total} host${backendFallback.total === 1 ? " is" : "s are"} registered with the backend, none reporting metrics.`}
+                </span>{" "}
+                <button
+                  onClick={() => setBackendHostID(backendFallback.hostID)}
+                  className="underline underline-offset-2"
+                  style={{ color: "var(--accent)" }}
+                >
+                  {backendFallback.matched
+                    ? `Read ${backendFallback.label} from the backend`
+                    : backendFallback.hasData
+                      ? `Open ${backendFallback.label}`
+                      : `Open ${backendFallback.label} (no metrics yet)`}
+                </button>
+              </>
+            )}
           </span>
         </div>
       )}
 
       <div className="flex flex-1 min-h-0">
-        <Sidebar view={view} setView={setView} snap={snapshot} />
+        {managing && (
+          <HostManager
+            hosts={hosts}
+            setHosts={setHosts}
+            health={hostHealth}
+            onClose={() => setManaging(false)}
+          />
+        )}
+        <Sidebar view={view} setView={setView} hostCount={hosts.length} fleetCount={backendRows.length} />
 
         <div className="flex-1 min-w-0 p-5 overflow-y-auto">
           <div className="flex items-center gap-2 text-[11px] text-[var(--ink-5)] font-mono mb-3">
@@ -1497,10 +2253,20 @@ export default function ObservabilityDashboard() {
           )}
           {view === "fleet" && (
             <FleetView
-              results={fleet}
-              loading={fleetLoading}
-              onOpen={(i) => {
-                setHostIndex(i);
+              entries={fleetEntries}
+              loading={usingBackend ? backendLoading : fleetLoading}
+              source={usingBackend ? "backend" : "agents"}
+              sourceError={usingBackend ? backendError : null}
+              onOpen={(host, row) => {
+                if (host) {
+                  setBackendHostID("");
+                  setSelectedURL(host.url);
+                } else {
+                  // No route to the machine, so its telemetry comes from the
+                  // backend. This is the case the backend exists for and the
+                  // one that used to dead-end at a row you could not open.
+                  setBackendHostID(row.instanceID);
+                }
                 // SigNoz opens the host's detail, not a generic overview.
                 setView("infra");
               }}
@@ -1531,8 +2297,12 @@ export default function ObservabilityDashboard() {
           <div className="flex items-center gap-2 text-[10px] text-[var(--ink-5)] font-mono mt-5">
             <Cpu size={11} />
             {connected
-              ? `live from agent-i · ${d.envelopes.toLocaleString()} envelopes · ${snapshot.retain_sec}s window`
-              : "not connected to an agent"}
+              ? readingBackend
+                ? `from the backend · ${snapshot.counts?.series ?? 0} series · ${snapshot.counts?.logs ?? 0} logs · ${snapshot.counts?.spans ?? 0} spans · ${snapshot.retain_sec}s window`
+                : `live from agent-i · ${d.envelopes.toLocaleString()} envelopes · ${snapshot.retain_sec}s window`
+              : hosts.length === 0 && backendRows.length === 0
+                ? "no agents configured and nothing reporting to the backend"
+                : "not connected to an agent"}
           </div>
         </div>
       </div>

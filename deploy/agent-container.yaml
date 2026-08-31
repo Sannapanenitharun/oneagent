@@ -1,0 +1,130 @@
+# Agent configuration baked into the container image.
+#
+# It differs from configs/agent.yaml in the ways running inside a container
+# actually forces, and in no others. Every difference is commented, because a
+# second configuration file that quietly drifts from the first is how a
+# container deployment ends up collecting something different from a host
+# deployment for reasons nobody can reconstruct.
+#
+# Mount your own over it for anything real — the exporter below writes to
+# stdout, which is useful for confirming the agent works and useless for
+# shipping telemetry anywhere:
+#
+#   -v /etc/agent-i/agent.yaml:/etc/agent-i/agent.yaml:ro
+
+# Left empty, as on a host: the agent derives its id from the machine — the EC2
+# Name tag or instance id where those exist, and the hostname otherwise.
+#
+# In a container the hostname is the container's own id unless you run with
+# --uts=host, and that id changes on every recreate — so without that flag this
+# host reports as a new machine each restart. The agent detects the situation
+# and says so at startup rather than letting it pass. Set agent_id here if you
+# would rather pin it explicitly than depend on the flag.
+agent_id: ""
+interval: 15s
+
+metrics:
+  enabled: true
+  collect: ["cpu", "memory", "disk", "network"]
+
+# Per-container metrics and container stdout/stderr. On, which is the whole
+# reason this image exists.
+containers:
+  enabled: true
+  docker_endpoint: "/var/run/docker.sock"
+  logs:
+    enabled: true
+    # A host path. The agent prefixes it with AGENT_I_HOST_ROOT, so with
+    # -e AGENT_I_HOST_ROOT=/host this reads
+    # /host/var/lib/docker/containers — which is where the bind mount puts it.
+    root: "/var/lib/docker/containers"
+
+# Off: journalctl is not in this image, and shelling out to a binary that does
+# not exist would restart-loop the reader. Collect the host's journal with a
+# host-installed agent, or bind-mount /var/log/journal and add journalctl to
+# the image if you need it here.
+journald:
+  enabled: false
+
+# Host log files, if you mount them. Nothing is collected until you do:
+#
+#   -v /var/log:/host/var/log:ro
+#
+# Note these paths are NOT rewritten by AGENT_I_HOST_ROOT — that prefix applies
+# to /proc and /sys, which the agent addresses itself, not to paths you wrote.
+# Spelling out /host here is deliberate: a glob is a thing the operator chose,
+# and silently relocating it would make a path that works on a host silently
+# read something else in a container.
+logs:
+  enabled: true
+  paths:
+    - "/host/var/log/*.log"
+    - "/host/var/log/syslog"
+  multiline:
+    enabled: false
+
+access_logs:
+  enabled: false
+
+tailing:
+  scan_interval: 30s
+  poll_interval: 500ms
+  max_line_bytes: 262144
+  # Mount a volume at /var/lib/agent-i or this is lost on every recreate, and
+  # the agent re-reads or skips log files instead of resuming.
+  registry_path: "/var/lib/agent-i/registry.json"
+
+traces:
+  enabled: true
+  # 0.0.0.0, where a host install uses 127.0.0.1 — and this is not the loosening
+  # it looks like. Inside a container, 0.0.0.0 is the container's own network
+  # interface, not the host's: nothing outside reaches it until you publish the
+  # port with -p or attach an app container to the same network. A loopback
+  # bind here would be unreachable even from a container on the same network,
+  # which would defeat the purpose of running the receiver at all.
+  #
+  # 4318 rather than the host default of 4319, because that is the port an SDK
+  # assumes when given OTEL_EXPORTER_OTLP_ENDPOINT=http://agent-i:4318.
+  listen_addr: "0.0.0.0:4318"
+  max_request_bytes: 4194304
+  # Set either of AGENT_I_TRACE_TOKEN or AGENT_I_API_TOKEN in the container's
+  # environment to require a bearer token; the named one wins when both are
+  # set. Worth doing the moment the port is published beyond a private network
+  # — the receiver otherwise accepts spans from anything that can reach it.
+  auth_token_env: "AGENT_I_TRACE_TOKEN"
+  accept_logs: true
+  accept_metrics: true
+  sampling:
+    enabled: false
+  stats:
+    enabled: true
+    interval: 60s
+
+dashboard:
+  enabled: true
+  # Also 0.0.0.0 for the reason above: docker's port publishing forwards to the
+  # container's interface, so a service bound to 127.0.0.1 inside the container
+  # cannot be published at all. Publish it to loopback on the host side instead
+  # — -p 127.0.0.1:8088:8088 — which puts the access control where it can
+  # actually be enforced. The endpoint is unauthenticated and shows this host's
+  # metrics, logs and trace contents; do not publish it to 0.0.0.0.
+  listen_addr: "0.0.0.0:8088"
+  retain: 15m
+  max_series: 500
+
+exporter:
+  # stdout so a fresh `docker run` visibly works before anything else is
+  # configured. Replace it with your backend by mounting a config:
+  #
+  #   exporter:
+  #     type: "otlp_http"
+  #     endpoint: "http://backend:4318"
+  #     headers_env:
+  #       x-api-key: AGENT_I_INGEST_KEY
+  type: "stdout"
+  batch_size: 100
+  flush_interval: 10s
+  max_batch_bytes: 4194304
+  spool:
+    enabled: true
+    dir: "/var/lib/agent-i/spool"

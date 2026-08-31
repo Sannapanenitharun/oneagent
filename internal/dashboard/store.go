@@ -69,6 +69,22 @@ type Span struct {
 	Name     string  `json:"name"`
 	DurMs    float64 `json:"dur_ms"`
 	Status   string  `json:"status,omitempty"`
+	// Kind is OTLP's span kind — client, server, producer, consumer, internal.
+	//
+	// It is what makes a service graph derivable rather than guessed. An edge
+	// between two services is a client span whose child is a server span;
+	// parent-child alone cannot distinguish that from an ordinary nested call,
+	// and cannot tell an outbound call to an uninstrumented database from one
+	// to a service that happens not to be reporting.
+	Kind string `json:"kind,omitempty"`
+	// Peer carries the attributes naming what an outbound span was talking to,
+	// for the case where that something is not instrumented and so has no span
+	// of its own anywhere in the trace. Without it a service's databases,
+	// queues and third-party APIs are simply absent from the graph.
+	//
+	// Omitted when the span named no peer, which is every server span and most
+	// internal ones.
+	Peer map[string]string `json:"peer,omitempty"`
 }
 
 // AdapterContract identifies the derivation semantics this payload is built
@@ -120,6 +136,19 @@ type Snapshot struct {
 	// answers "is the agent working", so it is where "is the agent running what
 	// you think it is" belongs too.
 	ReloadPendingRestart []string `json:"reload_pending_restart"`
+	// Host carries attributes describing the machine itself, discovered at
+	// startup rather than configured — on EC2 that is the instance id, type,
+	// region, availability zone and account.
+	//
+	// It is separate from AgentID because the two answer different questions.
+	// AgentID is the name an operator chose in the config file and is all that
+	// exists off a cloud host; this is what the machine actually is. Showing
+	// only the former means a dashboard cannot tell you which instance you are
+	// looking at, which is exactly what you need when a host misbehaves.
+	//
+	// Omitted entirely when nothing was discovered, so a non-cloud host does
+	// not carry an empty object the UI would have to special-case.
+	Host map[string]string `json:"host,omitempty"`
 }
 
 type seriesBuf struct {
@@ -149,7 +178,11 @@ type Store struct {
 	// HTTP handlers, so it lives behind the store's existing mutex rather than
 	// introducing a lock into the daemon, which owns its state without one.
 	pendingRestart []string
-	nowFn          func() time.Time // injectable for tests
+	// hostAttrs is written once at startup, before the HTTP server is
+	// serving, but read by handler goroutines — kept under the same mutex as
+	// everything else rather than reasoned about as a special case.
+	hostAttrs map[string]string
+	nowFn     func() time.Time // injectable for tests
 }
 
 func NewStore(agentID, version string, retain time.Duration, maxSeries int) *Store {
@@ -168,6 +201,23 @@ func NewStore(agentID, version string, retain time.Duration, maxSeries int) *Sto
 		series:    make(map[string]*seriesBuf),
 		counts:    make(map[string]uint64),
 		nowFn:     func() time.Time { return time.Now().UTC() },
+	}
+}
+
+// SetHostAttributes records what the machine is, as discovered at startup.
+//
+// A setter rather than a NewStore parameter because detection is optional and
+// can fail: threading it through the constructor would put a "may be nil" map
+// in every caller, including the several tests that have no interest in it.
+func (s *Store) SetHostAttributes(attrs map[string]string) {
+	if len(attrs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hostAttrs = make(map[string]string, len(attrs))
+	for k, v := range attrs {
+		s.hostAttrs[k] = v
 	}
 }
 
@@ -213,12 +263,41 @@ func (s *Store) Record(e collector.Envelope) {
 			Name:     e.Labels["name"],
 			DurMs:    e.Value,
 			Status:   e.Labels["status.code"],
+			Kind:     e.Labels["span.kind"],
+			Peer:     peerAttributes(e.Labels),
 		}, maxSpans)
 	case collector.KindAPICall:
 		// An access-log request is a metric-shaped thing here: its latency
 		// over time is the useful view, keyed by method+path+status.
 		s.recordMetric(e)
 	}
+}
+
+// peerAttributeKeys mirrors the receiver's list. Kept as an explicit set
+// rather than "every label that is not one of ours" so that a new label added
+// elsewhere cannot silently start appearing on every span in the payload.
+var peerAttributeKeys = []string{
+	"peer.service",
+	"db.system", "db.system.name", "db.name", "db.namespace",
+	"messaging.system", "messaging.destination.name", "messaging.destination",
+	"rpc.system", "rpc.service",
+	"server.address", "net.peer.name",
+}
+
+// peerAttributes extracts what an outbound span named as its peer, returning
+// nil when it named none — which is most spans, and nil keeps the field out of
+// the JSON entirely rather than sending an empty object per span.
+func peerAttributes(labels map[string]string) map[string]string {
+	var out map[string]string
+	for _, k := range peerAttributeKeys {
+		if v := labels[k]; v != "" {
+			if out == nil {
+				out = make(map[string]string, 2)
+			}
+			out[k] = v
+		}
+	}
+	return out
 }
 
 func (s *Store) recordMetric(e collector.Envelope) {
@@ -329,6 +408,7 @@ func (s *Store) Snapshot() Snapshot {
 		RetainSec:       int(s.retain / time.Second),
 		Counts:          make(map[string]uint64, len(s.counts)),
 		SeriesDropped:   s.dropped,
+		Host:            copyAttrs(s.hostAttrs),
 		Series:          make([]Series, 0, len(s.series)),
 		// make, not append to a nil slice: appending nothing to nil yields nil,
 		// which marshals as JSON null rather than []. Series was already built
@@ -420,4 +500,17 @@ func appendCapped[T any](buf []T, v T, max int) []T {
 		buf = append(buf[:0], buf[len(buf)-max:]...)
 	}
 	return buf
+}
+
+// copyAttrs returns a copy so a caller holding a Snapshot cannot mutate store
+// state, and nil for an empty map so the field is omitted from the JSON.
+func copyAttrs(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

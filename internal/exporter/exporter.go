@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -38,6 +39,25 @@ type Exporter interface {
 func New(cfg config.ExporterConfig, retire func(collector.Envelope)) (Exporter, error) {
 	switch cfg.Type {
 	case "stdout", "":
+		// Said out loud, because this is the configuration that looks most like
+		// a working one and is not.
+		//
+		// stdout is the shipped default, so a fresh install collects correctly,
+		// reports healthy, prints every envelope — and delivers nothing. On a
+		// systemd host those envelopes go to the journal and are discarded by
+		// its rotation, so the evidence that it was working is also the reason
+		// nobody notices it is not. Diagnosing it means reading the journal
+		// closely enough to realise the JSON in it IS the telemetry rather than
+		// a debug trace of it, which is not an obvious leap.
+		//
+		// A warning rather than an error: stdout is genuinely the right choice
+		// for a local run or a container you are watching, and refusing to
+		// start would break that. But it should never be silent, which is the
+		// same rule the spool applies a few lines below.
+		log.Printf("exporter: type is %q — telemetry is written to this process's standard output and "+
+			"sent NOWHERE. On a systemd host it lands in the journal and is rotated away. Set "+
+			"exporter.type to \"otlp_http\" with an endpoint to ship it to a backend.",
+			exporterTypeLabel(cfg.Type))
 		return withRetire(&stdoutExporter{}, retire), nil
 	case "file":
 		f, err := newFileExporter(cfg.Path)
@@ -49,21 +69,72 @@ func New(cfg config.ExporterConfig, retire func(collector.Envelope)) (Exporter, 
 		// Network exporters are wrapped so delivery happens off the
 		// collectors' goroutines — see async.go for why that matters. stdout
 		// and file are left synchronous: they are local, fast, and tests rely
-		// on their output being deterministic.
+		// on their output being deterministic. They also have no use for a
+		// spool, since the sink they write to IS the disk.
 		h, err := newHTTPExporter(cfg)
 		if err != nil {
 			return nil, err
 		}
-		return newAsyncExporter(h, cfg.QueueSize, cfg.ShutdownTimeout, retire), nil
+		sp, err := openConfiguredSpool(cfg, retire)
+		if err != nil {
+			return nil, err
+		}
+		return newAsyncExporter(h, cfg.QueueSize, cfg.ShutdownTimeout, retire, sp), nil
 	case "otlp_http":
 		o, err := newOTLPHTTPExporter(cfg)
 		if err != nil {
 			return nil, err
 		}
-		return newAsyncExporter(o, cfg.QueueSize, cfg.ShutdownTimeout, retire), nil
+		sp, err := openConfiguredSpool(cfg, retire)
+		if err != nil {
+			return nil, err
+		}
+		return newAsyncExporter(o, cfg.QueueSize, cfg.ShutdownTimeout, retire, sp), nil
 	default:
 		return nil, fmt.Errorf("unknown exporter type %q", cfg.Type)
 	}
+}
+
+// exporterTypeLabel names the type in a message, distinguishing a deliberate
+// "stdout" from an absent value that defaulted to it — the second is worth
+// separating because the operator never chose it.
+func exporterTypeLabel(t string) string {
+	if t == "" {
+		return "stdout (unset)"
+	}
+	return t
+}
+
+// openConfiguredSpool builds the disk spool, if one is wanted.
+//
+// The failure handling is deliberately asymmetric. A spool_dir written in the
+// config is a promise the operator made about where this agent keeps its data,
+// and quietly ignoring an unusable one would leave them believing an outage is
+// survivable when it is not — so that is a startup error, in keeping with how
+// this package already treats a typo'd exporter type. The default path is a
+// guess we made on their behalf, and an agent that refuses to start because it
+// could not create /var/lib/agent-i/spool (unprivileged run, read-only root)
+// would be worse than one that collects with the pre-spool durability. So that
+// case warns loudly and carries on.
+func openConfiguredSpool(cfg config.ExporterConfig, retire func(collector.Envelope)) (*spool, error) {
+	if !cfg.Spool.SpoolEnabled() {
+		return nil, nil
+	}
+	sp, err := openSpool(spoolOptions{
+		Dir:          cfg.Spool.Dir,
+		MaxBytes:     cfg.Spool.MaxBytes,
+		SegmentBytes: cfg.Spool.SegmentBytes,
+		SyncInterval: cfg.Spool.SyncInterval,
+		Retire:       retire,
+	})
+	if err == nil {
+		return sp, nil
+	}
+	if cfg.Spool.SpoolRequired() {
+		return nil, fmt.Errorf("opening exporter spool: %w", err)
+	}
+	log.Printf("exporter: no spool (%v) — envelopes will be dropped oldest-first during an outage and lost on restart; set exporter.spool.dir to a writable path to keep them", err)
+	return nil, nil
 }
 
 // retiringExporter reports the fate of an envelope for the synchronous sinks,
@@ -310,4 +381,28 @@ func gzipCompress(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// ResourceRefresher is implemented by exporters whose host attributes are not
+// necessarily final when the process starts.
+//
+// It exists for IMDS: a boot can have the agent running before the network
+// stack answers, and the instance identity discovered a few seconds later is
+// still the right identity for everything sent afterwards. Without a way to
+// publish it, a host that lost that race reported no instance attributes until
+// somebody restarted the agent.
+//
+// Optional by design — stdout and file exporters have no resource to refresh —
+// so callers type-assert rather than depending on every Exporter to implement
+// it.
+type ResourceRefresher interface {
+	SetResourceAttributes(map[string]string)
+}
+
+// SetResourceAttributes forwards to the wrapped exporter when it supports it,
+// so the wrapping does not hide the capability from the daemon.
+func (r *retiringExporter) SetResourceAttributes(attrs map[string]string) {
+	if inner, ok := r.inner.(ResourceRefresher); ok {
+		inner.SetResourceAttributes(attrs)
+	}
 }

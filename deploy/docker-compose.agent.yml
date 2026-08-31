@@ -1,0 +1,86 @@
+# The agent, monitoring the Docker host it runs on.
+#
+#   cd deploy && docker compose -f docker-compose.agent.yml up -d
+#
+# Separate from docker-compose.yml, which brings up the backend. They are
+# different things with different lifecycles: one backend serves many hosts,
+# and this file runs on every host that has containers worth watching. Bring up
+# both on a laptop by passing both files.
+
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.agent
+    container_name: agent-i
+
+    # Host process namespace. Needed for two things: resolving the pids listed
+    # in a container's cgroup.procs so per-container network counters can be
+    # read from that container's /proc/<pid>/net/dev, and letting the agent
+    # identify the machine rather than itself. Without it, container network
+    # metrics are absent — everything else still works.
+    pid: host
+
+    # Host cgroup namespace. This one is not optional for container metrics.
+    # Under cgroup v2 a container in its own cgroup namespace sees
+    # /sys/fs/cgroup rooted at its OWN cgroup, so sibling containers are
+    # invisible no matter what is mounted. Omitting this produces an agent that
+    # reports zero containers on a host running fifty.
+    cgroup: host
+
+    # Host UTS namespace, which is to say the host's hostname.
+    #
+    # Without it the agent names itself after the container — a hex string that
+    # changes on every recreate — and this host arrives at the backend as a new
+    # machine each time. Nothing else can supply it: the hostname lives in this
+    # namespace, the /proc and cgroup mounts do not reach into it, and the one
+    # route that would (reading pid 1's root) needs SYS_PTRACE, which this
+    # deployment deliberately does not take. The agent says so at startup if it
+    # is missing. Setting agent_id in the config is the alternative.
+    uts: host
+
+    environment:
+      # Where the host's filesystem is mounted below. Without it the agent
+      # reads its own /proc and reports the container's view of the machine as
+      # the host's — not missing data, but confidently wrong data.
+      AGENT_I_HOST_ROOT: /host
+      # Uncomment to require a bearer token on the OTLP receiver.
+      # AGENT_I_TRACE_TOKEN: "${AGENT_I_TRACE_TOKEN:-}"
+      # The ingest key for the backend, referenced by headers_env in a mounted
+      # config. Never put the key in the config file itself.
+      # AGENT_I_INGEST_KEY: "${AGENT_I_INGEST_KEY:-}"
+
+    volumes:
+      # Host metrics: cpu, memory, load, disk io, network. Read-only.
+      - /proc:/host/proc:ro
+      # Container metrics. Every container.* number comes from here.
+      - /sys/fs/cgroup:/host/sys/fs/cgroup:ro
+      # Container names and images. Metrics work without it — containers are
+      # then labelled by short id — so it is genuinely optional, but a chart of
+      # twelve hex strings is not much use.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Container stdout/stderr, as written by the json-file log driver.
+      - /var/lib/docker/containers:/host/var/lib/docker/containers:ro
+      # Host log files, matching the logs.paths globs in the baked config.
+      - /var/log:/host/var/log:ro
+      # Tail offsets and the export spool. Without this a recreate loses the
+      # read positions and the agent either re-sends or skips.
+      - agent-i-state:/var/lib/agent-i
+      # Your own configuration, replacing the stdout exporter in the image.
+      # - ./agent.yaml:/etc/agent-i/agent.yaml:ro
+
+    ports:
+      # OTLP ingest for application containers. This is what makes traces work
+      # on a Docker host: an app container cannot reach a receiver bound to the
+      # host's 127.0.0.1, which is the usual reason spans never arrive. Apps on
+      # this compose network can also skip the published port entirely and send
+      # to http://agent-i:4318.
+      - "4318:4318"
+      # The local dashboard, published to loopback only. It is unauthenticated
+      # and shows this host's metrics, logs and trace contents.
+      - "127.0.0.1:8088:8088"
+
+    restart: unless-stopped
+
+volumes:
+  agent-i-state:

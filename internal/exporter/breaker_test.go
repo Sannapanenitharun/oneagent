@@ -209,7 +209,7 @@ func (f *failingExporter) count() int {
 // holding the freshest envelopes, not have been drained and discarded.
 func TestAsyncExporter_OpenBreakerRetainsQueuedEnvelopes(t *testing.T) {
 	inner := &failingExporter{failFor: 1 << 30} // never recovers
-	a := newAsyncExporter(inner, 8, 50*time.Millisecond, nil)
+	a := newAsyncExporter(inner, 8, 50*time.Millisecond, nil, nil)
 	defer a.Close()
 
 	// First envelope trips the breaker.
@@ -237,7 +237,7 @@ func TestAsyncExporter_OpenBreakerRetainsQueuedEnvelopes(t *testing.T) {
 
 func TestAsyncExporter_ResumesAfterEndpointRecovers(t *testing.T) {
 	inner := &failingExporter{failFor: 1}
-	a := newAsyncExporter(inner, 16, time.Second, nil)
+	a := newAsyncExporter(inner, 16, time.Second, nil, nil)
 	defer a.Close()
 
 	// The first send fails and opens the breaker.

@@ -137,3 +137,61 @@ func TestResourceFor_AttributeOrderIsStable(t *testing.T) {
 		}
 	}
 }
+
+// A resource must never carry the same attribute twice.
+//
+// Every other test here reads attributes through attrMap, which collapses a
+// duplicate into one entry and so cannot see this class of fault at all. It
+// went unnoticed that way: discovery began supplying host.name from the EC2
+// Name tag while resourceFor still appended its own unconditionally, and the
+// resource carried two host.name attributes with different values. OTLP does
+// not say which one a backend keeps, so the host's name depended on the reader.
+func TestResourceFor_NoDuplicateAttributes(t *testing.T) {
+	cfg := config.ExporterConfig{
+		Endpoint: "http://127.0.0.1:1",
+		ResourceAttributes: map[string]string{
+			"host.name":      "prod-web-01",
+			"host.id":        "i-0123456789abcdef0",
+			"cloud.provider": "aws",
+		},
+	}
+	exp, err := newOTLPHTTPExporter(cfg)
+	if err != nil {
+		t.Fatalf("constructing exporter: %v", err)
+	}
+	defer exp.Close()
+
+	counts := map[string]int{}
+	for _, a := range exp.resourceFor("svc").Attributes {
+		counts[a.Key]++
+	}
+	for key, n := range counts {
+		if n > 1 {
+			t.Errorf("attribute %q appears %d times in one resource", key, n)
+		}
+	}
+
+	// And the discovered values are the ones that survived, not the agent's
+	// own fallbacks — the whole point of detecting them.
+	got := attrMap(exp.resourceFor("svc"))
+	if got["host.name"] != "prod-web-01" {
+		t.Errorf("host.name = %q, want the discovered Name tag", got["host.name"])
+	}
+	if got["host.id"] != "i-0123456789abcdef0" {
+		t.Errorf("host.id = %q, want the discovered instance id", got["host.id"])
+	}
+}
+
+// With nothing discovered the agent still has to name the host, or telemetry
+// arrives with no host identity at all.
+func TestResourceFor_HostNameFallsBackWithoutDiscovery(t *testing.T) {
+	exp, err := newOTLPHTTPExporter(config.ExporterConfig{Endpoint: "http://127.0.0.1:1"})
+	if err != nil {
+		t.Fatalf("constructing exporter: %v", err)
+	}
+	defer exp.Close()
+
+	if got := attrMap(exp.resourceFor("svc")); got["host.name"] == "" {
+		t.Error("host.name absent with no discovered value to replace it")
+	}
+}

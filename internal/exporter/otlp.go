@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent-i/agent/internal/collector"
@@ -208,9 +209,29 @@ type otlpHTTPExporter struct {
 	hostIDOnce sync.Once
 	hostIDVal  string
 
-	// resourceAttrs are runtime-discovered attributes describing the host
-	// (EC2 instance identity). Fixed for the life of the process.
-	resourceAttrs map[string]string
+	// resourceAttrs are runtime-discovered attributes describing the host: the
+	// OS description, and on EC2 the instance identity.
+	//
+	// Held behind an atomic pointer because they are not necessarily final at
+	// startup. IMDS can be unreachable for the first seconds of a boot — the
+	// agent may well start before the network stack is ready — and a host that
+	// lost that race used to report no instance identity for the entire life
+	// of the process, until somebody noticed and restarted it. The daemon
+	// re-probes in the background and publishes the result here.
+	//
+	// The map itself is never mutated after being stored; a refresh swaps in a
+	// new one, so readers need no lock.
+	resourceAttrs atomic.Pointer[map[string]string]
+}
+
+// SetResourceAttributes publishes a refined set of host attributes. It is safe
+// to call while exports are in flight.
+func (o *otlpHTTPExporter) SetResourceAttributes(attrs map[string]string) {
+	copied := make(map[string]string, len(attrs))
+	for k, v := range attrs {
+		copied[k] = v
+	}
+	o.resourceAttrs.Store(&copied)
 }
 
 func newOTLPHTTPExporter(cfg config.ExporterConfig) (*otlpHTTPExporter, error) {
@@ -238,9 +259,9 @@ func newOTLPHTTPExporter(cfg config.ExporterConfig) (*otlpHTTPExporter, error) {
 		maxBatchBytes: resolveMaxBatchBytes(cfg.MaxBatchBytes),
 		flushInterval: flushInterval,
 		maxRetries:    maxRetries,
-		resourceAttrs: cfg.ResourceAttributes,
 		stopCh:        make(chan struct{}),
 	}
+	o.SetResourceAttributes(cfg.ResourceAttributes)
 	o.flushWg.Add(1)
 	go o.flushLoop()
 	return o, nil
@@ -368,14 +389,41 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	// service.name, it should never vary per-envelope.
 	attrs := []otlpKeyValue{
 		stringAttr("service.name", serviceName),
-		stringAttr("host.name", o.hostName()),
-		// os.type is what a backend's host-inventory view
-		// reads to populate its "OS Type" filter. Without it every host
-		// this agent reports lands in an unnamed, unselectable bucket in
-		// that facet. runtime.GOOS already spells the OTel-defined values
-		// ("linux", "darwin", "windows") identically, so no mapping table
-		// is needed for any platform this agent builds for.
-		stringAttr("os.type", runtime.GOOS),
+	}
+	// Loaded once per resource so every attribute below sees the same
+	// snapshot. Reading the pointer per lookup would let a refresh land
+	// mid-build and produce a resource that is half old and half new.
+	ra := *o.resourceAttrs.Load()
+
+	// host.name is emitted here, immediately after service.name, only when
+	// discovery did not supply one. For a while it was emitted unconditionally
+	// while discovery also supplied it from the EC2 Name tag, so the resource
+	// carried the attribute twice with two different values — and OTLP does
+	// not define which of a duplicated pair a backend keeps, so the host's
+	// name depended on the reader. The discovered one wins, for the same
+	// reason it does for host.id below: the Name tag is what the instance is
+	// actually called, while this is the agent's own configured id.
+	if _, discovered := ra["host.name"]; !discovered {
+		attrs = append(attrs, stringAttr("host.name", o.hostName()))
+	}
+
+	// os.type is what a backend's host-inventory view reads to populate its
+	// "OS Type" filter. Without it every host this agent reports lands in an
+	// unnamed, unselectable bucket in that facet.
+	//
+	// Emitted here only when detection did not supply it. runtime.GOOS is a
+	// build constant, so it can say which kernel family the binary was
+	// compiled for and nothing more — it cannot distinguish two hosts, which
+	// is what a fleet view exists to do. The detected value carries the
+	// distribution and version alongside it; this remains as the floor for a
+	// host that could not describe itself. Same precedence as host.name above,
+	// and for the same reason: a duplicated attribute has no defined winner in
+	// OTLP, so the value would depend on the reader.
+	if _, discovered := ra["os.type"]; !discovered {
+		attrs = append(attrs, stringAttr("os.type", runtime.GOOS))
+	}
+
+	attrs = append(attrs,
 		// Which build produced this telemetry. Deliberately NOT
 		// service.version: on spans forwarded from an externally
 		// instrumented app, service.name is that app's identity, and
@@ -386,7 +434,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 		// it carries.
 		stringAttr("telemetry.distro.name", "agent-i"),
 		stringAttr("telemetry.distro.version", version.Version),
-	}
+	)
 	// host.id is recommended (not required) by the OTel host resource
 	// Monitoring as a fallback identifier when hostnames collide (cloned
 	// VMs, ephemeral instances reusing a name) — included when available,
@@ -396,7 +444,7 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 	// define host.id as the instance id, and that is what links this telemetry
 	// to the instance in a backend. machine-id remains the fallback everywhere
 	// else.
-	if _, discovered := o.resourceAttrs["host.id"]; !discovered {
+	if _, discovered := ra["host.id"]; !discovered {
 		if id := o.hostID(); id != "" {
 			attrs = append(attrs, stringAttr("host.id", id))
 		}
@@ -404,14 +452,14 @@ func (o *otlpHTTPExporter) resourceFor(serviceName string) otlpResource {
 
 	// Emitted in sorted order so a resource is byte-identical between flushes
 	// and between processes, which keeps diffs and tests stable.
-	if len(o.resourceAttrs) > 0 {
-		keys := make([]string, 0, len(o.resourceAttrs))
-		for k := range o.resourceAttrs {
+	if len(ra) > 0 {
+		keys := make([]string, 0, len(ra))
+		for k := range ra {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			attrs = append(attrs, stringAttr(k, o.resourceAttrs[k]))
+			attrs = append(attrs, stringAttr(k, ra[k]))
 		}
 	}
 	return otlpResource{Attributes: attrs}
@@ -467,6 +515,19 @@ var cumulativeMetrics = map[string]bool{
 	"system.disk.io":             true,
 	"system.disk.operations":     true,
 	"system.disk.operation_time": true,
+
+	// Container counters. These reset when a container restarts rather than
+	// when the host boots, which is why their envelopes carry the container's
+	// own creation time as the start time (see containers.go) — a Sum whose
+	// start time is the host's boot would make a fresh container's first
+	// reading look like a step change from a value it never had.
+	"container.cpu.usage.total":                    true,
+	"container.cpu.usage.usermode":                 true,
+	"container.cpu.usage.kernelmode":               true,
+	"container.cpu.throttling_data.throttled_time": true,
+	"container.blockio.io_service_bytes_recursive": true,
+	"container.network.io.usage.rx_bytes":          true,
+	"container.network.io.usage.tx_bytes":          true,
 }
 
 // startTimeFor returns the cumulative counter's start time, which OTel requires

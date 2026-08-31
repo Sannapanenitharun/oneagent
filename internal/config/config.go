@@ -13,14 +13,21 @@ import (
 
 // Config is the root configuration for the agent daemon.
 type Config struct {
-	AgentID    string          `yaml:"agent_id"`
-	Interval   time.Duration   `yaml:"interval"`
-	Metrics    MetricsConfig   `yaml:"metrics"`
-	Logs       LogsConfig      `yaml:"logs"`
-	AccessLogs AccessLogConfig `yaml:"access_logs"`
-	Tailing    TailingConfig   `yaml:"tailing"`
-	Traces     TracesConfig    `yaml:"traces"`
-	Exporter   ExporterConfig  `yaml:"exporter"`
+	// AgentID names this agent in every signal it emits. Optional: left empty,
+	// the daemon derives one at startup from what the machine actually is —
+	// see daemon.resolveAgentID. It is not defaulted here because Load must
+	// stay a pure function of the file, and any useful default depends on the
+	// host rather than the configuration.
+	AgentID    string           `yaml:"agent_id"`
+	Interval   time.Duration    `yaml:"interval"`
+	Metrics    MetricsConfig    `yaml:"metrics"`
+	Logs       LogsConfig       `yaml:"logs"`
+	Journald   JournaldConfig   `yaml:"journald"`
+	Containers ContainersConfig `yaml:"containers"`
+	AccessLogs AccessLogConfig  `yaml:"access_logs"`
+	Tailing    TailingConfig    `yaml:"tailing"`
+	Traces     TracesConfig     `yaml:"traces"`
+	Exporter   ExporterConfig   `yaml:"exporter"`
 
 	Aggregation AggregationConfig `yaml:"aggregation"`
 	Dashboard   DashboardConfig   `yaml:"dashboard"`
@@ -179,6 +186,85 @@ type AccessLogConfig struct {
 	} `yaml:"json_fields"`
 }
 
+// JournaldConfig controls collection of the systemd journal — the operating
+// system's own logs, which are not files and so cannot be reached by the path
+// tailer in LogsConfig.
+//
+// Off by default, for the same reason Datadog and Dynatrace both make it
+// opt-in: it needs the agent user to be in the systemd-journal group, and on a
+// host without systemd it cannot work at all.
+type JournaldConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Units limits collection to these systemd units. Empty collects the whole
+	// journal, which is the useful default for OS logs — the interesting entry
+	// is usually from a unit nobody thought to list.
+	Units []string `yaml:"units"`
+	// ExcludeUnits drops entries from named units, for the noisy one on an
+	// otherwise interesting host.
+	ExcludeUnits []string `yaml:"exclude_units"`
+	// Priority keeps entries at this syslog level and more severe ("err",
+	// "warning", "4"). Empty keeps everything.
+	Priority string `yaml:"priority"`
+	// Since seeds the first read when no cursor has been stored yet. Empty
+	// starts at the end of the journal rather than replaying whatever history
+	// the host retains.
+	Since string `yaml:"since"`
+	// JournalctlPath overrides the binary; needed inside a chroot, where
+	// resolving from $PATH does not work.
+	JournalctlPath string `yaml:"journalctl_path"`
+	// CursorPath persists the position of the last exported entry so a restart
+	// resumes instead of skipping or replaying. Defaults beside the tail
+	// registry in the state directory.
+	CursorPath string `yaml:"cursor_path"`
+}
+
+// ContainersConfig controls per-container metrics and container log collection
+// on a Docker host.
+//
+// Off by default. On a host with no containers it would cost a cgroup stat
+// every interval to learn that repeatedly, and on a host that does run
+// containers, turning it on multiplies the series count by however many are
+// running — which is the operator's decision to make, not an upgrade side
+// effect. The shipped container image enables it explicitly.
+type ContainersConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// DockerEndpoint is the Engine API socket, used only to resolve container
+	// names and images. Metrics come from cgroups and do not need it; an
+	// unreachable socket costs the labels, not the data.
+	DockerEndpoint string `yaml:"docker_endpoint"`
+	// Interval defaults to the agent's top-level interval. Separable because
+	// container counts change far more slowly than a busy host's CPU, and on a
+	// host running hundreds of containers a longer container interval is a
+	// cheap way to cut series volume without blunting host metrics.
+	Interval time.Duration `yaml:"interval"`
+	// ExcludeImages and ExcludeNames drop containers whose image reference or
+	// name contains any of these substrings. The agent's own container is
+	// always excluded and does not need listing.
+	ExcludeImages []string `yaml:"exclude_images"`
+	ExcludeNames  []string `yaml:"exclude_names"`
+
+	Logs ContainerLogsConfig `yaml:"logs"`
+}
+
+// ContainerLogsConfig controls collection of container stdout/stderr from the
+// json-file log driver's files.
+type ContainerLogsConfig struct {
+	// Enabled is a pointer so an absent block means on whenever containers are
+	// enabled at all. Someone who turns on container monitoring and gets
+	// metrics but no logs has to go and find out why; the reverse — getting
+	// logs they did not want — is one setting away and visible immediately.
+	Enabled *bool `yaml:"enabled"`
+	// Root is the json-file driver's directory. Override it for a host with a
+	// relocated Docker data-root.
+	Root string `yaml:"root"`
+}
+
+// CollectLogs reports whether container logs should be collected, treating an
+// unset value as true.
+func (c ContainersConfig) CollectLogs() bool {
+	return c.Logs.Enabled == nil || *c.Logs.Enabled
+}
+
 type TracesConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// ListenAddr is the address to listen on for OTLP span pushes from
@@ -193,6 +279,17 @@ type TracesConfig struct {
 	// clients must present. Empty means no authentication, which is only
 	// reasonable while ListenAddr is loopback.
 	AuthTokenEnv string `yaml:"auth_token_env"`
+	// AcceptLogs and AcceptMetrics control the other two OTLP signals on this
+	// same listener. An SDK configured with OTEL_EXPORTER_OTLP_ENDPOINT sends
+	// all three to one base URL, so accepting only traces silently 404s an
+	// application's metrics and logs — which is why both default to true.
+	//
+	// They are pointers so an existing config that predates them is
+	// distinguishable from one that sets them to false: a bare false is the
+	// zero value of a bool and would silently disable both on upgrade. See
+	// applyTraceSignalDefaults.
+	AcceptLogs    *bool `yaml:"accept_logs"`
+	AcceptMetrics *bool `yaml:"accept_metrics"`
 
 	Sampling TraceSamplingConfig `yaml:"sampling"`
 	Stats    TraceStatsConfig    `yaml:"stats"`
@@ -267,7 +364,71 @@ type ExporterConfig struct {
 	// ShutdownTimeout bounds the final flush attempt on SIGTERM. An unbounded
 	// flush against an unreachable backend turns a restart into an outage.
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+
+	// Spool backs the queue above with disk so an outage or a restart does not
+	// end in data loss.
+	Spool SpoolConfig `yaml:"spool"`
 }
+
+// SpoolConfig controls the exporter's disk-backed overflow buffer.
+//
+// QueueSize alone bounds how much of an outage the agent can absorb, and it
+// bounds it in memory, so raising it trades RAM on the observed host for
+// resilience — a bad trade past a few thousand envelopes, and one that a
+// restart wipes out anyway. The spool moves that buffer to disk, where it is
+// cheap and survives the process.
+//
+// It matters most for signals the agent cannot re-read. A tailed file or the
+// journal is itself a durable log, so those recover by rewinding a saved
+// position. Spans, logs and metrics pushed into the OTLP receiver were handed
+// over once and will not be offered again; without a spool, they are simply
+// gone.
+type SpoolConfig struct {
+	// Enabled is a pointer so an absent block means on. The healthy path never
+	// touches the disk — envelopes are written only once the in-memory queue
+	// has overflowed — so leaving it off by default would cost every existing
+	// deployment its data on the next outage in exchange for nothing.
+	Enabled *bool `yaml:"enabled"`
+
+	// Dir holds the segment files. Setting it explicitly also makes the spool
+	// mandatory: a directory the agent cannot open is a startup error rather
+	// than a warning, on the grounds that someone who named a path meant it.
+	// Left unset, an unusable default degrades to a warning and the old
+	// drop-oldest behaviour instead of refusing to start.
+	Dir string `yaml:"dir"`
+
+	// MaxBytes caps total spool size on disk. Beyond it the oldest whole
+	// segment is discarded, mirroring the in-memory queue's shed-oldest
+	// policy — a spool that filled the disk would take the host down with it,
+	// which is worse than losing the telemetry it was holding.
+	MaxBytes int64 `yaml:"max_bytes"`
+
+	// SegmentBytes is the size of one segment file. Segments are the unit of
+	// reclamation: a fully-read segment is deleted outright, so nothing is
+	// ever rewritten or compacted. Clamped to at most half of MaxBytes, since
+	// the cap has to hold one segment being written plus one still draining.
+	SegmentBytes int64 `yaml:"segment_bytes"`
+
+	// SyncInterval bounds how long a written envelope can sit in the page
+	// cache before fsync. This is the durability window: a power loss inside
+	// it loses those envelopes. Syncing per envelope would close the window
+	// and cost an fsync per record, which is more than duplicate telemetry is
+	// worth.
+	SyncInterval time.Duration `yaml:"sync_interval"`
+
+	// explicit records whether the YAML named this block at all, captured
+	// before defaults are applied — after which Dir is always set and could no
+	// longer answer the question. It is what separates "the operator asked for
+	// a spool here" from "nobody said, so we picked somewhere".
+	explicit bool
+}
+
+// SpoolEnabled reports whether to spool, treating an unset value as true.
+func (c SpoolConfig) SpoolEnabled() bool { return c.Enabled == nil || *c.Enabled }
+
+// SpoolRequired reports whether the spool was asked for by name. Only then is
+// a failure to open it fatal.
+func (c SpoolConfig) SpoolRequired() bool { return c.explicit }
 
 // Load reads and validates a YAML config file. Fails loudly on malformed
 // config rather than silently falling back to defaults — a mis-scoped agent
@@ -283,9 +444,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 
-	if cfg.AgentID == "" {
-		return nil, fmt.Errorf("config: agent_id is required")
-	}
+	// agent_id is deliberately not required. It used to be, which meant the
+	// shipped config had to carry a placeholder value for the agent to start at
+	// all — and that placeholder was then the real, identical id of every host
+	// installed from it. An empty value now means "work it out from the host",
+	// which is both a better default and impossible to leave wrong by accident.
 	if cfg.Interval <= 0 {
 		cfg.Interval = 15 * time.Second
 	}
@@ -327,6 +490,40 @@ func Load(path string) (*Config, error) {
 		cfg.Dashboard.MaxSeries = 500
 	}
 
+	if cfg.Journald.CursorPath == "" {
+		cfg.Journald.CursorPath = "/var/lib/agent-i/journald.cursor"
+	}
+
+	// Container defaults. Applied unconditionally rather than under
+	// cfg.Containers.Enabled so the effective values are the same whichever
+	// way the block was written, and so turning the feature on later does not
+	// also change what it points at.
+	if cfg.Containers.DockerEndpoint == "" {
+		cfg.Containers.DockerEndpoint = "/var/run/docker.sock"
+	}
+	if cfg.Containers.Interval <= 0 {
+		cfg.Containers.Interval = cfg.Interval
+	}
+	if cfg.Containers.Logs.Root == "" {
+		cfg.Containers.Logs.Root = "/var/lib/docker/containers"
+	}
+
+	// Spool defaults. Alongside the tailing registry and the journald cursor,
+	// because it is the same kind of thing: agent state that has to outlive
+	// the process for the agent to be able to promise anything.
+	cfg.Exporter.Spool.explicit = cfg.Exporter.Spool.Enabled != nil || cfg.Exporter.Spool.Dir != ""
+	if cfg.Exporter.Spool.Dir == "" {
+		cfg.Exporter.Spool.Dir = "/var/lib/agent-i/spool"
+	}
+	if cfg.Exporter.Spool.MaxBytes <= 0 {
+		cfg.Exporter.Spool.MaxBytes = 128 << 20
+	}
+	if cfg.Exporter.Spool.SegmentBytes <= 0 {
+		cfg.Exporter.Spool.SegmentBytes = 8 << 20
+	}
+	if cfg.Exporter.Spool.SyncInterval <= 0 {
+		cfg.Exporter.Spool.SyncInterval = time.Second
+	}
 	if cfg.Traces.ListenAddr == "" {
 		cfg.Traces.ListenAddr = "127.0.0.1:4319"
 	}
@@ -336,6 +533,18 @@ func Load(path string) (*Config, error) {
 	if cfg.Traces.Sampling.KeepErrors == nil {
 		keep := true
 		cfg.Traces.Sampling.KeepErrors = &keep
+	}
+	// Default on: an unset value means a config written before this listener
+	// accepted anything but traces, and on those hosts the application's
+	// metrics and logs were being 404'd. Turning them on is the fix, not a
+	// behaviour change someone has to opt into.
+	if cfg.Traces.AcceptLogs == nil {
+		on := true
+		cfg.Traces.AcceptLogs = &on
+	}
+	if cfg.Traces.AcceptMetrics == nil {
+		on := true
+		cfg.Traces.AcceptMetrics = &on
 	}
 	if cfg.Traces.Sampling.Enabled && cfg.Traces.Sampling.Rate <= 0 {
 		// Enabling sampling without a rate almost certainly means "I forgot to

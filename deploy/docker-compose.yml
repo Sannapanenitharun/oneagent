@@ -1,0 +1,87 @@
+# The backend: ClickHouse plus the server that receives OTLP and answers the
+# dashboard's queries.
+#
+#   cd deploy && docker compose up -d
+#
+# Then point an agent at it:
+#
+#   exporter:
+#     type: "otlp_http"
+#     endpoint: "http://<this-host>:4318"
+#     headers_env:
+#       x-api-key: AGENT_I_INGEST_KEY
+#
+# and put the key in /etc/agent-i/env on the agent host.
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    environment:
+      CLICKHOUSE_DB: agenti
+      CLICKHOUSE_USER: agenti
+      # Development only. Override in any deployment that is not a laptop —
+      # the server reads its copy from AGENTI_CLICKHOUSE_PASSWORD below.
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-devpass}
+    ulimits:
+      # ClickHouse opens a file per part and logs a warning at every start
+      # without this. The default container limit is low enough to matter once
+      # there is real data.
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ports:
+      # Bound to loopback: the database has no business being reachable from
+      # outside this host. The server talks to it over the compose network.
+      - "127.0.0.1:8123:8123"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    # The same policy the server has, and for a stronger reason.
+    #
+    # Without it the database was the one part of the stack that could die and
+    # stay dead. It did: ClickHouse exited and the server carried on running —
+    # restart: unless-stopped kept IT alive — so `docker ps` showed the backend
+    # "Up" while every query and every ingest failed. depends_on only gates
+    # startup ordering, so nothing brought the database back or took the server
+    # down to match.
+    #
+    # A stack whose storage can vanish while its API keeps answering is worse
+    # than one that fails outright, because the failure is invisible from
+    # outside.
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      AGENTI_LISTEN: "0.0.0.0:4318"
+      AGENTI_CLICKHOUSE: "http://clickhouse:8123"
+      AGENTI_CLICKHOUSE_DB: agenti
+      AGENTI_CLICKHOUSE_USER: agenti
+      AGENTI_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-devpass}
+      # Comma-separated "label:key". Unset means no authentication, and the
+      # server says so loudly at startup rather than accepting the world
+      # quietly.
+      AGENTI_API_KEYS: ${AGENTI_API_KEYS:-}
+    ports:
+      # This one IS meant to be reachable — it is where the agents send.
+      # The published port is overridable because 4318 is OTLP's default and
+      # anything else speaking OTLP on this machine will already have claimed
+      # it. Inside the container it stays 4318.
+      - "${AGENTI_PORT:-4318}:4318"
+    depends_on:
+      clickhouse:
+        # Waits for the healthcheck, not just the container. The server would
+        # survive starting first (it retries), but a clean start is a clearer
+        # log for anyone reading it the first time.
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:

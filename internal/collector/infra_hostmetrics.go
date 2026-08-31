@@ -226,7 +226,7 @@ type networkPacketSample struct {
 }
 
 func readNetworkPacketStates() ([]networkPacketSample, error) {
-	f, err := os.Open("/proc/net/dev")
+	f, err := os.Open(hostPath("/proc/net/dev"))
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +278,7 @@ type networkIOSample struct {
 // fields followed by 8 transmit fields; bytes is the first field in each
 // group (index 0 and index 8).
 func readNetworkIOStates() ([]networkIOSample, error) {
-	f, err := os.Open("/proc/net/dev")
+	f, err := os.Open(hostPath("/proc/net/dev"))
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +357,25 @@ var realFilesystemTypes = map[string]bool{
 // numbers is deliberate — two filesystems that happen to be the same size are
 // still two filesystems, and must not collapse into one.
 func readFilesystemUsageStates() ([]filesystemUsageSample, error) {
-	return readFilesystemUsageStatesFrom("/proc/mounts", syscall.Statfs)
+	return readFilesystemUsageStatesFrom(hostPath("/proc/mounts"), hostStatfs)
+}
+
+// hostStatfs resolves a mountpoint read out of the host's mount table before
+// asking the kernel about it.
+//
+// The prefix has to be applied here and not only to the mounts file, because
+// the two are different kinds of lookup: reading /host/proc/mounts yields
+// paths like "/" and "/var" that name mountpoints in the HOST's namespace,
+// and statfs("/") inside a container answers about the container's overlay
+// instead. Left unprefixed, the disk metrics would be silently wrong rather
+// than absent — the same class of bug HostRootEnv exists to prevent.
+//
+// If the host root is not mounted, statfs fails and the mount is skipped by
+// the caller. That is the intended degradation: disk usage disappears from a
+// containerised agent that was only given /proc and /sys, rather than
+// reporting the image's layer sizes as if they were the disk.
+func hostStatfs(mountpoint string, buf *syscall.Statfs_t) error {
+	return syscall.Statfs(hostPath(mountpoint), buf)
 }
 
 // readFilesystemUsageStatesFrom is the testable body: the mounts file and the
@@ -430,7 +448,7 @@ func readFilesystemUsageStatesFrom(mountsPath string, statfs func(string, *sysca
 // minute load averages — a simple, non-cumulative Gauge, unlike
 // everything else read from /proc/stat in this file.
 func readLoadAverage() (map[string]float64, error) {
-	b, err := os.ReadFile("/proc/loadavg")
+	b, err := os.ReadFile(hostPath("/proc/loadavg"))
 	if err != nil {
 		return nil, err
 	}
@@ -476,7 +494,7 @@ type networkErrDropSample struct {
 // merged into readNetworkIOStates to keep each function's return type
 // simple and single-purpose.
 func readNetworkErrorsAndDrops() ([]networkErrDropSample, error) {
-	f, err := os.Open("/proc/net/dev")
+	f, err := os.Open(hostPath("/proc/net/dev"))
 	if err != nil {
 		return nil, err
 	}
@@ -528,7 +546,7 @@ var tcpStateNames = map[string]string{
 func readNetworkConnectionStates() (map[string]float64, error) {
 	counts := make(map[string]float64, len(tcpStateNames))
 	found := false
-	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+	for _, path := range []string{hostPath("/proc/net/tcp"), hostPath("/proc/net/tcp6")} {
 		f, err := os.Open(path)
 		if err != nil {
 			continue // tcp6 may not exist on IPv4-only hosts — not fatal
@@ -592,7 +610,7 @@ func isVirtualDisk(device string) bool {
 // block size — this is a longstanding Linux kernel convention, not
 // something read from the device itself.
 func readDiskIOStates() ([]diskIOSample, error) {
-	f, err := os.Open("/proc/diskstats")
+	f, err := os.Open(hostPath("/proc/diskstats"))
 	if err != nil {
 		return nil, err
 	}
@@ -641,7 +659,7 @@ func readDiskIOStates() ([]diskIOSample, error) {
 // any failure, since this is a supplementary field — losing it shouldn't
 // stop the actual CPU metrics from being collected.
 func readBootTimeUnix() string {
-	f, err := os.Open("/proc/stat")
+	f, err := os.Open(hostPath("/proc/stat"))
 	if err != nil {
 		return ""
 	}
@@ -669,7 +687,7 @@ var cpuTimeStateOrder = []string{"user", "nice", "system", "idle", "iowait", "ir
 // stat's jiffie counters themselves only ever increase, exactly like a
 // monotonic OTel counter is defined to behave.
 func readCPUTimeStates() (map[string]float64, error) {
-	f, err := os.Open("/proc/stat")
+	f, err := os.Open(hostPath("/proc/stat"))
 	if err != nil {
 		return nil, err
 	}
@@ -701,7 +719,7 @@ func readCPUTimeStates() (map[string]float64, error) {
 // system.memory.usage states (used/free/buffered/cached). Values are
 // converted from /proc/meminfo's native KB to bytes.
 func readMemoryUsageStates() (map[string]float64, error) {
-	f, err := os.Open("/proc/meminfo")
+	f, err := os.Open(hostPath("/proc/meminfo"))
 	if err != nil {
 		return nil, err
 	}

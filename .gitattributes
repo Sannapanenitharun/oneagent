@@ -1,0 +1,34 @@
+# Line endings.
+#
+# Git for Windows installs with core.autocrlf=true, which converts text files to
+# CRLF on checkout. Two things in this repo break when that happens, and both
+# break in ways that do not point at line endings:
+#
+#   internal/config/testdata/golden_config.json is compared byte for byte
+#   against what the parser produces, which is always LF. On a fresh Windows
+#   clone that test fails with a diff showing two identical-looking documents.
+#
+#   scripts/*.sh are executed on Linux hosts. A CRLF shebang line makes the
+#   kernel look for an interpreter whose name ends in a carriage return, and
+#   the error it produces names the interpreter, not the line ending.
+#
+# Declaring the endings here settles it for every clone regardless of local
+# git configuration. Nothing changes in the repository itself: every file is
+# already stored with LF, so this only affects what lands in the working tree.
+
+* text=auto
+
+*.sh    text eol=lf
+*.go    text eol=lf
+*.json  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.js    text eol=lf
+*.jsx   text eol=lf
+*.mjs   text eol=lf
+*.md    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+
+# Windows-native, and the only file here a Windows tool opens directly.
+*.ps1   text eol=crlf

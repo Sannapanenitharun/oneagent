@@ -239,3 +239,59 @@ func TestResourceAttributes_NilIsSafe(t *testing.T) {
 		t.Errorf("nil metadata produced %v", got)
 	}
 }
+
+// An instance with InstanceMetadataTags enabled exposes its tags, and the Name
+// tag is the label an operator recognises the host by.
+func TestDetect_ReadsNameTag(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/latest/api/token":
+			_, _ = w.Write([]byte("AQAAA-test-token"))
+		case r.URL.Path == "/latest/dynamic/instance-identity/document":
+			_, _ = w.Write([]byte(identityJSON))
+		case r.URL.Path == "/latest/meta-data/tags/instance/Name":
+			if r.Header.Get("X-aws-ec2-metadata-token") != "AQAAA-test-token" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			// IMDS returns the bare value; the trailing newline is here to
+			// prove it does not survive into an attribute.
+			_, _ = w.Write([]byte("prod-web-01\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	got, err := newDetectorAt(srv.URL, time.Second).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if got.Name != "prod-web-01" {
+		t.Errorf("name = %q, want the trimmed tag value", got.Name)
+	}
+	if got.ResourceAttributes()["host.name"] != "prod-web-01" {
+		t.Errorf("host.name = %q", got.ResourceAttributes()["host.name"])
+	}
+}
+
+// Tags are not exposed through IMDS unless someone turned that on, so a 404 on
+// the tag path is the ordinary case and must not fail detection.
+func TestDetect_SucceedsWithoutTags(t *testing.T) {
+	srv := imdsV2(t) // serves the identity document and 404s everything else
+	defer srv.Close()
+
+	got, err := newDetectorAt(srv.URL, time.Second).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("detect must succeed without tags: %v", err)
+	}
+	if got.InstanceID != "i-0123456789abcdef0" {
+		t.Errorf("instance id = %q", got.InstanceID)
+	}
+	if got.Name != "" {
+		t.Errorf("name = %q, want empty when tags are not exposed", got.Name)
+	}
+	if _, ok := got.ResourceAttributes()["host.name"]; ok {
+		t.Error("host.name must be absent rather than empty when there is no tag")
+	}
+}

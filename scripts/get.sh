@@ -7,6 +7,8 @@
 # Optional environment overrides:
 #   AGENT_I_REPO=owner/repo                # GitHub repo to fetch releases from, if you forked
 #   AGENT_I_VERSION=v1.2.0                 # defaults to the latest release
+#   AGENT_I_AGENT_ID=prod-web-01           # defaults to the machine's own name:
+#                                          # EC2 Name tag, else instance id, else hostname
 #
 # What it does, in order:
 #   1. detects OS + CPU architecture
@@ -107,6 +109,16 @@ id -u agent-i >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/
 # root:adm 640) and silently collects nothing, which looks like "it's
 # just not finding new lines" rather than the permission issue it is.
 usermod -aG adm agent-i
+# Read access to the systemd journal, which is owned by this group. Added here
+# rather than left to the operator so that turning journald.enabled on is a
+# one-line config change — the same group Datadog's installer documents. A host
+# without systemd has no such group, and that is not an error worth failing an
+# install over.
+if getent group systemd-journal >/dev/null 2>&1; then
+  usermod -aG systemd-journal agent-i
+else
+  echo "    no systemd-journal group on this host — journald collection will not be available"
+fi
 
 # --- 6. install binary, config, systemd unit ---
 echo "==> installing binary"
@@ -121,6 +133,45 @@ echo "==> installing config"
 mkdir -p /etc/agent-i
 if [[ ! -f /etc/agent-i/agent.yaml ]]; then
   install -m 0640 -o agent-i -g agent-i "$EXTRACTED_DIR/agent.yaml" /etc/agent-i/agent.yaml
+  # The shipped config leaves agent_id empty on purpose: the agent then names
+  # itself after the machine at startup (EC2 Name tag, else instance id, else
+  # hostname), so an unattended fleet install cannot produce N hosts sharing a
+  # single id. AGENT_I_AGENT_ID covers the case where the operator wants a name
+  # of their own instead.
+  if [[ -n "${AGENT_I_AGENT_ID:-}" ]]; then
+    # Restricted to characters that need no YAML quoting or escaping. Anything
+    # else is refused rather than written, because a value containing a quote
+    # or a backslash would produce a config file the agent cannot parse — and
+    # it would fail at the next start, long after this script exited 0.
+    if [[ ! "$AGENT_I_AGENT_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "error: AGENT_I_AGENT_ID may contain only letters, digits, dot, underscore and hyphen (got: $AGENT_I_AGENT_ID)" >&2
+      exit 1
+    fi
+    # Exact-line match and printf rather than sed: the id is data, never part
+    # of a pattern or a replacement string that could reinterpret it.
+    agent_id_written=0
+    tmp_cfg="$(mktemp)"
+    while IFS= read -r line; do
+      if [[ "$line" == 'agent_id: ""' ]]; then
+        printf 'agent_id: "%s"\n' "$AGENT_I_AGENT_ID"
+        agent_id_written=1
+      else
+        printf '%s\n' "$line"
+      fi
+    done < /etc/agent-i/agent.yaml > "$tmp_cfg"
+    if [[ "$agent_id_written" -ne 1 ]]; then
+      rm -f "$tmp_cfg"
+      echo "error: no 'agent_id: \"\"' line in the shipped config to set" >&2
+      exit 1
+    fi
+    # Overwrite in place so the mode and ownership set by install(1) above
+    # survive; mv would replace them with mktemp's 0600 root-owned defaults.
+    cat "$tmp_cfg" > /etc/agent-i/agent.yaml
+    rm -f "$tmp_cfg"
+    echo "    agent_id set to ${AGENT_I_AGENT_ID}"
+  else
+    echo "    agent_id left empty — the agent names itself after the host at startup"
+  fi
 else
   echo "    /etc/agent-i/agent.yaml already exists — leaving it in place"
 fi

@@ -114,8 +114,11 @@ func (v otlpAnyValue) toString() string {
 
 type otlpExportTraceResponse struct{} // empty body per spec on full success
 
-// OTLPTraceReceiverCollector runs an OTLP/HTTP compliant trace endpoint apps
-// can point their OTel SDK exporter at.
+// OTLPReceiverCollector runs an OTLP/HTTP compliant receiver apps can point
+// their OTel SDK exporter at. It serves all three signals — /v1/traces,
+// /v1/logs and /v1/metrics — on one listener, which is what an SDK configured
+// with a single OTEL_EXPORTER_OTLP_ENDPOINT expects. The logs and metrics
+// handlers live in otlp_signals.go.
 //
 // This is the agent's only inbound network surface, so it is also the only
 // place where an outsider gets to hand us work. Three limits apply:
@@ -127,7 +130,7 @@ type otlpExportTraceResponse struct{} // empty body per spec on full success
 //     memory growth, not slowness, which is much harder to diagnose;
 //   - an optional bearer token is required, which matters as soon as the
 //     listener is not on loopback.
-type OTLPTraceReceiverCollector struct {
+type OTLPReceiverCollector struct {
 	agentID   string
 	addr      string
 	maxBytes  int64
@@ -137,13 +140,19 @@ type OTLPTraceReceiverCollector struct {
 	// queue here is just memory we have not accounted for.
 	sem    chan struct{}
 	server *http.Server
+	// acceptLogs and acceptMetrics gate the two non-trace endpoints. Both
+	// default to true; AcceptSignals turns them off. A disabled signal has no
+	// route registered at all, so it 404s exactly as it did before this
+	// receiver learned to serve it.
+	acceptLogs    bool
+	acceptMetrics bool
 }
 
 // decodeWaitTimeout is how long a request waits for a decode slot before being
 // told to back off. Short on purpose: an OTel SDK exporter retries.
 const decodeWaitTimeout = 2 * time.Second
 
-func NewOTLPTraceReceiverCollector(agentID, addr string, maxBytes int64, authToken string) *OTLPTraceReceiverCollector {
+func NewOTLPReceiverCollector(agentID, addr string, maxBytes int64, authToken string) *OTLPReceiverCollector {
 	if maxBytes <= 0 {
 		maxBytes = 4 << 20
 	}
@@ -151,54 +160,61 @@ func NewOTLPTraceReceiverCollector(agentID, addr string, maxBytes int64, authTok
 	if slots < 2 {
 		slots = 2
 	}
-	return &OTLPTraceReceiverCollector{
+	return &OTLPReceiverCollector{
 		agentID:   agentID,
 		addr:      addr,
 		maxBytes:  maxBytes,
 		authToken: authToken,
 		sem:       make(chan struct{}, slots),
+		// On unless a caller says otherwise, so a construction site that does
+		// not care — every test here, for one — gets the full receiver.
+		acceptLogs:    true,
+		acceptMetrics: true,
 	}
 }
 
-func (t *OTLPTraceReceiverCollector) Name() string { return "trace.otlp_http" }
+// AcceptSignals selects which of the two non-trace OTLP signals this receiver
+// serves. Traces are always served: the listener exists for them, and a
+// receiver that accepted neither traces nor anything else would be a listener
+// with no purpose.
+//
+// A setter rather than two more constructor parameters, which would make six
+// positional arguments of which half are bools — the shape where callers
+// quietly transpose two and nothing complains.
+func (t *OTLPReceiverCollector) AcceptSignals(logs, metrics bool) {
+	t.acceptLogs, t.acceptMetrics = logs, metrics
+}
 
-func (t *OTLPTraceReceiverCollector) Start(ctx context.Context, out chan<- Envelope) error {
+func (t *OTLPReceiverCollector) Name() string { return "otlp_http" }
+
+func (t *OTLPReceiverCollector) Start(ctx context.Context, out chan<- Envelope) error {
 	if !isLoopbackAddr(t.addr) && t.authToken == "" {
 		log.Printf("trace receiver: WARNING listening on %s with no auth token — "+
 			"anything that can reach this host can inject spans into your backend. "+
 			"Set traces.listen_addr to 127.0.0.1:4319 or configure traces.auth_token_env.", t.addr)
 	}
 
+	// All three OTLP signals share one listener and one set of limits. An SDK
+	// pointed at OTEL_EXPORTER_OTLP_ENDPOINT sends every signal to the same
+	// base URL, so serving traces here and not the other two meant an
+	// auto-instrumented application had its metrics and logs 404'd while its
+	// traces arrived — a silent partial loss rather than a visible failure.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/traces", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if !t.authorized(r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		select {
-		case t.sem <- struct{}{}:
-			defer func() { <-t.sem }()
-		case <-r.Context().Done():
-			return
-		case <-time.After(decodeWaitTimeout):
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "receiver busy", http.StatusTooManyRequests)
-			return
-		}
-
-		r.Body = http.MaxBytesReader(w, r.Body, t.maxBytes)
-
-		if isProtobufContentType(r.Header.Get("Content-Type")) {
-			t.handleProtobuf(w, r, out)
-			return
-		}
-		t.handleJSON(w, r, out)
-	})
+	mux.HandleFunc("/v1/traces", t.signalHandler(out, t.handleProtobuf, t.handleJSON))
+	accepted := []string{"traces"}
+	if t.acceptLogs {
+		mux.HandleFunc("/v1/logs", t.signalHandler(out, t.handleLogsProtobuf, t.handleLogsJSON))
+		accepted = append(accepted, "logs")
+	}
+	if t.acceptMetrics {
+		mux.HandleFunc("/v1/metrics", t.signalHandler(out, t.handleMetricsProtobuf, t.handleMetricsJSON))
+		accepted = append(accepted, "metrics")
+	}
+	// Said out loud at startup because the failure it prevents is silent: an
+	// application exporting a signal this receiver is not serving gets a 404
+	// its SDK swallows, and the only visible symptom is data that never
+	// arrives.
+	log.Printf("otlp receiver: accepting %s on %s", strings.Join(accepted, ", "), t.addr)
 
 	t.server = &http.Server{
 		Addr:    t.addr,
@@ -224,9 +240,52 @@ func (t *OTLPTraceReceiverCollector) Start(ctx context.Context, out chan<- Envel
 	return nil
 }
 
+// signalDecoder is one encoding's handler for one signal.
+type signalDecoder func(http.ResponseWriter, *http.Request, chan<- Envelope)
+
+// signalHandler wraps the checks every OTLP endpoint must make before it
+// decodes anything: the method, the bearer token, the concurrency limit that
+// stops a burst of exports from occupying every decode goroutine, and the body
+// size cap.
+//
+// Shared rather than repeated per endpoint so the three signals cannot drift
+// apart — a metrics path that forgot the auth check or the size cap would be a
+// hole in exactly the protections the trace path documents at length.
+func (t *OTLPReceiverCollector) signalHandler(out chan<- Envelope, proto, jsonH signalDecoder) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !t.authorized(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		select {
+		case t.sem <- struct{}{}:
+			defer func() { <-t.sem }()
+		case <-r.Context().Done():
+			return
+		case <-time.After(decodeWaitTimeout):
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "receiver busy", http.StatusTooManyRequests)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, t.maxBytes)
+
+		if isProtobufContentType(r.Header.Get("Content-Type")) {
+			proto(w, r, out)
+			return
+		}
+		jsonH(w, r, out)
+	}
+}
+
 // authorized checks the bearer token when one is configured. The comparison is
 // constant-time so a caller cannot recover the token by measuring responses.
-func (t *OTLPTraceReceiverCollector) authorized(r *http.Request) bool {
+func (t *OTLPReceiverCollector) authorized(r *http.Request) bool {
 	if t.authToken == "" {
 		return true
 	}
@@ -255,7 +314,7 @@ func isLoopbackAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (t *OTLPTraceReceiverCollector) Stop() error {
+func (t *OTLPReceiverCollector) Stop() error {
 	if t.server != nil {
 		return t.server.Close()
 	}
@@ -269,7 +328,7 @@ func isProtobufContentType(ct string) bool {
 	return ct == "application/x-protobuf" || ct == "application/protobuf"
 }
 
-func (t *OTLPTraceReceiverCollector) handleJSON(w http.ResponseWriter, r *http.Request, out chan<- Envelope) {
+func (t *OTLPReceiverCollector) handleJSON(w http.ResponseWriter, r *http.Request, out chan<- Envelope) {
 	var req otlpExportTraceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid OTLP JSON payload"}`, http.StatusBadRequest)
@@ -295,7 +354,7 @@ func (t *OTLPTraceReceiverCollector) handleJSON(w http.ResponseWriter, r *http.R
 	_ = json.NewEncoder(w).Encode(otlpExportTraceResponse{})
 }
 
-func (t *OTLPTraceReceiverCollector) handleProtobuf(w http.ResponseWriter, r *http.Request, out chan<- Envelope) {
+func (t *OTLPReceiverCollector) handleProtobuf(w http.ResponseWriter, r *http.Request, out chan<- Envelope) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "error reading request body", http.StatusBadRequest)
@@ -342,6 +401,61 @@ func (t *OTLPTraceReceiverCollector) handleProtobuf(w http.ResponseWriter, r *ht
 // functions separate rather than unifying through a shared intermediate
 // type — the two input shapes are different enough that a shared type
 // would just move the conversion complexity rather than remove it.
+// spanKindName renders OTLP's SpanKind enum.
+//
+// The kind is what separates a service graph from a call tree. A dependency
+// between two services is a CLIENT span in one whose child is a SERVER span in
+// the other — pairing on parent-child alone cannot tell that from an ordinary
+// nested call, and cannot tell an outbound call to an uninstrumented database
+// from one to a service that simply did not report. Both distinctions are
+// invisible without this field, so it rides on every span.
+func spanKindName(kind int32) string {
+	switch kind {
+	case 1:
+		return "internal"
+	case 2:
+		return "server"
+	case 3:
+		return "client"
+	case 4:
+		return "producer"
+	case 5:
+		return "consumer"
+	default:
+		return ""
+	}
+}
+
+// peerAttributeKeys are the attributes that identify what an outbound span was
+// talking to, when that something is not itself instrumented.
+//
+// A CLIENT span to a database or a third-party API has no matching SERVER span
+// anywhere in the trace, so the dependency is invisible unless the peer names
+// itself in an attribute. These are the attributes that do, and they are the
+// same set the OpenTelemetry service graph connector reads for the purpose.
+//
+// Promoted onto labels rather than left in the payload's attribute map because
+// the dashboard reads labels; the full attribute set stays in the payload
+// untouched. Both the current and the previous semantic-convention spellings
+// are listed, since which one arrives depends on the age of the SDK rather
+// than on anything the operator chose.
+var peerAttributeKeys = []string{
+	"peer.service",
+	"db.system", "db.system.name", "db.name", "db.namespace",
+	"messaging.system", "messaging.destination.name", "messaging.destination",
+	"rpc.system", "rpc.service",
+	"server.address", "net.peer.name",
+}
+
+// copyPeerAttributes lifts the peer-identifying attributes onto labels.
+func copyPeerAttributes(labels map[string]string, attrs map[string]any) {
+	for _, k := range peerAttributeKeys {
+		if v, ok := attrs[k].(string); ok && v != "" {
+			labels[k] = v
+		}
+	}
+}
+
 func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *otlpwire.Span) Envelope {
 	durationMs := float64(sp.EndTimeUnixNano-sp.StartTimeUnixNano) / 1e6
 
@@ -379,6 +493,10 @@ func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *otlpwire.Sp
 	for _, a := range sp.Attributes {
 		attrs[a.Key] = a.Value.String()
 	}
+	if k := spanKindName(sp.Kind); k != "" {
+		labels["span.kind"] = k
+	}
+	copyPeerAttributes(labels, attrs)
 
 	return Envelope{
 		Kind:      KindTrace,
@@ -423,6 +541,10 @@ func spanToEnvelopeJSON(agentID, serviceName, scopeName string, sp otlpSpan) Env
 	for _, a := range sp.Attributes {
 		attrs[a.Key] = a.Value.toString()
 	}
+	if k := spanKindName(int32(sp.Kind)); k != "" {
+		labels["span.kind"] = k
+	}
+	copyPeerAttributes(labels, attrs)
 
 	return Envelope{
 		Kind:      KindTrace,

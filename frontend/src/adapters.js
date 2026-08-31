@@ -227,27 +227,201 @@ export function deriveTraces(snap) {
   return traces.sort((a, b) => b.startedAt - a.startedAt);
 }
 
-// Caller -> callee edges, read straight off the parent links. This is exactly
-// how Grafana Tempo derives its service graph, and it means the topology is
-// observed rather than declared: it cannot drift from reality.
+// Caller -> callee edges, derived the way OpenTelemetry's service graph
+// connector derives them, because the naive reading of parent links gets two
+// things wrong that matter.
+//
+// An edge between two services is a CLIENT span whose child is a SERVER span
+// in another service. Pairing on parent-child alone cannot tell that from an
+// ordinary nested call, and — worse — it silently drops every dependency that
+// is not itself instrumented. A service's database, its queue and the
+// third-party API it calls produce a CLIENT span with no matching SERVER span
+// anywhere in the trace, so under the old derivation they did not exist. Those
+// are usually the dependencies a topology is being read to find.
+//
+// So this pairs on kind, and where a client span has no server span to pair
+// with it reads the peer's identity out of the span's own attributes and
+// creates a virtual node — the purple "inferred dependency" every commercial
+// map shows.
+//
+// Edges carry their traffic rather than only their existence. An unweighted
+// graph draws a dependency serving one request an hour identically to one
+// serving a thousand a second, and cannot show which edge is the failing one.
+
+// PEER_NAMERS resolve what an uninstrumented peer should be called, in
+// priority order. peer.service is the explicit answer when an SDK sets it;
+// everything after it is inference from what the span was doing.
+const PEER_NAMERS = [
+  (p) => p["peer.service"],
+  (p) => p["db.namespace"] || p["db.name"],
+  (p) => p["messaging.destination.name"] || p["messaging.destination"],
+  (p) => p["rpc.service"],
+  (p) => p["server.address"] || p["net.peer.name"],
+  (p) => p["db.system.name"] || p["db.system"],
+  (p) => p["messaging.system"],
+];
+
+// peerName resolves the display name of an uninstrumented dependency, or ""
+// when the span said nothing about who it was talking to — in which case no
+// edge is invented, because a node called "unknown" is worse than an absent
+// one.
+export function peerName(peer) {
+  if (!peer) return "";
+  for (const namer of PEER_NAMERS) {
+    const v = namer(peer);
+    if (v) return String(v);
+  }
+  return "";
+}
+
+// peerType classifies a dependency so the map can draw a datastore differently
+// from a queue differently from an HTTP service. Mirrors the connection_type
+// dimension the service graph connector puts on its metrics.
+export function peerType(peer) {
+  if (!peer) return "service";
+  if (peer["db.system"] || peer["db.system.name"] || peer["db.name"] || peer["db.namespace"]) return "database";
+  if (peer["messaging.system"] || peer["messaging.destination"] || peer["messaging.destination.name"]) return "messaging";
+  return "service";
+}
+
+const isServerSide = (k) => k === "server" || k === "consumer";
+const isClientSide = (k) => k === "client" || k === "producer";
+
+// deriveEdges returns one aggregated edge per caller/callee pair.
+//
+// Each carries calls, errors and a latency distribution, so the map can encode
+// volume as thickness and failure as colour instead of drawing every
+// dependency the same weight.
 export function deriveEdges(snap) {
   const spans = snap?.spans || [];
+  if (!spans.length) return [];
+
   const byId = new Map(spans.map((s) => [s.span_id, s]));
-  const seen = new Set();
-  const edges = [];
-  for (const sp of spans) {
-    if (!sp.parent_id) continue;
-    const parent = byId.get(sp.parent_id);
-    if (!parent) continue;
-    const from = parent.service || "unknown";
-    const to = sp.service || "unknown";
-    if (from === to) continue; // an internal call, not a service dependency
-    const key = `${from}->${to}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    edges.push([from, to]);
+  const childrenOf = new Map();
+  for (const s of spans) {
+    if (!s.parent_id) continue;
+    if (!childrenOf.has(s.parent_id)) childrenOf.set(s.parent_id, []);
+    childrenOf.get(s.parent_id).push(s);
   }
-  return edges;
+
+  // Whether the agent reporting these spans sends span kinds at all. Older
+  // agents do not, and on those the only derivation available is the parent
+  // link — worse, but far better than an empty map.
+  const hasKinds = spans.some((s) => s.kind);
+  const known = new Set(spans.map((s) => s.service).filter(Boolean));
+
+  const acc = new Map();
+  const add = (from, to, { error, durMs, type, virtual }) => {
+    if (!from || !to || from === to) return;
+    const key = `${from}\u0000${to}`;
+    let e = acc.get(key);
+    if (!e) {
+      e = { from, to, calls: 0, errors: 0, durs: [], type: type || "service", virtual: !!virtual };
+      acc.set(key, e);
+    }
+    e.calls++;
+    if (error) e.errors++;
+    if (Number.isFinite(durMs)) e.durs.push(durMs);
+    // An edge is only virtual while every call on it was to an unpaired peer.
+    // One real server span proves the far side is instrumented after all.
+    if (!virtual) e.virtual = false;
+    if (type === "database" || type === "messaging") e.type = type;
+  };
+
+  for (const sp of spans) {
+    const service = sp.service || "";
+    if (!service) continue;
+
+    // --- paired: a server span whose parent is a client span elsewhere ---
+    const parent = sp.parent_id ? byId.get(sp.parent_id) : null;
+    const pairedAsServer = parent && (!hasKinds || (isServerSide(sp.kind) && isClientSide(parent.kind)));
+    if (pairedAsServer) {
+      add(parent.service || "", service, {
+        // Either side failing makes the call a failed call: a caller that
+        // errored on a response the callee considered fine still had the
+        // request fail, and vice versa.
+        error: isError(sp) || isError(parent),
+        // The caller's duration, which is what the caller experienced —
+        // it includes the network and any queueing the callee never saw.
+        durMs: Number.isFinite(parent.dur_ms) ? parent.dur_ms : sp.dur_ms,
+        type: sp.kind === "consumer" ? "messaging" : "service",
+        virtual: false,
+      });
+      continue;
+    }
+
+    // --- unpaired: an outbound span with nothing on the other end ---
+    if (!hasKinds || !isClientSide(sp.kind)) continue;
+    const children = childrenOf.get(sp.span_id) || [];
+    if (children.some((c) => (c.service || "") !== service)) continue; // paired above
+
+    const name = peerName(sp.peer);
+    if (!name || name === service) continue;
+    // A peer that names an instrumented service is not virtual — its spans are
+    // simply outside this window, which the rolling buffer makes routine. This
+    // is what stops a real service flickering into a separate inferred node
+    // whenever its own spans age out first.
+    add(service, name, {
+      error: isError(sp),
+      durMs: sp.dur_ms,
+      type: peerType(sp.peer),
+      virtual: !known.has(name),
+    });
+  }
+
+  return [...acc.values()]
+    .map((e) => {
+      const sorted = e.durs.slice().sort((a, b) => a - b);
+      return {
+        from: e.from,
+        to: e.to,
+        calls: e.calls,
+        errors: e.errors,
+        errPct: e.calls ? Math.round((e.errors / e.calls) * 10000) / 100 : 0,
+        p50: Math.round(percentile(sorted, 0.5)),
+        p99: Math.round(percentile(sorted, 0.99)),
+        type: e.type,
+        virtual: e.virtual,
+      };
+    })
+    .sort((a, b) => b.calls - a.calls);
+}
+
+// deriveTopologyNodes returns every node the map should draw: the instrumented
+// services, plus a node for each inferred dependency an edge points at.
+//
+// Virtual nodes are built here rather than in deriveServices because they are
+// not services — nothing reported them, they have no latency of their own and
+// no health to speak of. Putting them in the services list would have them
+// counted in "healthy / seen" and listed in the services table, both of which
+// would be claims the data does not support.
+export function deriveTopologyNodes(services, edges) {
+  const nodes = services.map((s) => ({ ...s, virtual: false }));
+  const have = new Set(nodes.map((n) => n.id));
+
+  for (const e of edges) {
+    if (!e.virtual || have.has(e.to)) continue;
+    have.add(e.to);
+    const inbound = edges.filter((x) => x.to === e.to);
+    const calls = inbound.reduce((a, x) => a + x.calls, 0);
+    const errors = inbound.reduce((a, x) => a + x.errors, 0);
+    nodes.push({
+      id: e.to,
+      label: e.to,
+      virtual: true,
+      type: e.type,
+      calls,
+      // An inferred node's health is entirely what its callers saw, since it
+      // reported nothing itself. Said plainly rather than shown as unknown:
+      // a database failing every call is worth drawing as failing.
+      err: calls ? Math.round((errors / calls) * 10000) / 100 : 0,
+      status: calls && errors / calls > 0.01 ? "degraded" : "healthy",
+      p50: Math.round(Math.min(...inbound.map((x) => x.p50))),
+      p99: Math.round(Math.max(...inbound.map((x) => x.p99))),
+      rps: 0,
+    });
+  }
+  return nodes;
 }
 
 // Lays out a derived graph in dependency order: roots on the left, each node
@@ -256,7 +430,7 @@ export function deriveEdges(snap) {
 export function layoutTopology(services, edges, width = 460, height = 190) {
   if (!services.length) return {};
   const incoming = new Map(services.map((s) => [s.id, 0]));
-  for (const [, to] of edges) incoming.set(to, (incoming.get(to) || 0) + 1);
+  for (const { to } of edges) incoming.set(to, (incoming.get(to) || 0) + 1);
 
   const col = new Map();
   const roots = services.filter((s) => !incoming.get(s.id));
@@ -265,7 +439,7 @@ export function layoutTopology(services, edges, width = 460, height = 190) {
 
   for (let guard = 0; queue.length && guard < 500; guard++) {
     const cur = queue.shift();
-    for (const [from, to] of edges) {
+    for (const { from, to } of edges) {
       if (from !== cur) continue;
       const next = (col.get(cur) || 0) + 1;
       if ((col.get(to) ?? -1) < next) {
@@ -352,18 +526,34 @@ export function flattenFields(value, prefix = "", depth = 0, out = []) {
   return out;
 }
 
+// normalizeLevel maps the many spellings of a severity onto the five the UI
+// filters by. Returns "" for anything unrecognised, so a caller can tell an
+// absent level from one it could not read.
+function normalizeLevel(raw) {
+  const tok = String(raw || "").trim().toUpperCase();
+  if (!tok) return "";
+  if (tok === "FATAL" || tok === "CRITICAL" || tok === "CRIT" || tok === "ERR") return "ERROR";
+  if (tok === "WARNING") return "WARN";
+  if (["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].includes(tok)) return tok;
+  return "";
+}
+
 export function deriveLogs(snap) {
   return (snap?.logs || [])
     .slice()
     .reverse()
     .map((l) => {
-      const m = LEVEL_RE.exec(l.message || "");
-      let lvl = "INFO";
-      if (m) {
-        const tok = m[1].toUpperCase();
-        if (tok === "FATAL" || tok === "CRITICAL" || tok === "ERR") lvl = "ERROR";
-        else if (tok === "WARNING") lvl = "WARN";
-        else if (["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].includes(tok)) lvl = tok;
+      // A severity the record actually carries beats one guessed from its
+      // text. Lines tailed from a file have none — which is why the regex
+      // below exists — but an OTLP record has a severity the application set,
+      // and preferring the guess over it would classify a line the writer
+      // explicitly marked WARN as INFO because the word does not appear in the
+      // message.
+      const reported = normalizeLevel(l.labels?.level);
+      let lvl = reported || "INFO";
+      if (!reported) {
+        const m = LEVEL_RE.exec(l.message || "");
+        if (m) lvl = normalizeLevel(m[1]) || "INFO";
       }
       return {
         t: new Date(l.t).toLocaleTimeString([], { hour12: false }),
@@ -380,7 +570,7 @@ export function deriveLogs(snap) {
         // depending on where the pattern anchors. Stamping the adapter version
         // means a severity that later looks wrong can be traced to the
         // classifier that produced it, instead of being assumed authoritative.
-        lvlSource: `client:${ADAPTER_VERSION}`,
+        lvlSource: reported ? "record" : `client:${ADAPTER_VERSION}`,
         // Source is the file the line was tailed from; its basename is the
         // most useful short identifier available.
         svc: (l.source || "").split(/[\\/]/).pop() || "log",
@@ -388,11 +578,12 @@ export function deriveLogs(snap) {
         labels: l.labels || null,
         msg: l.message || "",
         structured: parseLogBody(l.message || ""),
-        // Trace/log correlation needs the app to emit trace_id into its log
-        // line AND the agent to parse it. Neither exists yet, so this stays
-        // null and the UI hides the jump-to-trace affordance rather than
-        // offering one that goes nowhere.
-        traceId: null,
+        // Correlation, when the record carries it. An OTLP log record has a
+        // trace id field and the backend passes it through; a line tailed from
+        // a file has nothing to correlate on and stays null, so the UI hides
+        // the jump-to-trace affordance rather than offering one that goes
+        // nowhere.
+        traceId: l.labels?.trace_id || null,
       };
     });
 }
@@ -477,6 +668,66 @@ export function deriveInfra(snap) {
 // IOWait earns its column despite looking like a CPU detail. A host pinned on
 // iowait is not busy, it is BLOCKED — the CPU is idle waiting for a disk that
 // cannot keep up. Read from CPU usage alone that host looks fine.
+// fmtAge renders how long ago something happened, at one significant unit.
+//
+// Coarse on purpose: the question it answers is "is this host still
+// reporting", and "22m" answers it. A precise duration would be more
+// characters saying the same thing and would change on every poll for every
+// row, which makes a table impossible to read at a glance.
+export function fmtAge(sec) {
+  if (!Number.isFinite(sec)) return "never";
+  // Negative means the host's clock is ahead of the backend's. Rendering
+  // "-3s ago" would look like a bug in the dashboard rather than what it is,
+  // which is a machine whose time is slightly off.
+  if (sec < 0) return "now";
+  if (sec < 60) return `${Math.round(sec)}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h`;
+  return `${Math.round(sec / 86400)}d`;
+}
+
+// hostStatus collapses a fleet row into the single state the table shows.
+//
+// It exists because that state is read in three places — the status cell, the
+// column sort, and the "N active" count — and deriving it three times produced
+// three different answers. A host that had registered with the backend but sent
+// no data, and whose last_seen was recent, rendered a green dot labelled
+// NO DATA, sorted among the healthy hosts, and was counted as active. The dot
+// said one thing and the word beside it said another.
+//
+// The precedence is: having sent no metrics outranks being recent. A row with
+// no readings cannot be called active whatever its timestamp says, because the
+// timestamp only records that something arrived carrying its identity — see
+// backendHostRow's hasMetrics.
+//
+// "no-metrics" and not "no-data", because host metrics are the only thing the
+// fleet query measures: /api/hosts returns cpu, mem, disk and load15 and
+// nothing else, so a host shipping logs with metrics.enabled false looks
+// identical here to one shipping nothing at all. Calling that "no data" would
+// repeat, one level down, exactly the overclaim this state was added to fix.
+//
+// hasMetrics is only set on backend-sourced rows. An agent-sourced row leaves
+// it undefined and keeps the original two states, which is right: reading an
+// agent directly means the data either came back or the poll failed, and there
+// is no third case.
+export function hostStatus(row) {
+  if (row?.hasMetrics === false) return "no-metrics";
+  return row?.active ? "active" : "inactive";
+}
+
+// statusRank orders the states for the sortable Status column, worst first, so
+// one sort direction puts what needs attention at the top.
+export function statusRank(row) {
+  switch (hostStatus(row)) {
+    case "inactive":
+      return 0;
+    case "no-metrics":
+      return 1;
+    default:
+      return 2;
+  }
+}
+
 export function hostRow(snap) {
   const base = deriveInfra(snap)[0];
   if (!base) return null;
@@ -504,10 +755,44 @@ export function hostRow(snap) {
   }, 0);
   const ageSec = newest && snap.now ? (snap.now - newest) / 1000 : Infinity;
 
+  // What the machine is, as the agent discovered it — distinct from agent_id
+  // above, which is only what it calls itself. Absent off a cloud host, so
+  // every field defaults to "" rather than undefined: the fleet table sorts
+  // these as strings, and a missing key would fall through to the numeric
+  // comparison and sort nonsensically against the rows that do have one.
+  const host = snap.host || {};
+
   return {
     host: base.host,
+    instanceID: host["host.id"] || "",
+    instanceType: host["host.type"] || "",
+    // Zone is the more specific of the two and the one that matters when a
+    // single AZ is having a bad day; region is the fallback on the rare
+    // instance that reports one without the other.
+    zone: host["cloud.availability_zone"] || host["cloud.region"] || "",
+    account: host["cloud.account.id"] || "",
+    // The AMI. Collected by the agent since EC2 detection landed and never
+    // surfaced anywhere until now — the same oversight as the account above.
+    // It is what answers "are these two hosts even running the same image",
+    // which is the first question when one of a pair misbehaves.
+    imageID: host["host.image.id"] || "",
     version: snap.version || "",
-    os: "linux", // the agent reads /proc and builds only for Linux
+    // Read from the host, not asserted. This was the literal string "linux"
+    // for every row, which is the build target rather than an observation and
+    // told you nothing you could act on: a fleet is worth a column here only
+    // if the column can differ between rows.
+    //
+    // os.name/os.version are the distribution ("Ubuntu 24.04"); os.type is the
+    // kernel family and is the floor for a host whose /etc/os-release could
+    // not be read. Empty rather than guessed when the agent predates the
+    // detection, so an old agent reads as unknown instead of as Linux.
+    os:
+      [host["os.name"], host["os.version"]].filter(Boolean).join(" ") ||
+      host["os.description"] ||
+      host["os.type"] ||
+      "",
+    osDescription: host["os.description"] || "",
+    arch: host["host.arch"] || "",
     active: ageSec <= 600,
     ageSec,
     cpu: base.cpu,
@@ -771,14 +1056,41 @@ export function globalStats(snap) {
   const totalRps = services.reduce((a, s) => a + s.rps, 0);
   const p99 = services.length ? Math.max(...services.map((s) => s.p99)) : NaN;
   const counts = snap?.counts || {};
-  const uptimeSec = snap ? Math.max(1, (snap.now - snap.started_at) / 1000) : 1;
   const envelopes = Object.values(counts).reduce((a, b) => a + b, 0);
+
+  // What the rate is measured over.
+  //
+  // An agent reports started_at, so its rate is "since the process started".
+  // A backend snapshot has no such thing — the process it would refer to is
+  // on another machine and may have restarted a dozen times inside the window
+  // — so the denominator is the window the payload covers. Naming which is
+  // not decoration: 12 envelopes over a 15-minute window and 12 since a
+  // process started an hour ago are different numbers, and a rate that does
+  // not say what it is divided by cannot be checked.
+  //
+  // Subtracting an absent started_at produced NaN and rendered "NaN/s", which
+  // is the failure this guards: an arithmetic result printed with the same
+  // confidence as a real one.
+  let uptimeSec = 0;
+  let rateBasis = "";
+  if (snap && Number.isFinite(snap.started_at) && snap.started_at > 0) {
+    uptimeSec = Math.max(1, (snap.now - snap.started_at) / 1000);
+    rateBasis = "since start";
+  } else if (snap && Number.isFinite(snap.retain_sec) && snap.retain_sec > 0) {
+    uptimeSec = snap.retain_sec;
+    rateBasis = "over the window";
+  }
+
   return {
     services,
     totalRps: Math.round(totalRps * 1000) / 1000,
     p99,
     envelopes,
-    envelopesPerSec: Math.round((envelopes / uptimeSec) * 10) / 10,
+    // NaN rather than a fabricated 0 when there is nothing to divide by. The
+    // UI renders it as an em dash; a 0 would be a claim that nothing is
+    // arriving.
+    envelopesPerSec: uptimeSec > 0 ? Math.round((envelopes / uptimeSec) * 10) / 10 : NaN,
+    rateBasis,
     counts,
     seriesDropped: snap?.series_dropped || 0,
   };

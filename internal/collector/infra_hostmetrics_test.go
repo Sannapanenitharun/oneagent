@@ -230,6 +230,18 @@ func TestReadFilesystemUsageStates_StableOrder(t *testing.T) {
 	}
 }
 
+// This reads the real /proc/mounts, so it asserts something about the machine
+// it runs on rather than about the code. The parsing itself is covered against
+// fixtures above; what this adds is that the whole path works against a real
+// kernel.
+//
+// A container is not that machine. Its root is an overlay mount, which the
+// collector correctly filters out as a pseudo filesystem, so "/" is genuinely
+// absent from the result and the assertion below cannot hold. That is the
+// environment failing the test's precondition, not the code failing the test,
+// and it used to make `go test ./...` in a container report a red suite that
+// everyone learned to ignore — which is worse than one skip, because a suite
+// with a permanent known failure hides the next real one.
 func TestReadFilesystemUsageStates_RealProcMounts(t *testing.T) {
 	samples, err := readFilesystemUsageStates()
 	if err != nil {
@@ -237,6 +249,22 @@ func TestReadFilesystemUsageStates_RealProcMounts(t *testing.T) {
 	}
 	if len(samples) == 0 {
 		t.Fatal("no real filesystems found — expected at least the root filesystem")
+	}
+
+	hasRoot := false
+	for _, s := range samples {
+		if s.mountpoint == "/" {
+			hasRoot = true
+			break
+		}
+	}
+	if !hasRoot {
+		mounts := make([]string, 0, len(samples))
+		for _, s := range samples {
+			mounts = append(mounts, s.mountpoint)
+		}
+		t.Skipf("no real root filesystem in /proc/mounts (got %v) — "+
+			"expected inside a container, where / is an overlay and is filtered out by design", mounts)
 	}
 
 	foundRoot := false
@@ -369,10 +397,22 @@ func TestInfraHostMetricsCollector_EndToEnd(t *testing.T) {
 	}
 	defer coll.Stop()
 
+	// A machine with no TCP sockets emits no connection samples, and waiting
+	// for one that cannot arrive is how this test used to spend its whole
+	// budget and then fail. Containers routinely have an empty /proc/net/tcp.
+	// Asked once, up front, so the requirement matches the machine rather than
+	// being quietly dropped whenever the count happened to stay at zero — on a
+	// host that does have sockets, a missing sample is still a failure.
+	wantNetConn := 1
+	if states, err := readNetworkConnectionStates(); err != nil || len(states) == 0 {
+		t.Log("no TCP sockets in /proc/net/tcp — not requiring connection samples")
+		wantNetConn = 0
+	}
+
 	var cpuStates, memStates, netSamples, fsSamples, loadSamples, netErrSamples, netConnSamples, diskSamples int
 	timeout := time.After(2 * time.Second)
 	for cpuStates < 8 || memStates < 4 || netSamples < 1 || fsSamples < 1 || loadSamples < 1 ||
-		netErrSamples < 1 || netConnSamples < 1 || diskSamples < 1 {
+		netErrSamples < 1 || netConnSamples < wantNetConn || diskSamples < 1 {
 		select {
 		case env := <-out:
 			if env.Kind != KindMetric {
@@ -429,8 +469,8 @@ func TestInfraHostMetricsCollector_EndToEnd(t *testing.T) {
 				t.Errorf("unexpected envelope source: %s", env.Source)
 			}
 		case <-timeout:
-			t.Fatalf("timed out — got cpu=%d mem=%d net=%d fs=%d load=%d netErr=%d netConn=%d disk=%d (all need >=1, cpu>=8, mem>=4)",
-				cpuStates, memStates, netSamples, fsSamples, loadSamples, netErrSamples, netConnSamples, diskSamples)
+			t.Fatalf("timed out — got cpu=%d mem=%d net=%d fs=%d load=%d netErr=%d netConn=%d (need %d) disk=%d (all need >=1, cpu>=8, mem>=4)",
+				cpuStates, memStates, netSamples, fsSamples, loadSamples, netErrSamples, netConnSamples, wantNetConn, diskSamples)
 		}
 	}
 }

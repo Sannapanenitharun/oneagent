@@ -31,6 +31,23 @@ scripts\dev-tunnel.ps1 -Identity C:\keys\host.pem ubuntu@203.0.113.10
 
 .EXAMPLE
 scripts\dev-tunnel.ps1 -LocalPort 9000 ubuntu@203.0.113.10
+
+.EXAMPLE
+Reverse: let a remote agent reach a backend running on THIS machine.
+
+scripts\dev-tunnel.ps1 -Reverse -Identity C:\keys\host.pem ubuntu@203.0.113.10
+
+The default direction reaches an agent's dashboard from here. -Reverse is the
+other problem: an agent pushes outward to a backend, and a backend running on a
+laptop behind NAT has no address the agent can dial. This gives the remote host
+a loopback port that arrives here, so exporter.endpoint can be set to
+http://127.0.0.1:14400 on that machine.
+
+It needs the reconnect loop more than the forward direction does, not less. A
+dropped forward tunnel shows up immediately as "agent not reachable" in the UI;
+a dropped reverse tunnel is silent, because the thing that notices is an agent
+on another continent writing to its own log. Hours of telemetry can go missing
+before anyone looks.
 #>
 [CmdletBinding()]
 param(
@@ -39,8 +56,21 @@ param(
 
     [string] $Identity,
     [int]    $LocalPort  = 8089,
-    [int]    $RemotePort = 8088
+    [int]    $RemotePort = 8088,
+
+    # Reverse the direction: bind RemotePort on the far host and deliver to
+    # LocalPort here, rather than binding LocalPort here and reaching
+    # RemotePort there.
+    [switch] $Reverse
 )
+
+# Ports that make sense for each direction. Reversed, the defaults above are
+# wrong in both halves: 8089 is a dashboard forward, and the thing a remote
+# agent needs to reach is the backend.
+if ($Reverse) {
+    if (-not $PSBoundParameters.ContainsKey('LocalPort'))  { $LocalPort  = 4400 }
+    if (-not $PSBoundParameters.ContainsKey('RemotePort')) { $RemotePort = 14400 }
+}
 
 $sshArgs = @(
     '-o', 'BatchMode=yes'
@@ -48,13 +78,23 @@ $sshArgs = @(
     '-o', 'ServerAliveInterval=15'
     '-o', 'ServerAliveCountMax=3'
     '-o', 'TCPKeepAlive=yes'
-    '-N', '-L', "${LocalPort}:127.0.0.1:${RemotePort}"
+    '-N'
 )
+if ($Reverse) {
+    $sshArgs += @('-R', "${RemotePort}:127.0.0.1:${LocalPort}")
+} else {
+    $sshArgs += @('-L', "${LocalPort}:127.0.0.1:${RemotePort}")
+}
 if ($Identity) { $sshArgs = @('-i', $Identity) + $sshArgs }
 
 # Fail early and legibly rather than letting ssh exit 255 into the retry loop,
 # where "port already in use" looks identical to an auth failure.
-$inUse = Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue
+# Only meaningful forward: reversed, the port being bound is on the far host,
+# and ExitOnForwardFailure is what reports a clash there.
+$inUse = $null
+if (-not $Reverse) {
+    $inUse = Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue
+}
 if ($inUse) {
     # Not $pid: that is a read-only automatic variable and assigning to it throws.
     $owner = ($inUse | Select-Object -First 1).OwningProcess
@@ -62,8 +102,13 @@ if ($inUse) {
     exit 1
 }
 
-Write-Host "forwarding 127.0.0.1:$LocalPort -> $Target 127.0.0.1:$RemotePort"
-Write-Host "point the UI at it with: `$env:AGENT_I_URL = 'http://127.0.0.1:$LocalPort'; npm run dev"
+if ($Reverse) {
+    Write-Host "reverse: $Target 127.0.0.1:$RemotePort -> this machine 127.0.0.1:$LocalPort"
+    Write-Host "set exporter.endpoint on that host to: http://127.0.0.1:$RemotePort"
+} else {
+    Write-Host "forwarding 127.0.0.1:$LocalPort -> $Target 127.0.0.1:$RemotePort"
+    Write-Host "point the UI at it with: `$env:AGENT_I_URL = 'http://127.0.0.1:$LocalPort'; npm run dev"
+}
 
 $fails = 0
 while ($true) {

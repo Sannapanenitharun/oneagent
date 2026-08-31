@@ -15,6 +15,8 @@ import {
   globalStats, toRate, fmtRps,
   alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
   parseLogBody, flattenFields, ADAPTER_VERSION, CONTRACT, contractMatches,
+  hostRow, deriveTopologyNodes, peerName, peerType, fmtAge,
+  hostStatus, statusRank,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -76,12 +78,97 @@ check("root service identified", trace.root === "api-gateway");
 check("error status propagates to trace", trace.status === "error");
 check("span start is relative to trace start", byOp["ChargeCard"].start === 130);
 
-console.log("edges");
+// The fixture above carries no span kinds, which is what an older agent sends.
+// The derivation has to fall back to parent links there rather than returning
+// an empty map — a dashboard pointed at a host that has not been upgraded must
+// still draw its topology.
+console.log("edges (no span kinds — fallback path)");
 const edges = deriveEdges(SNAP);
-const has = (f, t) => edges.some(([a, b]) => a === f && b === t);
+const has = (f, t) => edges.some((e) => e.from === f && e.to === t);
 check("api-gateway -> checkout", has("api-gateway", "checkout"));
 check("checkout -> payments", has("checkout", "payments"));
 check("self-calls are not dependencies", !has("checkout", "checkout"));
+
+const payEdge = edges.find((e) => e.to === "payments");
+check("edges carry their traffic", payEdge.calls === 1, `calls=${payEdge?.calls}`);
+check("edges carry their failures", payEdge.errors === 1 && payEdge.errPct === 100,
+  `errors=${payEdge?.errors} errPct=${payEdge?.errPct}`);
+check("edges carry latency", payEdge.p99 > 0, `p99=${payEdge?.p99}`);
+check("nothing is inferred without kinds", edges.every((e) => !e.virtual));
+
+// A service graph is a client span paired with a server span in another
+// service. With kinds present the derivation must use them, and must find the
+// dependencies that have no span of their own at all.
+console.log("edges (span kinds + uninstrumented peers)");
+const KINDED = {
+  agent_id: "x", version: "v", started_at: T0, now: T0 + 1000, retain_sec: 900,
+  counts: {}, series: [], logs: [],
+  spans: [
+    // gateway -> orders, paired client/server, called twice with one failure
+    { t: T0, trace_id: "t1", span_id: "a1", service: "gateway", name: "GET /o", kind: "client", dur_ms: 90 },
+    { t: T0, trace_id: "t1", span_id: "b1", parent_id: "a1", service: "orders", name: "GET /o", kind: "server", dur_ms: 70 },
+    { t: T0, trace_id: "t2", span_id: "a2", service: "gateway", name: "GET /o", kind: "client", dur_ms: 110 },
+    { t: T0, trace_id: "t2", span_id: "b2", parent_id: "a2", service: "orders", name: "GET /o", kind: "server", dur_ms: 95, status: "2" },
+    // orders -> postgres: a client span with no server span anywhere
+    { t: T0, trace_id: "t1", span_id: "c1", parent_id: "b1", service: "orders", name: "SELECT", kind: "client",
+      dur_ms: 20, peer: { "db.system": "postgresql", "db.name": "ordersdb" } },
+    // orders -> kafka: a producer with no consumer in this window
+    { t: T0, trace_id: "t1", span_id: "d1", parent_id: "b1", service: "orders", name: "publish", kind: "producer",
+      dur_ms: 5, peer: { "messaging.system": "kafka", "messaging.destination.name": "order-events" } },
+    // orders -> gateway named by peer.service, whose spans ARE present:
+    // outside the window this would look uninstrumented, and must not.
+    { t: T0, trace_id: "t3", span_id: "e1", service: "orders", name: "callback", kind: "client",
+      dur_ms: 15, peer: { "peer.service": "gateway" } },
+  ],
+};
+const ke = deriveEdges(KINDED);
+const kf = (f, t) => ke.find((e) => e.from === f && e.to === t);
+
+check("client/server pair becomes an edge", !!kf("gateway", "orders"));
+check("repeat calls aggregate onto one edge", kf("gateway", "orders").calls === 2,
+  `calls=${kf("gateway", "orders")?.calls}`);
+check("either side failing fails the call", kf("gateway", "orders").errors === 1);
+check("paired edges are not inferred", kf("gateway", "orders").virtual === false);
+// The caller's duration, not the callee's: it is what the caller experienced.
+check("edge latency is the caller's view", kf("gateway", "orders").p99 === 110,
+  `p99=${kf("gateway", "orders")?.p99}`);
+
+check("uninstrumented database becomes an edge", !!kf("orders", "ordersdb"));
+check("database edge is marked inferred", kf("orders", "ordersdb").virtual === true);
+check("database edge is typed", kf("orders", "ordersdb").type === "database",
+  `type=${kf("orders", "ordersdb")?.type}`);
+check("uninstrumented queue becomes an edge", !!kf("orders", "order-events"));
+check("queue edge is typed", kf("orders", "order-events").type === "messaging");
+
+// The rolling span buffer means a real service's own spans can age out first.
+// Treating it as uninstrumented would make it flicker into a separate node.
+check("a peer that is a known service is not inferred", kf("orders", "gateway")?.virtual === false,
+  `virtual=${kf("orders", "gateway")?.virtual}`);
+
+// Internal work is not a dependency.
+check("no self edges", ke.every((e) => e.from !== e.to));
+
+console.log("topology nodes");
+const kNodes = deriveTopologyNodes(deriveServices(KINDED), ke);
+const nodeIds = kNodes.map((n) => n.id);
+check("instrumented services are nodes", nodeIds.includes("gateway") && nodeIds.includes("orders"));
+check("inferred dependencies are nodes", nodeIds.includes("ordersdb") && nodeIds.includes("order-events"));
+check("no duplicate nodes", new Set(nodeIds).size === nodeIds.length);
+check("inferred nodes are marked", kNodes.find((n) => n.id === "ordersdb").virtual === true);
+check("real services are not marked inferred", kNodes.find((n) => n.id === "orders").virtual === false);
+// Inferred nodes must not be counted as services anywhere else, or "healthy /
+// seen" starts counting databases nobody instrumented.
+check("inferred nodes stay out of deriveServices",
+  !deriveServices(KINDED).some((s) => s.id === "ordersdb"));
+
+console.log("peer naming");
+check("peer.service wins", peerName({ "peer.service": "billing", "db.name": "x" }) === "billing");
+check("db name beats db system", peerName({ "db.system": "postgresql", "db.name": "ordersdb" }) === "ordersdb");
+check("falls back to the address", peerName({ "server.address": "api.stripe.com" }) === "api.stripe.com");
+check("no peer means no name", peerName(undefined) === "" && peerName({}) === "");
+check("database is typed", peerType({ "db.system": "redis" }) === "database");
+check("messaging is typed", peerType({ "messaging.system": "kafka" }) === "messaging");
+check("plain http is a service", peerType({ "server.address": "x" }) === "service");
 
 console.log("services");
 const services = deriveServices(SNAP);
@@ -250,6 +337,78 @@ check("series safe", deriveAllSeries(EMPTY).length === 0);
 check("traffic safe", deriveTraffic(EMPTY).rps.length === 0);
 check("null snapshot safe", globalStats(null).envelopes === 0);
 
+// hostRow feeds the fleet table, which is the only view that shows many
+// machines at once — so it is the one place where confusing two hosts is
+// possible, and where identity has to survive the reduction intact.
+console.log("host row");
+const EC2 = {
+  ...EMPTY,
+  agent_id: "prod-web-01",
+  host: {
+    "cloud.provider": "aws",
+    "cloud.account.id": "123456789012",
+    "cloud.region": "us-east-1",
+    "cloud.availability_zone": "us-east-1a",
+    "host.id": "i-0123456789abcdef0",
+    "host.type": "t3.medium",
+    "host.image.id": "ami-0abcdef1234567890",
+  },
+  series: SNAP.series,
+};
+const ec2Row = hostRow(EC2);
+check("carries the instance id", ec2Row.instanceID === "i-0123456789abcdef0", ec2Row.instanceID);
+check("carries the instance type", ec2Row.instanceType === "t3.medium", ec2Row.instanceType);
+check("prefers the AZ over the region", ec2Row.zone === "us-east-1a", ec2Row.zone);
+check("keeps agent_id as the host name", ec2Row.host === "prod-web-01", ec2Row.host);
+
+// An instance reporting a region but no AZ still gets a usable zone column.
+const REGION_ONLY = { ...EC2, host: { "cloud.region": "eu-west-2", "host.id": "i-abc" } };
+check("falls back to the region", hostRow(REGION_ONLY).zone === "eu-west-2");
+
+// Off a cloud host the agent omits `host` entirely. These must come back as
+// strings: the fleet table sorts them with localeCompare, and undefined would
+// take the numeric path and order the rows nonsensically.
+const BARE = { ...EMPTY, agent_id: "laptop", series: SNAP.series };
+const bareRow = hostRow(BARE);
+check("no host object is not an error", bareRow !== null);
+check(
+  "absent instance fields are strings",
+  ["instanceID", "instanceType", "zone", "account"].every((k) => bareRow[k] === "")
+);
+
+// OS is read from the host, not asserted. It was the literal string "linux"
+// on every row — the build target rather than an observation — which made the
+// column useless for the only thing a fleet column is for: telling rows apart.
+console.log("host os");
+const UBUNTU = { ...EMPTY, agent_id: "web-1", series: SNAP.series, host: {
+  "os.type": "linux", "os.name": "Ubuntu", "os.version": "24.04",
+  "os.description": "Ubuntu 24.04.1 LTS (Linux 6.8.0-1017-aws)", "host.arch": "amd64",
+}};
+const AMZN = { ...EMPTY, agent_id: "web-2", series: SNAP.series, host: {
+  "os.type": "linux", "os.name": "Amazon Linux", "os.version": "2023", "host.arch": "arm64",
+}};
+check("distribution and version", hostRow(UBUNTU).os === "Ubuntu 24.04");
+check("two distributions differ", hostRow(UBUNTU).os !== hostRow(AMZN).os);
+check("description carried for the tooltip", hostRow(UBUNTU).osDescription.includes("6.8.0-1017-aws"));
+check("arch carried", hostRow(AMZN).arch === "arm64");
+
+// An agent predating OS detection sends os.type only, or nothing at all. It
+// must read as unknown rather than as a confident "linux" the agent never
+// measured.
+const TYPE_ONLY = { ...EMPTY, agent_id: "old", series: SNAP.series, host: { "os.type": "linux" } };
+check("falls back to os.type", hostRow(TYPE_ONLY).os === "linux");
+check("no host object means unknown, not linux", hostRow(BARE).os === "");
+check("unknown os is a string", typeof hostRow(BARE).os === "string");
+
+// The account was derived and then never rendered — the column did not exist —
+// which left a fleet spanning several accounts looking like one flat list.
+console.log("host account");
+check("account is surfaced", hostRow(EC2).account === EC2.host["cloud.account.id"]);
+check("absent account is a string", hostRow(BARE).account === "");
+// The AMI was collected by the agent and dropped on the floor here.
+check("ami is surfaced", hostRow(EC2).imageID === EC2.host["host.image.id"]);
+check("absent ami is a string", hostRow(BARE).imageID === "");
+
 // A malformed trace must not hang the render.
 console.log("malformed input");
 const CYCLE = { ...EMPTY, spans: [
@@ -257,6 +416,142 @@ const CYCLE = { ...EMPTY, spans: [
   { t: T0, trace_id: "c", span_id: "b", parent_id: "a", service: "x", name: "b", dur_ms: 1 },
 ]};
 check("parent cycle terminates", deriveTraces(CYCLE)[0].spans.length === 2);
+
+// A severity the record carries beats one guessed from its text.
+//
+// Lines tailed from a file have no severity, which is why the text classifier
+// exists. An OTLP record - every log the backend stores - has one the writer
+// set, and preferring the guess over it marks a line explicitly written as
+// WARN as INFO because the word does not appear in the message.
+console.log("log severity");
+const REPORTED = { ...EMPTY, logs: [
+  { t: T0, source: "app", message: "connection pool at 80% capacity", labels: { level: "WARN" } },
+  { t: T0 + 1, source: "app", message: "upstream timeout", labels: { level: "ERROR" } },
+  { t: T0 + 2, source: "app", message: "starting", labels: { level: "warning" } },
+  { t: T0 + 3, source: "app", message: "ERROR retrying is fine", labels: { level: "INFO" } },
+  { t: T0 + 4, source: "app", message: "plain line with no label" },
+  { t: T0 + 5, source: "app", message: "ERROR something broke" },
+  { t: T0 + 6, source: "app", message: "labelled with nonsense", labels: { level: "SEVERE" } },
+]};
+const rl = deriveLogs(REPORTED).slice().reverse(); // deriveLogs reverses
+check("reported WARN is used", rl[0].lvl === "WARN", rl[0].lvl);
+check("reported ERROR is used", rl[1].lvl === "ERROR", rl[1].lvl);
+check("reported level is normalised", rl[2].lvl === "WARN", rl[2].lvl);
+// The case the text classifier gets wrong on its own.
+check("reported level beats the text guess", rl[3].lvl === "INFO", rl[3].lvl);
+check("reported level is marked as reported", rl[0].lvlSource === "record", rl[0].lvlSource);
+check("unlabelled line still falls back to INFO", rl[4].lvl === "INFO", rl[4].lvl);
+check("unlabelled line still reads its text", rl[5].lvl === "ERROR", rl[5].lvl);
+check("guessed level is stamped with the adapter version",
+  rl[5].lvlSource === `client:${ADAPTER_VERSION}`, rl[5].lvlSource);
+// An unrecognised label must not be trusted blindly, and must not blank the
+// level either.
+check("unrecognised label falls back", rl[6].lvl === "INFO", rl[6].lvl);
+
+// Correlation, when the record carries it. A tailed file line has nothing to
+// correlate on and must stay null so the UI hides the affordance.
+console.log("log correlation");
+const CORR = { ...EMPTY, logs: [
+  { t: T0, source: "app", message: "handled", labels: { trace_id: "5b8efff798038103" } },
+  { t: T0 + 1, source: "/var/log/syslog", message: "no trace here" },
+]};
+const cl = deriveLogs(CORR).slice().reverse();
+check("trace id is surfaced", cl[0].traceId === "5b8efff798038103", cl[0].traceId);
+check("absent trace id stays null", cl[1].traceId === null, String(cl[1].traceId));
+
+// How long since a host reported. Without it, INACTIVE is a verdict with no
+// evidence: a host that stopped ten minutes ago and one that stopped last
+// week look identical, and an empty metrics row reads as a broken dashboard
+// rather than as a quiet machine.
+console.log("fmtAge");
+check("seconds", fmtAge(22) === "22s", fmtAge(22));
+check("rounds to the nearest second", fmtAge(0.4) === "0s", fmtAge(0.4));
+check("just under a minute stays seconds", fmtAge(59) === "59s", fmtAge(59));
+check("a minute becomes minutes", fmtAge(60) === "1m", fmtAge(60));
+check("the case from the fleet table", fmtAge(1320) === "22m", fmtAge(1320));
+check("just under an hour stays minutes", fmtAge(3599) === "60m", fmtAge(3599));
+check("an hour becomes hours", fmtAge(3600) === "1h", fmtAge(3600));
+check("two hours exactly", fmtAge(7200) === "2h", fmtAge(7200));
+// 2.5h rounds half up, which is the language's rule and fine here:
+// the unit is coarse on purpose and nothing downstream reads it.
+check("half an hour rounds up", fmtAge(9000) === "3h", fmtAge(9000));
+check("a day becomes days", fmtAge(86400) === "1d", fmtAge(86400));
+check("a week reads in days", fmtAge(7 * 86400) === "7d", fmtAge(7 * 86400));
+// Never heard from is not the same as heard from a long time ago, and the
+// fleet table distinguishes them: a configured agent that has never answered
+// has no age at all.
+check("infinite age is never", fmtAge(Infinity) === "never", fmtAge(Infinity));
+check("NaN is never", fmtAge(NaN) === "never", fmtAge(NaN));
+check("undefined is never", fmtAge(undefined) === "never", fmtAge(undefined));
+// A host whose clock runs ahead of the backend's produces a negative age.
+// "-3s" would read as a dashboard bug rather than as mild clock skew.
+check("negative age reads as now", fmtAge(-3) === "now", fmtAge(-3));
+
+// The envelope rate has to say what it is divided by.
+//
+// An agent reports started_at, so its rate is since the process started. A
+// backend snapshot has no such field - the process it would refer to is on
+// another machine and may have restarted inside the window - so the
+// denominator is the window itself. Subtracting an absent started_at produced
+// NaN and rendered "NaN/s", an arithmetic accident printed with the same
+// confidence as a real measurement.
+console.log("envelope rate");
+{
+  const withStart = globalStats({ ...EMPTY, now: T0 + 60000, started_at: T0, counts: { metric: 120 } });
+  check("rate uses uptime when started_at exists", withStart.envelopesPerSec === 2, withStart.envelopesPerSec);
+  check("basis is named as since start", withStart.rateBasis === "since start", withStart.rateBasis);
+
+  // A backend snapshot: no started_at, but it declares the window it covers.
+  const windowed = globalStats({ now: T0, retain_sec: 900, counts: { series: 4, logs: 5 }, series: [], logs: [], spans: [] });
+  check("rate falls back to the window", windowed.envelopesPerSec === 0, windowed.envelopesPerSec);
+  check("basis is named as the window", windowed.rateBasis === "over the window", windowed.rateBasis);
+  check("windowed rate is a number, never NaN", Number.isFinite(windowed.envelopesPerSec), windowed.envelopesPerSec);
+
+  const busy = globalStats({ now: T0, retain_sec: 100, counts: { a: 500 }, series: [], logs: [], spans: [] });
+  check("windowed rate divides by the window", busy.envelopesPerSec === 5, busy.envelopesPerSec);
+
+  // Neither basis available: NaN rather than a fabricated 0, which would be a
+  // claim that nothing is arriving.
+  const neither = globalStats({ now: T0, counts: { a: 7 }, series: [], logs: [], spans: [] });
+  check("no basis yields NaN, not 0", Number.isNaN(neither.envelopesPerSec), neither.envelopesPerSec);
+  check("no basis has no label", neither.rateBasis === "", neither.rateBasis);
+  check("the count itself is still reported", neither.envelopes === 7, neither.envelopes);
+
+  // A zero or negative started_at is not a timestamp.
+  const bogus = globalStats({ now: T0, started_at: 0, retain_sec: 900, counts: { a: 900 }, series: [], logs: [], spans: [] });
+  check("a zero started_at falls through to the window", bogus.rateBasis === "over the window", bogus.rateBasis);
+}
+
+// The fleet table reads a host's state in three places — the status cell, the
+// column sort, and the "N active" count. Deriving it three times gave three
+// answers: a host that had registered with the backend and sent nothing, whose
+// last_seen was recent, drew a green dot labelled NO DATA, sorted among the
+// healthy hosts, and was counted as active.
+console.log("hostStatus");
+{
+  check("no metrics outranks a recent timestamp",
+    hostStatus({ active: true, hasMetrics: false }) === "no-metrics");
+  check("reporting and recent is active",
+    hostStatus({ active: true, hasMetrics: true }) === "active");
+  check("reporting but stale is inactive",
+    hostStatus({ active: false, hasMetrics: true }) === "inactive");
+  check("silent and stale is still no-metrics",
+    hostStatus({ active: false, hasMetrics: false }) === "no-metrics");
+
+  // Agent-sourced rows have no hasMetrics at all and must keep the original
+  // two states: a direct poll either returned data or failed, with no third
+  // case to represent.
+  check("an agent row with no field is active", hostStatus({ active: true }) === "active");
+  check("an agent row with no field is inactive", hostStatus({ active: false }) === "inactive");
+  check("a missing row does not throw", hostStatus(undefined) === "inactive");
+
+  // Worst first, so one sort direction puts what needs attention on top.
+  check("inactive sorts worst", statusRank({ active: false, hasMetrics: true }) === 0);
+  check("no-metrics sorts between", statusRank({ active: true, hasMetrics: false }) === 1);
+  check("active sorts best", statusRank({ active: true, hasMetrics: true }) === 2);
+  check("no-metrics does not sort with the healthy hosts",
+    statusRank({ active: true, hasMetrics: false }) < statusRank({ active: true, hasMetrics: true }));
+}
 
 console.log(failed === 0 ? "\nOK — all adapter checks passed" : `\n${failed} check(s) failed`);
 process.exit(failed ? 1 : 0);

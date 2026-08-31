@@ -10,3 +10,15 @@ configs/agent.local.yaml
 
 # Local dev tunnel with machine-specific key path and host; use scripts/dev-tunnel.sh instead.
 tunnel.sh
+
+# Local list of servers to tunnel to; names hosts and key paths.
+# Copy scripts/hosts.txt.example and edit.
+hosts.txt
+
+# Compose reads this automatically and it holds the ingest API keys and the
+# ClickHouse password. Never commit it.
+deploy/.env
+
+# Build artifacts from `go build ./cmd/...` in the repo root.
+server
+server.exe
