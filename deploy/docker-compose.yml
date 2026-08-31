@@ -41,6 +41,19 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
+    # The same policy the server has, and for a stronger reason.
+    #
+    # Without it the database was the one part of the stack that could die and
+    # stay dead. It did: ClickHouse exited and the server carried on running —
+    # restart: unless-stopped kept IT alive — so `docker ps` showed the backend
+    # "Up" while every query and every ingest failed. depends_on only gates
+    # startup ordering, so nothing brought the database back or took the server
+    # down to match.
+    #
+    # A stack whose storage can vanish while its API keeps answering is worse
+    # than one that fails outright, because the failure is invisible from
+    # outside.
+    restart: unless-stopped
 
   server:
     build:
