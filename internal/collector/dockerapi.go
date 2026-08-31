@@ -3,10 +3,12 @@ package collector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -22,10 +24,15 @@ import (
 // What the agent needs from the daemon is one endpoint returning one list, and
 // that is thirty lines of net/http.
 //
-// The client is also used for exactly one thing: names. Every number comes from
-// the cgroup files (see cgroup2.go). That split is what lets container metrics
-// keep working when the socket is not mounted, and is why the socket is
-// optional rather than required.
+// For metrics the client is used for exactly one thing: names. Every number
+// comes from the cgroup files (see cgroup2.go). That split is what lets
+// container metrics keep working when the socket is not mounted, and is why the
+// socket is optional rather than required.
+//
+// Logs are the exception. The json-file driver's directory is 0700 root-owned,
+// so an agent running as an unprivileged service account cannot read it at all,
+// and the daemon's own log endpoint is the only route to container stdout that
+// does not require running the whole agent as root. See dockerlogstream.go.
 
 // DefaultDockerEndpoint is where the Engine listens on a standard Linux install.
 const DefaultDockerEndpoint = "/var/run/docker.sock"
@@ -76,6 +83,11 @@ func (c dockerContainer) Name() string {
 type dockerClient struct {
 	http     *http.Client
 	endpoint string
+	// stream is the same transport without a client deadline. http.Client's
+	// Timeout covers reading the response body, which is exactly wrong for a
+	// follow stream: it would sever a healthy log tail every dockerAPITimeout.
+	// Streams are bounded by their context instead.
+	stream *http.Client
 }
 
 // newDockerClient builds a client for a unix socket path.
@@ -101,6 +113,7 @@ func newDockerClient(endpoint string) *dockerClient {
 	}
 	return &dockerClient{
 		http:     &http.Client{Transport: tr, Timeout: dockerAPITimeout},
+		stream:   &http.Client{Transport: tr},
 		endpoint: endpoint,
 	}
 }
@@ -156,7 +169,97 @@ func (c *dockerClient) Containers(ctx context.Context) ([]dockerContainer, error
 	return out, nil
 }
 
+// TTY reports whether a container was started with a pseudo-terminal.
+//
+// It decides how the log stream is framed, and there is no way to infer it from
+// the stream itself: a TTY container's output is raw bytes, while a non-TTY
+// container's is chopped into 8-byte-headed frames, and a raw line can begin
+// with any byte at all. Sniffing would misread a log line whose first character
+// happened to be 0x01 as a frame header.
+//
+// The answer is fixed for a container's life, so this is called once when its
+// stream is opened, not per read.
+func (c *dockerClient) TTY(ctx context.Context, id string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/containers/"+id+"/json", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("inspecting %s: %w", shortID(id), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return false, fmt.Errorf("inspecting %s: docker returned %d: %s",
+			shortID(id), resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var out struct {
+		Config struct {
+			Tty bool `json:"Tty"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, fmt.Errorf("decoding inspect for %s: %w", shortID(id), err)
+	}
+	return out.Config.Tty, nil
+}
+
+// Logs opens a following log stream for one container, resuming after since.
+//
+// The stream stays open until ctx is cancelled or the container exits, so the
+// caller gets lines as they are written rather than on a poll interval. Closing
+// the returned body is the only way to stop it; cancelling ctx does that too.
+//
+// since is exclusive on the daemon's side, but only to whole nanoseconds, and a
+// container writing two lines within the same nanosecond can therefore replay
+// one after a restart. That is the correct side to err on: this agent's log
+// contract is at-least-once, and a duplicate line is recoverable in a way a
+// dropped one is not.
+func (c *dockerClient) Logs(ctx context.Context, id string, since time.Time) (io.ReadCloser, error) {
+	// Timestamps are not decoration here: they are the resume cursor. Without
+	// them a restart could only start from "now" and would lose whatever was
+	// written while the agent was down.
+	q := url.Values{
+		"follow":     {"1"},
+		"stdout":     {"1"},
+		"stderr":     {"1"},
+		"timestamps": {"1"},
+	}
+	if !since.IsZero() {
+		q.Set("since", fmt.Sprintf("%d.%09d", since.Unix(), since.Nanosecond()))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://unix/containers/"+id+"/logs?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.stream.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("streaming logs for %s: %w", shortID(id), err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		// 501 is the daemon saying the container's log driver has no readable
+		// history — journald, splunk, awslogs and friends. It is a
+		// configuration fact, not a failure, and the caller reports it as one.
+		if resp.StatusCode == http.StatusNotImplemented {
+			return nil, fmt.Errorf("%w: %s", errLogDriverUnsupported, strings.TrimSpace(string(body)))
+		}
+		return nil, fmt.Errorf("streaming logs for %s: docker returned %d: %s",
+			shortID(id), resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return resp.Body, nil
+}
+
+// errLogDriverUnsupported reports that the container's logging driver cannot
+// replay logs through the Engine API.
+var errLogDriverUnsupported = errors.New("container log driver does not support reading")
+
 // Close releases pooled connections.
 func (c *dockerClient) Close() {
 	c.http.CloseIdleConnections()
+	c.stream.CloseIdleConnections()
 }

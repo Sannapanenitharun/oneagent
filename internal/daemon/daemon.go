@@ -184,14 +184,27 @@ func New(cfg *config.Config) (*Daemon, error) {
 			ExcludeNames:   cfg.Containers.ExcludeNames,
 		}))
 		if containerLogs {
-			collectors = append(collectors, collector.NewDockerLogCollector(d.agentID,
-				collector.ContainerLogOptions{
-					Root:         cfg.Containers.Logs.Root,
-					ExcludeNames: cfg.Containers.ExcludeNames,
-				},
-				tailOpts,
-				cfg.Containers.DockerEndpoint,
-			))
+			logOpts := collector.ContainerLogOptions{
+				Root:         cfg.Containers.Logs.Root,
+				ExcludeNames: cfg.Containers.ExcludeNames,
+			}
+			// Which reader can actually work depends on how the agent was
+			// installed, not on how it was configured, so the choice is
+			// resolved against the host and then stated. Stating it matters:
+			// the failure this replaces was a file reader finding nothing
+			// readable and looking identical to containers that never log.
+			source, why := collector.ResolveContainerLogSource(
+				collector.ContainerLogSource(cfg.Containers.Logs.Source),
+				cfg.Containers.Logs.Root,
+			)
+			log.Printf("container logs: %s", why)
+			if source == collector.ContainerLogSourceAPI {
+				collectors = append(collectors, collector.NewDockerLogStreamCollector(
+					d.agentID, logOpts, tailOpts, cfg.Containers.DockerEndpoint))
+			} else {
+				collectors = append(collectors, collector.NewDockerLogCollector(
+					d.agentID, logOpts, tailOpts, cfg.Containers.DockerEndpoint))
+			}
 		}
 	}
 

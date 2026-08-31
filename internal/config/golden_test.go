@@ -20,10 +20,11 @@ import (
 // receiver learned to serve logs and metrics, differing in exactly the two new
 // Traces fields, AcceptLogs and AcceptMetrics. Fourth when journald collection
 // was added, differing in exactly the new Journald block. Fifth when container
-// collection was added, differing in exactly the new Containers block. Each
-// regeneration was diffed against the previous fixture and confirmed to change
-// nothing else, so the equivalence the fixture originally proved still holds
-// for every field that predates it.
+// collection was added, differing in exactly the new Containers block. Sixth
+// when container logs learned to stream from the Engine API, differing in
+// exactly Containers.Logs.Source. Each regeneration was diffed against the
+// previous fixture and confirmed to change nothing else, so the equivalence the
+// fixture originally proved still holds for every field that predates it.
 //
 // Going forward it serves as a regression test: any unintended change in how
 // the real configuration file parses shows up here as a diff.

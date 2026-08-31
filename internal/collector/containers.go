@@ -173,6 +173,12 @@ func (c *ContainerCollector) sample(ctx context.Context, out chan<- Envelope) {
 	root := cgroupRoot()
 
 	containers := c.discover(ctx, root)
+	// See resolveSelfContainerID. For metrics this only costs a spurious series
+	// rather than starting a feedback loop, but the agent's own container is
+	// excluded for a reason — its usage correlates with how much telemetry is
+	// being collected — and that reason does not depend on the namespace it was
+	// started in.
+	c.selfID = resolveSelfContainerID(c.selfID, containers)
 	seen := make(map[string]bool, len(containers))
 
 	for _, ct := range containers {
@@ -527,6 +533,60 @@ func readSelfContainerID() string {
 	}
 	defer f.Close()
 	return parseSelfCgroup(f)
+}
+
+// resolveSelfContainerID identifies the container the agent is running in,
+// using the daemon's own list to confirm a guess the cgroup path could not make.
+//
+// This exists because /proc/self/cgroup only names the container when the agent
+// shares the host's cgroup namespace. Without --cgroupns host it reads "0::/",
+// the agent cannot recognise itself, and it collects its own container's
+// output — which for the log collectors is a feedback loop, not merely noise:
+// every envelope the agent writes to stdout is read back, wrapped in a new
+// envelope, and written again, with the escaping doubling on each pass. It
+// saturates the pipeline within seconds and starves every other container.
+//
+// Docker names a container's UTS hostname after its own short id, so the
+// hostname is the second signal. It is never trusted on its own: it is matched
+// against the ids the daemon just reported, so the only way to get a false
+// positive is for the hostname to be the short id of a container that is
+// genuinely running — which is the thing being detected.
+//
+// The two signals cover different deployments and neither is redundant. With
+// --cgroupns host the cgroup path answers and the hostname does not (--uts host
+// makes it the host's name). Without it, the reverse.
+func resolveSelfContainerID(current string, listed []dockerContainer) string {
+	if current != "" {
+		return current
+	}
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return resolveSelfContainerIDWithHost(h, current, listed)
+}
+
+// resolveSelfContainerIDWithHost is the testable body of the above. The
+// hostname is a parameter because the interesting behaviour is which hostnames
+// may be matched against container ids and which must not, and the test
+// process's own hostname is whatever the runner gave it.
+func resolveSelfContainerIDWithHost(hostname, current string, listed []dockerContainer) string {
+	if current != "" {
+		return current
+	}
+	// A short id is exactly twelve hex characters. Anything else is an ordinary
+	// hostname and must not be prefix-matched against container ids — a host
+	// called "web01" would otherwise claim any container whose id starts with
+	// those five characters.
+	if len(hostname) != 12 || !isHex(hostname) {
+		return ""
+	}
+	for _, ct := range listed {
+		if strings.HasPrefix(ct.ID, hostname) {
+			return ct.ID
+		}
+	}
+	return ""
 }
 
 // parseSelfCgroup is the testable body of readSelfContainerID.

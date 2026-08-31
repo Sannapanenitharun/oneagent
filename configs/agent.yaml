@@ -116,6 +116,19 @@ containers:
     # driver has no files here, and the agent says so rather than appearing to
     # watch containers that never log.
     root: "/var/lib/docker/containers"
+    # Where container stdout is read from: "auto", "file" or "api".
+    #
+    # The directory above is mode 0700 and owned by root, so the packaged agent
+    # — which runs as its own unprivileged service account — cannot read it at
+    # all. "auto" notices that and streams from the Engine API instead, which
+    # needs only membership of the docker group. A containerised agent
+    # bind-mounts the directory and reads the files.
+    #
+    # Prefer the files where they are readable: streaming costs the daemon a
+    # goroutine per container and puts log delivery behind dockerd's health,
+    # where the file reader keeps working through a wedged daemon. Set this
+    # explicitly only to overrule the probe.
+    source: "auto"
 
 logs:
   enabled: true

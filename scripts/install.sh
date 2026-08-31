@@ -57,6 +57,33 @@ else
   echo "    no systemd-journal group on this host — journald collection will not be available"
 fi
 
+# Docker access, which is NOT granted by default.
+#
+# Container CPU, memory, block I/O, PID and network metrics all work without
+# it: those come from world-readable cgroup files and /proc, so an unprivileged
+# agent already collects them. What the docker group buys is container NAMES —
+# and, on this install shape, container LOGS, because /var/lib/docker/containers
+# is mode 0700 owned by root and no group grant opens it, leaving the Engine
+# API as the only route to container stdout that does not mean running the whole
+# agent as root.
+#
+# It is opt-in because membership of the docker group is root-equivalent: the
+# socket that answers GET /containers/json also accepts a request to start a
+# privileged container bind-mounting /. The agent only ever issues GETs, but
+# the grant is not scoped to that, and quietly widening a host's privilege
+# boundary during an install is not something to do on the operator's behalf.
+INSTALL_DOCKER_ACCESS=0
+if getent group docker >/dev/null 2>&1; then
+  if [[ "${AGENT_I_ENABLE_DOCKER:-0}" == "1" ]]; then
+    usermod -aG docker agent-i
+    INSTALL_DOCKER_ACCESS=1
+    echo "    added agent-i to the docker group (AGENT_I_ENABLE_DOCKER=1)"
+  elif id -nG agent-i 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    INSTALL_DOCKER_ACCESS=1
+    echo "    agent-i is already in the docker group"
+  fi
+fi
+
 echo "==> installing config"
 mkdir -p /etc/agent-i
 if [[ ! -f /etc/agent-i/agent.yaml ]]; then
@@ -99,6 +126,25 @@ if [[ ! -f /etc/agent-i/agent.yaml ]]; then
     echo "    agent_id set to ${AGENT_I_AGENT_ID}"
   else
     echo "    agent_id left empty — the agent names itself after the host at startup"
+  fi
+
+  # Turn container collection on, but only on a first install and only when the
+  # operator asked for docker access. It stays off by default because enabling
+  # it multiplies the series count by however many containers are running, which
+  # is a decision to make deliberately rather than inherit from an install
+  # script — and only the fresh config is touched, so a host that has been
+  # configured by hand is never rewritten underneath its operator.
+  if [[ "$INSTALL_DOCKER_ACCESS" == "1" ]]; then
+    tmp_cfg="$(mktemp)"
+    awk '
+      /^containers:/ { in_block = 1; print; next }
+      in_block && /^[^ ]/ { in_block = 0 }
+      in_block && $0 == "  enabled: false" { print "  enabled: true"; in_block = 0; next }
+      { print }
+    ' /etc/agent-i/agent.yaml > "$tmp_cfg"
+    cat "$tmp_cfg" > /etc/agent-i/agent.yaml
+    rm -f "$tmp_cfg"
+    echo "    containers.enabled set to true"
   fi
 else
   echo "    /etc/agent-i/agent.yaml already exists — leaving it in place"
@@ -151,3 +197,26 @@ systemctl restart agent-i
 
 echo "==> done. check status with: systemctl status agent-i"
 echo "    tail output with:        journalctl -u agent-i -f"
+
+# Say what container collection will and will not do on this host. Without
+# this, the failure is silent in the worst way: container metrics arrive, so
+# the feature looks like it is working, while names show as short ids and no
+# container logs appear at all.
+if getent group docker >/dev/null 2>&1 || [[ -S /var/run/docker.sock ]]; then
+  echo ""
+  if [[ "$INSTALL_DOCKER_ACCESS" == "1" ]]; then
+    echo "    docker detected, agent-i has socket access:"
+    echo "      container cpu/memory/io/pids/network  yes (cgroups + /proc)"
+    echo "      container names, images, labels       yes (engine api)"
+    echo "      container logs                        yes (streamed from the engine api)"
+  else
+    echo "    docker detected, but agent-i has no socket access:"
+    echo "      container cpu/memory/io/pids/network  yes (cgroups + /proc)"
+    echo "      container names, images, labels       NO — containers show as short ids"
+    echo "      container logs                        NO — /var/lib/docker/containers is root-only"
+    echo ""
+    echo "    to collect those too, re-run with AGENT_I_ENABLE_DOCKER=1, or:"
+    echo "      sudo usermod -aG docker agent-i && sudo systemctl restart agent-i"
+    echo "    note that the docker group is root-equivalent on this host."
+  fi
+fi

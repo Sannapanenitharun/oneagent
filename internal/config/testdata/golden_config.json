@@ -37,7 +37,8 @@
     "ExcludeNames": null,
     "Logs": {
       "Enabled": true,
-      "Root": "/var/lib/docker/containers"
+      "Root": "/var/lib/docker/containers",
+      "Source": "auto"
     }
   },
   "AccessLogs": {

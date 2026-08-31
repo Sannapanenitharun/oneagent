@@ -30,6 +30,16 @@ TimeoutStopSec=15
 # Hardening: the agent only needs to read /proc, tail configured log paths,
 # persist its read offsets, and open one listening port — it does not need
 # broad filesystem or network privileges beyond that.
+#
+# Container collection adds nothing to this. Container CPU, memory, block I/O
+# and PID counters come from /sys/fs/cgroup and the network counters from
+# /proc/<pid>/net/dev, all of which are world-readable and all of which stay
+# readable under ProtectSystem=strict (it makes the hierarchy read-only, not
+# invisible). Container names and logs need the Engine socket, which is reached
+# by putting agent-i in the docker group — systemd applies the user's
+# supplementary groups from /etc/group, the same way journald collection gets
+# systemd-journal — and connecting to a unix socket does not modify it, so a
+# read-only mount does not block it either.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

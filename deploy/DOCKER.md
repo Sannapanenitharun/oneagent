@@ -1,7 +1,27 @@
 # Monitoring a Docker host
 
-The agent runs as one container per Docker host, beside the containers it
-watches.
+There are two shapes, and they differ in exactly one thing that matters: what
+the agent is allowed to read.
+
+| | Containerised agent (this document) | Host install (`scripts/install.sh`) |
+|---|---|---|
+| Runs as | root inside the container, no capabilities | `agent-i`, an unprivileged system user |
+| Container CPU / memory / IO / PIDs | yes | yes |
+| Container network rx/tx | yes (needs `--pid host`) | yes |
+| Container names, images, labels | yes (socket mounted) | only with `usermod -aG docker agent-i` |
+| Container logs | yes, read from the json-file files | yes, streamed from the Engine API |
+| Host `/var/log` files, journald | via bind mounts | natively |
+
+The numbers need nothing privileged in either shape: cgroup files and
+`/proc/<pid>/net/dev` are world-readable. The split is over names and logs, both
+of which need the Engine socket on a host install — the json-file directory is
+mode 0700 and owned by root, so no group grant opens it, and the API is the only
+route to container stdout that does not mean running the whole agent as root.
+The agent probes for this at startup and says which reader it chose; see
+`containers.logs.source` in `configs/agent.yaml`.
+
+The rest of this document is the containerised shape. The agent runs as one
+container per Docker host, beside the containers it watches.
 
 ```
 Docker host
@@ -190,7 +210,17 @@ are fine.
 `agent_id` in the config instead if you would rather pin it.
 
 **No container logs.** Check the log driver — `docker info -f '{{.LoggingDriver}}'`
-must be `json-file`.
+must be `json-file` for the file reader. The API reader works with any driver
+that supports `docker logs`, and reports the ones that do not (`journald` with
+remote storage, `awslogs`, `splunk`) as a named container it cannot read rather
+than as silence.
+
+**No container logs on a host install.** Look for the startup line beginning
+`container logs:`. `cannot read /var/lib/docker/containers` means the agent is
+running unprivileged, as it should be, and has fallen back to the API — which
+then needs `sudo usermod -aG docker agent-i && sudo systemctl restart agent-i`.
+The docker group is root-equivalent, which is why the installer does not grant
+it unless asked with `AGENT_I_ENABLE_DOCKER=1`.
 
 **Host metrics look like the container's.** `AGENT_I_HOST_ROOT` is not set, or
 `/proc` is not mounted where it points.

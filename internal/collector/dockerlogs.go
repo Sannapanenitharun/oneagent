@@ -3,7 +3,9 @@ package collector
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -57,6 +59,66 @@ type ContainerLogOptions struct {
 // DefaultDockerLogRoot is where the json-file driver stores logs on a stock
 // Linux install: <data-root>/containers/<id>/<id>-json.log.
 const DefaultDockerLogRoot = "/var/lib/docker/containers"
+
+// ContainerLogSource names where container stdout and stderr are read from.
+type ContainerLogSource string
+
+const (
+	// ContainerLogSourceAuto reads the files when they are readable and falls
+	// back to the daemon when they are not.
+	ContainerLogSourceAuto ContainerLogSource = "auto"
+	// ContainerLogSourceFile always reads the json-file driver's files.
+	ContainerLogSourceFile ContainerLogSource = "file"
+	// ContainerLogSourceAPI always streams from the Engine API.
+	ContainerLogSourceAPI ContainerLogSource = "api"
+)
+
+// ResolveContainerLogSource decides which log reader to build, and returns a
+// sentence explaining the choice for the startup log.
+//
+// The two readers are not interchangeable in cost, so the file reader wins
+// whenever it can run: it does not occupy a daemon goroutine per container and
+// it keeps delivering when dockerd is wedged. But it cannot run at all for a
+// non-root agent — /var/lib/docker/containers is mode 0700, owned by root, and
+// no group grant opens it — and that is the packaged agent's normal state. So
+// the default probes rather than assuming, because the wrong answer here is
+// silent: a file reader with no readable files looks exactly like a host whose
+// containers never log.
+func ResolveContainerLogSource(want ContainerLogSource, root string) (ContainerLogSource, string) {
+	if root == "" {
+		root = DefaultDockerLogRoot
+	}
+	resolved := hostPath(root)
+
+	switch want {
+	case ContainerLogSourceFile:
+		return ContainerLogSourceFile, "reading the json-file driver's files at " + resolved + " (configured)"
+	case ContainerLogSourceAPI:
+		return ContainerLogSourceAPI, "streaming from the docker api (configured)"
+	}
+
+	if err := probeReadableDir(resolved); err != nil {
+		return ContainerLogSourceAPI, "cannot read " + resolved + " (" + err.Error() +
+			") — streaming from the docker api instead, which needs membership of the docker group"
+	}
+	return ContainerLogSourceFile, "reading the json-file driver's files at " + resolved
+}
+
+// probeReadableDir reports whether a directory can actually be listed, which is
+// the permission the file tailer needs and the one an unprivileged agent lacks.
+// Stat is not enough: the parent is traversable, so a stat succeeds on a
+// directory whose contents are unreadable.
+func probeReadableDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Readdirnames(1); err != nil && err != io.EOF {
+		return err
+	}
+	return nil
+}
 
 // dockerMetaRefresh bounds how often the daemon is asked to re-describe the
 // containers it is running.
@@ -174,6 +236,10 @@ func (c *DockerLogCollector) refreshMetadata() {
 		return
 	}
 	c.metaFailed = false
+	// See resolveSelfContainerID: without --cgroupns host the agent cannot
+	// recognise itself from its cgroup path, and reading its own container's
+	// stdout is a feedback loop rather than merely redundant.
+	c.selfID = resolveSelfContainerID(c.selfID, listed)
 	next := make(map[string]dockerContainer, len(listed))
 	for _, ct := range listed {
 		next[ct.ID] = ct
@@ -302,13 +368,7 @@ func (c *DockerLogCollector) emit(ln tailLine, ct dockerContainer, rec dockerLog
 }
 
 func (c *DockerLogCollector) excluded(ct dockerContainer) bool {
-	name := ct.Name()
-	for _, pat := range c.exclude {
-		if pat != "" && strings.Contains(name, pat) {
-			return true
-		}
-	}
-	return false
+	return excludedByName(ct, c.exclude)
 }
 
 // containerIDFromLogPath recovers the container id from the log file's path.

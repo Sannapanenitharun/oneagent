@@ -257,6 +257,17 @@ type ContainerLogsConfig struct {
 	// Root is the json-file driver's directory. Override it for a host with a
 	// relocated Docker data-root.
 	Root string `yaml:"root"`
+	// Source selects where container stdout is read from: "file" for the
+	// json-file driver's files, "api" for a following stream from the Engine,
+	// or "auto" (the default) to use the files when they are readable.
+	//
+	// It defaults to probing rather than to either reader because the two need
+	// different privileges and the wrong choice fails silently. A packaged
+	// agent runs as its own service account, which cannot open the 0700
+	// root-owned log directory at all; a containerised agent bind-mounts that
+	// directory and can. Auto gets both right without the operator having to
+	// know which case they are in.
+	Source string `yaml:"source"`
 }
 
 // CollectLogs reports whether container logs should be collected, treating an
@@ -506,6 +517,19 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Containers.Logs.Root == "" {
 		cfg.Containers.Logs.Root = "/var/lib/docker/containers"
+	}
+	if cfg.Containers.Logs.Source == "" {
+		cfg.Containers.Logs.Source = "auto"
+	}
+	// Rejected rather than silently treated as "auto". A typo here is a
+	// deliberate choice that did not take effect, and the failure it produces —
+	// container logs quietly coming from the other source, or from none — is
+	// exactly the kind that gets diagnosed hours later.
+	switch cfg.Containers.Logs.Source {
+	case "auto", "file", "api":
+	default:
+		return nil, fmt.Errorf("config %s: containers.logs.source is %q; "+
+			"it must be \"auto\", \"file\" or \"api\"", path, cfg.Containers.Logs.Source)
 	}
 
 	// Spool defaults. Alongside the tailing registry and the journald cursor,
