@@ -62,6 +62,13 @@ type dockerContainer struct {
 	// rather than from the daemon.
 	Created int64             `json:"Created"`
 	Labels  map[string]string `json:"Labels"`
+
+	// Runtime is not part of the Engine API response — anything the Engine
+	// describes is Docker by definition, so it is set to "docker" on that path.
+	// It carries a value only because the cgroup fallback also produces these
+	// records, and there it may be containerd, CRI-O or Podman. Empty means the
+	// cgroup name gave no evidence either way; see containerIDFromCgroupName.
+	Runtime string `json:"-"`
 }
 
 // Name returns the container's display name without the Engine's leading slash.
@@ -165,6 +172,12 @@ func (c *dockerClient) Containers(ctx context.Context) ([]dockerContainer, error
 	var out []dockerContainer
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decoding container list: %w", err)
+	}
+	// Anything the Engine reports is Docker's, so this is a fact rather than an
+	// inference — unlike the cgroup fallback, where the runtime has to be read
+	// out of the directory name and is sometimes unknowable.
+	for i := range out {
+		out[i].Runtime = "docker"
 	}
 	return out, nil
 }

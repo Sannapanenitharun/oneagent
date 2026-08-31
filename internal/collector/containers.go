@@ -383,9 +383,17 @@ func (c *ContainerCollector) emit(ctx context.Context, out chan<- Envelope, now 
 // Twelve characters is what docker itself displays and is unique on any real
 // host.
 func containerLabels(ct dockerContainer) map[string]string {
+	runtime := ct.Runtime
+	if runtime == "" {
+		// Discovered from a cgroup name that named no runtime. Reported as
+		// unknown rather than assumed to be docker: the label is there so an
+		// operator can tell a containerd container from a Podman one, and a
+		// value that is sometimes a guess cannot do that job.
+		runtime = "unknown"
+	}
 	labels := map[string]string{
 		"container.id":      shortID(ct.ID),
-		"container.runtime": "docker",
+		"container.runtime": runtime,
 	}
 	if name := ct.Name(); name != "" {
 		labels["container.name"] = name
@@ -465,44 +473,116 @@ func discoverFromCgroups(root string) []dockerContainer {
 	var out []dockerContainer
 	seen := map[string]bool{}
 
-	for _, parent := range []string{
-		path.Join(root, "system.slice"),
-		path.Join(root, "docker"),
-		path.Join(root, "system.slice", "docker.service"),
-	} {
-		entries, err := os.ReadDir(parent)
+	// Walked rather than read from a fixed list of parents, because the
+	// runtimes that are not Docker nest far more deeply. A containerd container
+	// under Kubernetes lives at
+	//
+	//	kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope
+	//
+	// which is four levels down and cannot be enumerated by naming its parent.
+	// The depth bound is the same one resolveCgroupDir uses, and for the same
+	// reason: it covers every layout in practice while keeping a pathological
+	// tree from being walked forever.
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if depth > cgroupSearchMaxDepth {
+			return
+		}
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			continue
+			return
 		}
 		for _, e := range entries {
 			if !e.IsDir() {
 				continue
 			}
-			id := containerIDFromCgroupName(e.Name())
-			if id == "" || seen[id] {
+			id, runtime := containerIDFromCgroupName(e.Name())
+			if id != "" {
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				if runtime == "" {
+					// A bare id under .../docker/ is Docker's cgroupfs layout.
+					// The parent is the only evidence available, and it is
+					// good evidence.
+					runtime = runtimeFromCgroupParent(dir)
+				}
+				out = append(out, dockerContainer{ID: id, State: "running", Runtime: runtime})
+				// A container's own cgroup has no container children; not
+				// descending saves walking every container's subtree.
 				continue
 			}
-			seen[id] = true
-			out = append(out, dockerContainer{ID: id, State: "running"})
+			walk(path.Join(dir, e.Name()), depth+1)
 		}
 	}
+	walk(root, 0)
 	return out
 }
 
-// containerIDFromCgroupName extracts a container id from a cgroup directory
-// name, returning "" when the name is not a container's.
-//
-// The accepted shapes are "docker-<id>.scope" (systemd driver) and a bare
-// "<id>" (cgroupfs driver). Requiring 64 hex characters is what keeps ordinary
-// slices — user.slice, system.slice, init.scope — from being mistaken for
-// containers.
-func containerIDFromCgroupName(name string) string {
-	name = strings.TrimSuffix(name, ".scope")
-	name = strings.TrimPrefix(name, "docker-")
-	if len(name) != 64 || !isHex(name) {
+// runtimeFromCgroupParent infers a runtime from the directory a bare container
+// id was found in, for the cgroupfs drivers that carry no prefix.
+func runtimeFromCgroupParent(dir string) string {
+	switch base := path.Base(dir); {
+	case base == "docker" || strings.HasPrefix(base, "docker."):
+		return "docker"
+	case strings.HasPrefix(base, "containerd"):
+		return "containerd"
+	case strings.HasPrefix(base, "crio"):
+		return "cri-o"
+	case strings.Contains(base, "libpod"):
+		return "podman"
+	default:
 		return ""
 	}
-	return name
+}
+
+// containerCgroupPrefixes maps a cgroup directory-name prefix to the runtime
+// that created it, in the order they must be tried.
+//
+// Every OCI runtime names its cgroup after the container id and distinguishes
+// itself with a prefix. That is the whole of the difference between them as far
+// as this agent is concerned: the CPU, memory, I/O and PID numbers come from
+// the same cgroup v2 files whatever created them, so supporting a new runtime
+// is a naming question, not a collection one.
+//
+// Order matters. "cri-containerd-" must be tested before "containerd-", or the
+// longer prefix never matches and every containerd container is reported with
+// "cri-" left on the front of its id.
+var containerCgroupPrefixes = []struct{ prefix, runtime string }{
+	{"docker-", "docker"},
+	{"cri-containerd-", "containerd"},
+	{"containerd-", "containerd"},
+	{"crio-", "cri-o"},
+	{"libpod-", "podman"},
+}
+
+// containerIDFromCgroupName extracts a container id and its runtime from a
+// cgroup directory name, returning "" when the name is not a container's.
+//
+// The accepted shapes are "<prefix><id>.scope" for the systemd driver and a
+// bare "<id>" for cgroupfs. Requiring 64 hex characters is what keeps ordinary
+// slices — user.slice, system.slice, init.scope — from being mistaken for
+// containers.
+//
+// A bare id carries no evidence of which runtime made it, so the runtime is
+// returned empty rather than assumed. Guessing "docker" there would have been
+// right on most hosts and quietly wrong on the rest, and a mislabelled runtime
+// is worse than an absent one: it is a fact the operator cannot tell is made
+// up.
+func containerIDFromCgroupName(name string) (id, runtime string) {
+	name = strings.TrimSuffix(name, ".scope")
+	for _, p := range containerCgroupPrefixes {
+		if rest, ok := strings.CutPrefix(name, p.prefix); ok {
+			if len(rest) == 64 && isHex(rest) {
+				return rest, p.runtime
+			}
+		}
+	}
+	if len(name) == 64 && isHex(name) {
+		return name, ""
+	}
+	return "", ""
 }
 
 func isHex(s string) bool {
@@ -602,7 +682,10 @@ func parseSelfCgroup(r io.Reader) string {
 			continue
 		}
 		for _, seg := range strings.Split(fields[2], "/") {
-			if id := containerIDFromCgroupName(seg); id != "" {
+			// The runtime is irrelevant here — the question is only which
+			// container this process is in, and the agent's own container is
+			// excluded the same way whatever created it.
+			if id, _ := containerIDFromCgroupName(seg); id != "" {
 				return id
 			}
 		}

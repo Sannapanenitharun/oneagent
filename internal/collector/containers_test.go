@@ -46,21 +46,82 @@ func TestHostPath(t *testing.T) {
 
 func TestContainerIDFromCgroupName(t *testing.T) {
 	tests := []struct {
-		in, want string
+		in, wantID, wantRuntime string
 	}{
-		{"docker-" + testContainerID + ".scope", testContainerID}, // systemd driver
-		{testContainerID, testContainerID},                        // cgroupfs driver
+		{"docker-" + testContainerID + ".scope", testContainerID, "docker"},
+		// Every other OCI runtime names its cgroup the same way and differs
+		// only in the prefix, which is why supporting them is a naming change
+		// rather than a collection one: the numbers come from the same files.
+		{"cri-containerd-" + testContainerID + ".scope", testContainerID, "containerd"},
+		{"containerd-" + testContainerID + ".scope", testContainerID, "containerd"},
+		{"crio-" + testContainerID + ".scope", testContainerID, "cri-o"},
+		{"libpod-" + testContainerID + ".scope", testContainerID, "podman"},
+		// cgroupfs driver: a bare id names no runtime, and one is not invented.
+		{testContainerID, testContainerID, ""},
 		// Ordinary slices share the directory with containers and must not be
 		// mistaken for them — the length and hex check is what separates them.
-		{"system.slice", ""},
-		{"user-1000.slice", ""},
-		{"init.scope", ""},
-		{"docker-short.scope", ""},
-		{strings.Repeat("z", 64), ""},
+		{"system.slice", "", ""},
+		{"user-1000.slice", "", ""},
+		{"init.scope", "", ""},
+		{"docker-short.scope", "", ""},
+		{"crio-short.scope", "", ""},
+		{strings.Repeat("z", 64), "", ""},
 	}
 	for _, tc := range tests {
-		if got := containerIDFromCgroupName(tc.in); got != tc.want {
-			t.Errorf("containerIDFromCgroupName(%q) = %q, want %q", tc.in, got, tc.want)
+		id, runtime := containerIDFromCgroupName(tc.in)
+		if id != tc.wantID || runtime != tc.wantRuntime {
+			t.Errorf("containerIDFromCgroupName(%q) = (%q, %q), want (%q, %q)",
+				tc.in, id, runtime, tc.wantID, tc.wantRuntime)
+		}
+	}
+}
+
+// "cri-containerd-" is a longer prefix that starts with a shorter one. Testing
+// the short prefix first would leave "cri-" on the front of every containerd
+// id, producing a 68-character string that then fails the hex check — so the
+// container would vanish rather than be misnamed, which is the harder failure
+// to notice.
+func TestContainerIDFromCgroupName_LongestPrefixWins(t *testing.T) {
+	id, runtime := containerIDFromCgroupName("cri-containerd-" + testContainerID + ".scope")
+	if id != testContainerID {
+		t.Errorf("id = %q, want the bare 64-hex id", id)
+	}
+	if runtime != "containerd" {
+		t.Errorf("runtime = %q, want containerd", runtime)
+	}
+}
+
+// A container discovered from a cgroup that names no runtime is reported as
+// unknown. Labelling it "docker" would be right on most hosts and silently
+// wrong on the rest, and the label exists precisely so an operator can tell the
+// runtimes apart.
+func TestContainerLabels_RuntimeIsNeverGuessed(t *testing.T) {
+	if got := containerLabels(dockerContainer{ID: testContainerID})["container.runtime"]; got != "unknown" {
+		t.Errorf("container.runtime = %q, want unknown for a container with no runtime evidence", got)
+	}
+	for _, rt := range []string{"docker", "containerd", "cri-o", "podman"} {
+		got := containerLabels(dockerContainer{ID: testContainerID, Runtime: rt})["container.runtime"]
+		if got != rt {
+			t.Errorf("container.runtime = %q, want %q", got, rt)
+		}
+	}
+}
+
+// The cgroupfs drivers carry no prefix, so the directory a bare id sits in is
+// the only evidence of what made it.
+func TestRuntimeFromCgroupParent(t *testing.T) {
+	tests := []struct{ dir, want string }{
+		{"/sys/fs/cgroup/docker", "docker"},
+		{"/sys/fs/cgroup/system.slice/docker.service", "docker"},
+		{"/sys/fs/cgroup/system.slice/containerd.service", "containerd"},
+		{"/sys/fs/cgroup/crio", "cri-o"},
+		{"/sys/fs/cgroup/machine.slice/libpod_parent", "podman"},
+		{"/sys/fs/cgroup/system.slice", ""},
+		{"/sys/fs/cgroup", ""},
+	}
+	for _, tc := range tests {
+		if got := runtimeFromCgroupParent(tc.dir); got != tc.want {
+			t.Errorf("runtimeFromCgroupParent(%q) = %q, want %q", tc.dir, got, tc.want)
 		}
 	}
 }

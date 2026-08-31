@@ -41,6 +41,12 @@
       "Source": "auto"
     }
   },
+  "Processes": {
+    "Enabled": false,
+    "Interval": 15000000000,
+    "MaxExecutables": 256,
+    "ExcludeNames": null
+  },
   "AccessLogs": {
     "Enabled": false,
     "Paths": [

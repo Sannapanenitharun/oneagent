@@ -24,6 +24,7 @@ type Config struct {
 	Logs       LogsConfig       `yaml:"logs"`
 	Journald   JournaldConfig   `yaml:"journald"`
 	Containers ContainersConfig `yaml:"containers"`
+	Processes  ProcessesConfig  `yaml:"processes"`
 	AccessLogs AccessLogConfig  `yaml:"access_logs"`
 	Tailing    TailingConfig    `yaml:"tailing"`
 	Traces     TracesConfig     `yaml:"traces"`
@@ -244,6 +245,27 @@ type ContainersConfig struct {
 	ExcludeNames  []string `yaml:"exclude_names"`
 
 	Logs ContainerLogsConfig `yaml:"logs"`
+}
+
+// ProcessesConfig controls the process collector.
+//
+// Off by default, like containers, and for the same reason: it adds series to
+// every host that upgrades, and that is the operator's decision rather than an
+// upgrade side effect. Unlike containers it is cheap to leave on — the rollup
+// by executable means the series count tracks the number of distinct programs,
+// not the number of processes.
+type ProcessesConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Interval defaults to the agent's top-level interval. Worth raising: a
+	// process population changes far more slowly than CPU, and the scan reads
+	// one file per process.
+	Interval time.Duration `yaml:"interval"`
+	// MaxExecutables bounds the distinct executables that get their own
+	// series. Past it the remainder is summed into one bucket, so totals stay
+	// correct.
+	MaxExecutables int `yaml:"max_executables"`
+	// ExcludeNames drops executables whose name contains any of these.
+	ExcludeNames []string `yaml:"exclude_names"`
 }
 
 // ContainerLogsConfig controls collection of container stdout/stderr from the
@@ -517,6 +539,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Containers.Logs.Root == "" {
 		cfg.Containers.Logs.Root = "/var/lib/docker/containers"
+	}
+	if cfg.Processes.Interval <= 0 {
+		cfg.Processes.Interval = cfg.Interval
+	}
+	if cfg.Processes.MaxExecutables <= 0 {
+		cfg.Processes.MaxExecutables = 256
 	}
 	if cfg.Containers.Logs.Source == "" {
 		cfg.Containers.Logs.Source = "auto"

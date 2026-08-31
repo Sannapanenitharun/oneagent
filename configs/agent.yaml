@@ -97,6 +97,29 @@ journald:
 # The socket below is used only to turn container ids into names and images; an
 # unreachable socket costs you the labels, not the data. cgroup v1 hosts are
 # detected and reported at startup rather than silently collecting nothing.
+processes:
+  # What is running on this host, rolled up BY EXECUTABLE rather than by PID.
+  #
+  # The rollup is the reason this is safe to turn on. A series per process is
+  # how a metrics backend gets destroyed: anything that forks produces
+  # thousands of PIDs an hour, each a series that receives a few points and is
+  # never written to again. Ten thousand processes across forty programs is
+  # forty series here.
+  #
+  # The cost is that it cannot tell you about one process — only about a
+  # population. That is the right trade for a metric; per-instance detail
+  # belongs on an event path where a record has a lifetime.
+  enabled: false
+  # Defaults to the top-level interval. Worth raising: a process population
+  # changes far more slowly than CPU, and the scan reads one file per process.
+  # interval: 60s
+  # Distinct executables that get their own series. Past this the remainder is
+  # SUMMED into one "(other)" bucket rather than dropped, so totals stay true.
+  # max_executables: 256
+  # Substring matches against the executable name. Kernel threads are the usual
+  # candidates — there are hundreds and they are rarely what you are looking at.
+  # exclude_names: ["kworker", "ksoftirqd", "migration"]
+
 containers:
   enabled: false
   # Engine API socket. Mount it read-only — the agent only ever issues GETs.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -263,7 +264,7 @@ SELECT
     severity                            AS severity,
     body                                AS body,
     trace_id                            AS trace_id,
-    attributes['source']                AS src
+    attributes                          AS attrs
 FROM logs
 WHERE host_id = {host:String}
   AND timestamp >= now() - INTERVAL {window:UInt32} SECOND
@@ -271,12 +272,12 @@ ORDER BY timestamp DESC
 LIMIT {limit:UInt32}`
 
 	var rows []struct {
-		T        int64  `json:"t,string"`
-		Service  string `json:"service"`
-		Severity string `json:"severity"`
-		Body     string `json:"body"`
-		TraceID  string `json:"trace_id"`
-		Src      string `json:"src"`
+		T        int64             `json:"t,string"`
+		Service  string            `json:"service"`
+		Severity string            `json:"severity"`
+		Body     string            `json:"body"`
+		TraceID  string            `json:"trace_id"`
+		Attrs    map[string]string `json:"attrs"`
 	}
 	params := map[string]string{
 		"host":   hostID,
@@ -290,7 +291,7 @@ LIMIT {limit:UInt32}`
 	out := make([]LogLine, 0, len(rows))
 	for i := len(rows) - 1; i >= 0; i-- {
 		r := rows[i]
-		labels := map[string]string{}
+		labels := perRecordAttrs(r.Attrs)
 		// The dashboard reads severity from a label, which is where the agent
 		// puts it. Stored as its own column here because it is filtered on;
 		// it moves back into the label set on the way out so one log view can
@@ -305,11 +306,64 @@ LIMIT {limit:UInt32}`
 			labels["trace_id"] = r.TraceID
 		}
 		out = append(out, LogLine{
-			T: r.T, Source: firstNonEmptyStr(r.Src, r.Service, "otlp"),
+			T: r.T, Source: firstNonEmptyStr(r.Attrs["source"], r.Service, "otlp"),
 			Message: r.Body, Labels: labels,
 		})
 	}
 	return out, nil
+}
+
+// maxLogLabels bounds how many attributes one log line carries out of the
+// store. A producer is free to attach as many as it likes; this response is
+// rendered by a browser at a polling interval, and one pathological service
+// must not be able to make the snapshot expensive for every other.
+const maxLogLabels = 24
+
+// resourcePrefixes are the attribute namespaces that describe the HOST rather
+// than the record.
+//
+// Every log line from a machine carries an identical copy of them — twenty-odd
+// keys naming the instance, its image, its region and its OS — and the snapshot
+// already reports all of that once, in its own Host block. Returning them again
+// on each of three hundred log lines would be several thousand repeated strings
+// per poll, describing something the client already knows.
+//
+// Stripping by namespace rather than by an allowlist of what to keep is the
+// point. The bug this replaces was a query that selected one hardcoded
+// attribute and discarded the rest, so container.name, container.id and stream
+// were stored and then thrown away on the way out. An allowlist would have
+// reproduced that failure the next time a collector started emitting something
+// new. This keeps everything by default and removes only what is provably
+// redundant.
+var resourcePrefixes = []string{"host.", "cloud.", "os.", "telemetry."}
+
+// perRecordAttrs returns the attributes that describe this record.
+func perRecordAttrs(attrs map[string]string) map[string]string {
+	out := make(map[string]string, len(attrs))
+	for k, v := range attrs {
+		if v == "" || isResourceAttr(k) {
+			continue
+		}
+		if len(out) >= maxLogLabels {
+			break
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func isResourceAttr(k string) bool {
+	// service.name is the one resource attribute without a namespace prefix.
+	// It is already returned as the record's own service field.
+	if k == "service.name" {
+		return true
+	}
+	for _, p := range resourcePrefixes {
+		if strings.HasPrefix(k, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // hostSpans returns the most recent spans.

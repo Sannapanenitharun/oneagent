@@ -243,8 +243,16 @@ func New(cfg *config.Config) (*Daemon, error) {
 		collectors = append(collectors, rec)
 	}
 
+	if cfg.Processes.Enabled {
+		collectors = append(collectors, collector.NewProcessCollector(d.agentID, collector.ProcessOptions{
+			Interval:       cfg.Processes.Interval,
+			MaxExecutables: cfg.Processes.MaxExecutables,
+			ExcludeNames:   cfg.Processes.ExcludeNames,
+		}))
+	}
+
 	if len(collectors) == 0 {
-		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, access_logs.enabled, containers.enabled, traces.enabled")
+		return nil, fmt.Errorf("config: no collectors enabled — set at least one of metrics.enabled, logs.enabled, access_logs.enabled, containers.enabled, processes.enabled, traces.enabled")
 	}
 
 	// Built after the registry so the exporter can report which lines are

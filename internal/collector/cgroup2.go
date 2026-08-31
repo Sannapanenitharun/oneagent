@@ -327,12 +327,24 @@ func readCgroupFirstPID(dir string) (int, error) {
 // path and this list resolves the overwhelming majority of hosts with a single
 // stat.
 func cgroupDirCandidates(root, id string) []string {
-	return []string{
+	// Docker first and in full, because it is by far the most common and every
+	// stat that misses costs a syscall before the walk begins. The other
+	// runtimes contribute their systemd-driver form only; their cgroupfs and
+	// Kubernetes layouts nest too variably to enumerate, and the depth-limited
+	// walk in resolveCgroupDir is what covers those.
+	out := []string{
 		path.Join(root, "system.slice", "docker-"+id+".scope"),
 		path.Join(root, "docker", id),
 		path.Join(root, "system.slice", "docker.service", "docker-"+id+".scope"),
 		path.Join(root, "kubepods.slice", "docker-"+id+".scope"),
 	}
+	for _, p := range containerCgroupPrefixes {
+		if p.prefix == "docker-" {
+			continue
+		}
+		out = append(out, path.Join(root, "system.slice", p.prefix+id+".scope"))
+	}
+	return out
 }
 
 // resolveCgroupDir finds the cgroup directory for a container id.
