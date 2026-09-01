@@ -188,6 +188,32 @@ echo "==> installing systemd unit"
 install -m 0644 systemd/agent-i.service /etc/systemd/system/agent-i.service
 systemctl daemon-reload
 
+# Validate the config with the NEW binary before restarting into it.
+#
+# This is the step whose absence cost an EC2 instance 72 restarts. v2.1.0
+# added duplicate-key detection to the parser; the host's config had carried a
+# duplicate key harmlessly under v2.0.3 for weeks, and an automated install
+# swapped the binary and restarted straight into a crash loop with no telemetry
+# and no obvious cause. A stricter parser meeting an older config is a normal
+# consequence of upgrading, so the check belongs here permanently, not just for
+# the release that prompted it.
+#
+# Refuses the restart rather than the install: the old binary is already
+# replaced by this point, but the running process still holds the old one, so
+# leaving the service untouched keeps the host collecting while the config is
+# fixed.
+echo "==> validating config with the new binary"
+if ! /usr/local/bin/agent-i -check -config /etc/agent-i/agent.yaml; then
+  echo "" >&2
+  echo "ERROR: /etc/agent-i/agent.yaml is not valid for this version." >&2
+  echo "       The service has NOT been restarted — the running agent is untouched" >&2
+  echo "       and still collecting. Fix the file above, then run:" >&2
+  echo "" >&2
+  echo "         sudo agent-i -check -config /etc/agent-i/agent.yaml" >&2
+  echo "         sudo systemctl restart agent-i" >&2
+  exit 1
+fi
+
 echo "==> enabling and (re)starting service"
 systemctl enable agent-i
 # See get.sh for why this is a separate explicit restart rather than

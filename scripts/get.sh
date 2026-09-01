@@ -267,7 +267,34 @@ echo "==> installing systemd unit"
 install -m 0644 "$EXTRACTED_DIR/agent-i.service" /etc/systemd/system/agent-i.service
 systemctl daemon-reload
 
-# --- 7. enable + (re)start ---
+# --- 7. validate, then enable + (re)start ---
+#
+# The check runs with the NEW binary against the EXISTING config, which is the
+# combination that fails. v2.1.0 added duplicate-key detection to the parser;
+# a host whose config had carried a duplicate key harmlessly for weeks was
+# upgraded by this script, restarted straight into a crash loop, and stayed
+# there for 72 restarts with no telemetry and nothing obvious to look at.
+#
+# This is the curl-installer path, so it is the one that matters most: it runs
+# unattended, from a pipe, usually on a host nobody is watching.
+#
+# On failure the service is deliberately left alone. The new binary is already
+# on disk, but the running process still holds the old one via its open inode,
+# so refusing the restart keeps the host collecting on the last configuration
+# that worked while the file is fixed.
+echo "==> validating config with the new binary"
+if ! /usr/local/bin/agent-i -check -config /etc/agent-i/agent.yaml; then
+  echo "" >&2
+  echo "ERROR: /etc/agent-i/agent.yaml is not valid for this version." >&2
+  echo "       The service has NOT been restarted. The agent that was already" >&2
+  echo "       running is untouched and still collecting." >&2
+  echo "" >&2
+  echo "       Fix the problem reported above, then:" >&2
+  echo "         sudo agent-i -check -config /etc/agent-i/agent.yaml" >&2
+  echo "         sudo systemctl restart agent-i" >&2
+  exit 1
+fi
+
 echo "==> enabling and (re)starting service"
 systemctl enable agent-i
 # 'enable --now' would silently no-op if the service is already running,
