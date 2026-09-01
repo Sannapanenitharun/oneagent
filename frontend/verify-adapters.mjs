@@ -16,7 +16,7 @@ import {
   alignSeries, foldSmallest, hostMetricPanels, fmtBytes, fmtMetric, MAX_SERIES_PER_PANEL,
   parseLogBody, flattenFields, ADAPTER_VERSION, CONTRACT, contractMatches,
   hostRow, deriveTopologyNodes, peerName, peerType, fmtAge,
-  hostStatus, statusRank,
+  hostStatus, statusRank, deriveContainers, containerLogCounts,
 } from "./src/adapters.js";
 
 const T0 = 1786800000000;
@@ -551,6 +551,111 @@ console.log("hostStatus");
   check("active sorts best", statusRank({ active: true, hasMetrics: true }) === 2);
   check("no-metrics does not sort with the healthy hosts",
     statusRank({ active: true, hasMetrics: false }) < statusRank({ active: true, hasMetrics: true }));
+}
+
+// ---------------------------------------------------------------------------
+// containers
+// ---------------------------------------------------------------------------
+{
+  const C = (id, name, extra = {}) => ({
+    "container.id": id, "container.name": name,
+    "container.image.name": "nginx:1.27", "container.runtime": "docker", ...extra,
+  });
+  const snap = {
+    series: [
+      { name: "container.cpu.utilization", labels: C("aaa", "web"), cumulative: false,
+        points: [{ t: T0, v: 12.5 }] },
+      { name: "container.memory.usage.total", labels: C("aaa", "web"), cumulative: false,
+        points: [{ t: T0, v: 100 * 1024 * 1024 }] },
+      { name: "container.memory.percent", labels: C("aaa", "web"), cumulative: false,
+        points: [{ t: T0, v: 40 }] },
+      { name: "container.pids.count", labels: C("aaa", "web"), cumulative: false,
+        points: [{ t: T0, v: 7 }] },
+      // Cumulative: what the table wants is the rate, not the total since the
+      // container started.
+      { name: "container.network.io.usage.rx_bytes", labels: C("aaa", "web"), cumulative: true,
+        points: [{ t: T0, v: 1000 }, { t: T0 + 1000, v: 3000 }] },
+      { name: "container.network.io.usage.tx_bytes", labels: C("aaa", "web"), cumulative: true,
+        points: [{ t: T0, v: 500 }, { t: T0 + 1000, v: 1500 }] },
+      { name: "container.blockio.io_service_bytes_recursive",
+        labels: C("aaa", "web", { operation: "read" }), cumulative: true,
+        points: [{ t: T0, v: 0 }, { t: T0 + 1000, v: 4096 }] },
+      { name: "container.blockio.io_service_bytes_recursive",
+        labels: C("aaa", "web", { operation: "write" }), cumulative: true,
+        points: [{ t: T0, v: 0 }, { t: T0 + 1000, v: 8192 }] },
+      // A busier container, to check the ordering.
+      { name: "container.cpu.utilization", labels: C("bbb", "db"), cumulative: false,
+        points: [{ t: T0, v: 130 }] },
+      { name: "container.memory.usage.total", labels: C("bbb", "db"), cumulative: false,
+        points: [{ t: T0, v: 900 * 1024 * 1024 }] },
+      // Discovered from a cgroup with no socket: no name, runtime unknown.
+      { name: "container.memory.usage.total",
+        labels: { "container.id": "ccc", "container.name": "ccc", "container.runtime": "unknown" },
+        cumulative: false, points: [{ t: T0, v: 1024 }] },
+    ],
+  };
+
+  const rows = deriveContainers(snap);
+  check("one row per container", rows.length === 3, `got ${rows.length}`);
+
+  // Busiest first: the table is opened to find what is working hardest.
+  check("busiest container sorts first", rows[0].name === "db", rows.map((r) => r.name).join(","));
+
+  const web = rows.find((r) => r.name === "web");
+  check("cpu is the latest gauge value", web.cpu === 12.5);
+  check("memory is bytes", web.mem === 100 * 1024 * 1024);
+  check("memory percent carried", web.memPct === 40);
+  check("pids carried", web.pids === 7);
+  check("image carried", web.image === "nginx:1.27");
+  check("runtime carried", web.runtime === "docker");
+
+  // A counter differentiated over one second: 2000 bytes in 1s = 2000 B/s.
+  check("network rx is a rate, not a total", web.rx === 2000, String(web.rx));
+  check("network tx is a rate, not a total", web.tx === 1000, String(web.tx));
+  // The two block-IO directions share a metric name and differ only by a
+  // label; they must not overwrite each other.
+  check("block read separated from write", web.blkRead === 4096, String(web.blkRead));
+  check("block write separated from read", web.blkWrite === 8192, String(web.blkWrite));
+
+  // The runtime is never invented, and the view needs to be able to tell that
+  // this row has no real name.
+  const anon = rows.find((r) => r.id === "ccc");
+  check("unknown runtime is preserved, not defaulted to docker", anon.runtime === "unknown");
+  check("a nameless container is detectable by name === id", anon.name === anon.id);
+
+  // Grouping is by id, not name: two containers can share a name across a
+  // restart, and merging them would average two lifetimes into one row.
+  const dup = deriveContainers({
+    series: [
+      { name: "container.memory.usage.total", labels: C("id-1", "same"), cumulative: false,
+        points: [{ t: T0, v: 10 }] },
+      { name: "container.memory.usage.total", labels: C("id-2", "same"), cumulative: false,
+        points: [{ t: T0, v: 20 }] },
+    ],
+  });
+  check("grouped by id rather than name", dup.length === 2, `got ${dup.length}`);
+
+  // A series with no container.id is not a container metric and must not
+  // produce a phantom row.
+  const stray = deriveContainers({
+    series: [{ name: "container.cpu.utilization", labels: {}, cumulative: false, points: [{ t: T0, v: 5 }] }],
+  });
+  check("a series without container.id makes no row", stray.length === 0);
+
+  check("no series means no containers", deriveContainers({ series: [] }).length === 0);
+  check("a missing snapshot does not throw", deriveContainers(undefined).length === 0);
+
+  // Log counts drive the table's Logs column and the cross-link to a filtered
+  // log view, so they have to key off the same label the filter uses.
+  const counts = containerLogCounts([
+    { labels: { "container.name": "web" } },
+    { labels: { "container.name": "web" } },
+    { labels: { "container.name": "db" } },
+    { labels: {} },
+    {},
+  ]);
+  check("log counts per container", counts.web === 2 && counts.db === 1, JSON.stringify(counts));
+  check("logs without a container are not counted", Object.keys(counts).length === 2);
 }
 
 console.log(failed === 0 ? "\nOK — all adapter checks passed" : `\n${failed} check(s) failed`);

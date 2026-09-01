@@ -8,7 +8,7 @@ import {
   Cpu, MemoryStick, Gauge, Search, Bell, ChevronRight,
   LayoutDashboard, ScrollText, Waypoints, HardDrive,
   Network, PlugZap, Pause, Play, Sun, Moon, Monitor,
-  ChevronUp, ChevronDown, X, Braces, Settings,
+  ChevronUp, ChevronDown, X, Braces, Settings, Box,
 } from "lucide-react";
 
 import { useSnapshot, useHostHealth, useAllSnapshots } from "./api";
@@ -19,7 +19,7 @@ import {
   deriveTraces, deriveEdges, layoutTopology, deriveTopologyNodes,
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
   fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow, fmtAge,
-  hostStatus, statusRank,
+  hostStatus, statusRank, deriveContainers, containerLogCounts, fmtBytes,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -779,7 +779,7 @@ function FieldRow({ label, value, dense = false }) {
   );
 }
 
-function LogsView({ logs }) {
+function LogsView({ logs, scopeLabel = null, onClearScope }) {
   const [filter, setFilter] = useState("ALL");
   const [q, setQ] = useState("");
   const [selected, setSelected] = useState(null);
@@ -822,6 +822,21 @@ function LogsView({ logs }) {
         </div>
       }
     >
+      {/* The narrowing is stated and removable. A view silently showing a
+          subset is the reason someone concludes their logs stopped arriving. */}
+      {scopeLabel && (
+        <div className="flex items-center gap-2 mb-3 text-[11px]">
+          <span className="text-[var(--ink-4)]">showing</span>
+          <span className="font-mono px-1.5 py-0.5 rounded border border-[var(--n4)] bg-[var(--sunk)]">
+            container/{scopeLabel}
+          </span>
+          <button onClick={() => onClearScope?.()}
+            className="text-[var(--accent)] hover:underline">
+            show all
+          </button>
+        </div>
+      )}
+
       <div className="flex items-center gap-2 bg-[var(--sunk)] border border-[var(--n4)] rounded px-3 py-1.5 mb-3">
         <Search size={13} className="text-[var(--ink-3)]" />
         <input value={q} onChange={(e) => setQ(e.target.value)}
@@ -1120,6 +1135,158 @@ function TopologyView({ d, selected, setSelected }) {
 // Tabs on a host, not in the sidebar: these are the three signals *for this
 // host*, and the point of putting them here is to pivot from "this host looks
 // bad" to "what was it logging" without losing which host you were on.
+// ContainersView is the table for one host's containers.
+//
+// Columns are the five facts that decide whether a container needs attention,
+// which is the same reasoning behind the host table's column set: what is it,
+// how hard is it working, how much memory does it hold, is it talking, and how
+// many processes are inside. Everything else a container has — ports, mounts,
+// env, labels — describes how it was configured rather than how it is running,
+// and belongs on a detail page rather than in a list read at a glance.
+function ContainersView({ containers, logs, onShowLogs }) {
+  const [q, setQ] = useState("");
+
+  const counts = useMemo(() => containerLogCounts(logs), [logs]);
+  const rows = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    if (!needle) return containers;
+    return containers.filter(
+      (c) =>
+        c.name.toLowerCase().includes(needle) ||
+        c.image.toLowerCase().includes(needle) ||
+        c.runtime.toLowerCase().includes(needle)
+    );
+  }, [containers, q]);
+
+  if (!containers.length) {
+    return (
+      <NotWired
+        title="Containers"
+        why="No container metrics received. Set containers.enabled: true in the agent config — and note that a host simply running no containers looks the same here."
+        needs="containers.enabled"
+      />
+    );
+  }
+
+  const num = (v, fmt) => (Number.isFinite(v) ? fmt(v) : <span className="text-[var(--ink-4)]">—</span>);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="relative flex-1 max-w-xs">
+          <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--ink-4)]" />
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="filter by name, image or runtime"
+            className="w-full bg-[var(--surface)] border border-[var(--n4)] rounded pl-7 pr-2 py-1.5 text-[11.5px] font-mono outline-none focus:border-[var(--accent)]"
+          />
+        </div>
+        <span className="text-[10px] font-mono text-[var(--ink-4)]">
+          {rows.length === containers.length
+            ? `${containers.length} container${containers.length === 1 ? "" : "s"}`
+            : `${rows.length} of ${containers.length}`}
+        </span>
+      </div>
+
+      <div className="overflow-x-auto border border-[var(--n4)] rounded-lg bg-[var(--surface)]">
+        <table className="w-full text-[11.5px]">
+          <thead>
+            <tr className="text-left text-[10px] uppercase tracking-wide text-[var(--ink-4)] border-b border-[var(--n2)]">
+              <th className="px-3 py-2 font-medium">Container</th>
+              <th className="px-3 py-2 font-medium">Image</th>
+              <th className="px-3 py-2 font-medium text-right tabular-nums">CPU</th>
+              <th className="px-3 py-2 font-medium text-right tabular-nums">Memory</th>
+              <th className="px-3 py-2 font-medium text-right tabular-nums">Net rx/tx</th>
+              <th className="px-3 py-2 font-medium text-right tabular-nums">Disk r/w</th>
+              <th className="px-3 py-2 font-medium text-right tabular-nums">PIDs</th>
+              <th className="px-3 py-2 font-medium text-right tabular-nums">Logs</th>
+            </tr>
+          </thead>
+          <tbody className="font-mono">
+            {rows.map((c) => {
+              // The agent falls back to the short id when it cannot read the
+              // Docker socket. Saying so beats rendering a hex string as
+              // though it were the name somebody gave the container.
+              const unnamed = c.name === c.id;
+              const logCount = counts[c.name] || 0;
+              return (
+                <tr key={c.id} className="border-b border-[var(--n2)] last:border-0 hover:bg-[var(--n1)]">
+                  <td className="px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <span className={unnamed ? "text-[var(--ink-3)]" : ""}>
+                        {unnamed ? c.id.slice(0, 12) : c.name}
+                      </span>
+                      <span
+                        className="text-[9.5px] uppercase tracking-wide text-[var(--ink-4)] border border-[var(--n4)] rounded px-1 py-px"
+                        title={
+                          c.runtime === "unknown"
+                            ? "The runtime could not be determined from the cgroup name, and is reported as unknown rather than assumed."
+                            : `Reported by ${c.runtime}`
+                        }
+                      >
+                        {c.runtime}
+                      </span>
+                    </div>
+                    {unnamed && (
+                      <div className="text-[9.5px] text-[var(--ink-4)] mt-0.5">
+                        no name — the Docker socket is not readable
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 text-[var(--ink-3)] max-w-[220px] truncate" title={c.image}>
+                    {c.image || <span className="text-[var(--ink-4)]">—</span>}
+                  </td>
+                  {/* Percent of ONE core, so a multi-threaded container reads
+                      above 100 — the same convention `docker stats` uses and
+                      the same one the agent's own metric documents. */}
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    {num(c.cpu, (v) => `${v.toFixed(1)}%`)}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    {num(c.mem, (v) => fmtBytes(v))}
+                    {Number.isFinite(c.memPct) && (
+                      <span className="text-[var(--ink-4)] ml-1">{c.memPct.toFixed(0)}%</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-[var(--ink-3)]">
+                    {fmtBytes(c.rx, true)} / {fmtBytes(c.tx, true)}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-[var(--ink-3)]">
+                    {fmtBytes(c.blkRead, true)} / {fmtBytes(c.blkWrite, true)}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums">{num(c.pids, (v) => v.toFixed(0))}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    {logCount > 0 ? (
+                      <button
+                        onClick={() => onShowLogs?.(c.name)}
+                        className="text-[var(--accent)] hover:underline"
+                        title={`Show this container's log lines`}
+                      >
+                        {logCount}
+                      </button>
+                    ) : (
+                      <span className="text-[var(--ink-4)]">—</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="text-[11px] text-[var(--ink-4)] leading-relaxed px-0.5">
+        CPU is percent of one core, so a container using four threads reads about
+        400 — the convention <span className="text-[var(--ink-3)]">docker stats</span> uses.
+        Network and disk are rates over the collection interval, not totals since the
+        container started. A container with no log count either writes nothing or uses a
+        log driver the agent cannot read.
+      </div>
+    </div>
+  );
+}
+
 function HostTabs({ tab, setTab, tabs }) {
   return (
     <div className="flex items-center gap-1 border-b border-[var(--n4)]">
@@ -1151,6 +1318,10 @@ function HostTabs({ tab, setTab, tabs }) {
 
 function InfrastructureView({ snap, d }) {
   const [tab, setTab] = useState("metrics");
+  // Which container the log tab is narrowed to, or null for everything. Held
+  // here rather than inside LogsView because it is set from the containers
+  // tab, and a filter that only its own view can set could not be crossed to.
+  const [logFilter, setLogFilter] = useState(null);
   const panels = useMemo(() => hostMetricPanels(snap), [snap]);
 
   if (!d.infra.length) {
@@ -1223,6 +1394,12 @@ function InfrastructureView({ snap, d }) {
           tab={tab} setTab={setTab}
           tabs={[
             { id: "metrics", label: "Metrics", icon: Gauge },
+            // Present only when there are containers. A permanently empty tab
+            // on every bare-metal host is a worse answer than no tab: it
+            // invites a click that explains nothing.
+            ...(d.containers.length
+              ? [{ id: "containers", label: "Containers", icon: Box, count: d.containers.length }]
+              : []),
             { id: "logs", label: "Logs", icon: ScrollText, count: d.logs.length },
             { id: "traces", label: "Traces", icon: Waypoints, count: d.traces.length },
           ]}
@@ -1252,7 +1429,27 @@ function InfrastructureView({ snap, d }) {
           per dashboard, "this host's logs" and "all logs" are the same set, so
           these tabs are a pivot rather than a filter — they become a real
           narrowing only once a backend puts several hosts behind one view. */}
-      {tab === "logs" && <LogsView logs={d.logs} />}
+      {tab === "containers" && (
+        <ContainersView
+          containers={d.containers}
+          logs={d.logs}
+          // Clicking a container's log count crosses to the log tab already
+          // narrowed to it. Passing the name rather than filtering in place is
+          // what keeps one log view in the app: the alternative is a second,
+          // slightly different log list that drifts from the first.
+          onShowLogs={(name) => {
+            setLogFilter(name);
+            setTab("logs");
+          }}
+        />
+      )}
+      {tab === "logs" && (
+        <LogsView
+          logs={logFilter ? d.logs.filter((l) => l.labels?.["container.name"] === logFilter) : d.logs}
+          scopeLabel={logFilter}
+          onClearScope={() => setLogFilter(null)}
+        />
+      )}
       {tab === "traces" && <TracesView traces={d.traces} />}
     </div>
   );
@@ -2043,6 +2240,7 @@ export default function ObservabilityDashboard() {
       edges: deriveEdges(snapshot),
       logs: deriveLogs(snapshot),
       infra: deriveInfra(snapshot),
+      containers: deriveContainers(snapshot),
       traffic: deriveTraffic(snapshot),
       allSeries: deriveAllSeries(snapshot),
     };

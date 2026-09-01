@@ -387,7 +387,9 @@ func TestIsVirtualDisk(t *testing.T) {
 }
 
 func TestInfraHostMetricsCollector_EndToEnd(t *testing.T) {
-	coll := NewInfraHostMetricsCollector("test-agent", 200*time.Millisecond)
+	// A nil filter is the unconfigured case: every interface is collected,
+	// which is what this test is asserting the shape of.
+	coll := NewInfraHostMetricsCollector("test-agent", 200*time.Millisecond, nil)
 	out := make(chan Envelope, 200)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

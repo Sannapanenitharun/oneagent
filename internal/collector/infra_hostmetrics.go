@@ -31,14 +31,18 @@ type InfraHostMetricsCollector struct {
 	interval time.Duration
 	stop     chan struct{}
 	gate     *sendGate
+	// ifaces decides which network interfaces are measured. Nil collects every
+	// one of them, which is what an absent configuration block means.
+	ifaces *InterfaceFilter
 }
 
-func NewInfraHostMetricsCollector(agentID string, interval time.Duration) *InfraHostMetricsCollector {
+func NewInfraHostMetricsCollector(agentID string, interval time.Duration, ifaces *InterfaceFilter) *InfraHostMetricsCollector {
 	return &InfraHostMetricsCollector{
 		gate:     newSendGate("infra.hostmetrics"),
 		agentID:  agentID,
 		interval: interval,
 		stop:     make(chan struct{}),
+		ifaces:   ifaces,
 	}
 }
 
@@ -108,6 +112,9 @@ func (h *InfraHostMetricsCollector) sample(ctx context.Context, out chan<- Envel
 
 	if ifaces, err := readNetworkIOStates(); err == nil {
 		for _, s := range ifaces {
+			if !h.ifaces.Allow(s.device) {
+				continue
+			}
 			labels := map[string]string{"device": s.device, "direction": s.direction}
 			if bootTimeUnix != "" {
 				labels["_boot_time_unix"] = bootTimeUnix
@@ -125,6 +132,9 @@ func (h *InfraHostMetricsCollector) sample(ctx context.Context, out chan<- Envel
 
 	if pkts, err := readNetworkPacketStates(); err == nil {
 		for _, s := range pkts {
+			if !h.ifaces.Allow(s.device) {
+				continue
+			}
 			labels := map[string]string{"device": s.device, "direction": s.direction}
 			if bootTimeUnix != "" {
 				labels["_boot_time_unix"] = bootTimeUnix
@@ -142,6 +152,9 @@ func (h *InfraHostMetricsCollector) sample(ctx context.Context, out chan<- Envel
 
 	if errs, err := readNetworkErrorsAndDrops(); err == nil {
 		for _, s := range errs {
+			if !h.ifaces.Allow(s.device) {
+				continue
+			}
 			labels := map[string]string{"device": s.device, "direction": s.direction}
 			if bootTimeUnix != "" {
 				labels["_boot_time_unix"] = bootTimeUnix

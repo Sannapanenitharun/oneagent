@@ -373,3 +373,95 @@ func TestSnapshot_RespectsTheWindow(t *testing.T) {
 		t.Errorf("a two-hour-old line appeared in a 15-minute window: %v", snap.Logs)
 	}
 }
+
+// The cap used to keep the first N series as they arrived, and rows arrive
+// ordered by metric name — so the cut fell wherever the alphabet put it. On a
+// real host that admitted system.network.dropped and system.network.errors and
+// refused system.network.io and system.network.packets outright, because "d"
+// and "e" sort before "i" and "p". The dashboard rendered those panels as "not
+// wired" while four thousand points sat in the database.
+func TestCapSeries_NoMetricFamilyDisappears(t *testing.T) {
+	var all []Series
+	// Mirrors the shape that broke: several families, each with many devices,
+	// in alphabetical order.
+	for _, name := range []string{
+		"system.network.dropped", "system.network.errors",
+		"system.network.io", "system.network.packets",
+	} {
+		for i := 0; i < 74; i++ {
+			all = append(all, Series{Name: name, Labels: map[string]string{"device": string(rune('a' + i%26))}})
+		}
+	}
+
+	got, dropped, err := capSeries(all, 100)
+	if err != nil {
+		t.Fatalf("capSeries: %v", err)
+	}
+	if len(got) != 100 {
+		t.Errorf("returned %d series, want the full cap of 100", len(got))
+	}
+	if dropped != uint64(len(all)-100) {
+		t.Errorf("dropped = %d, want %d", dropped, len(all)-100)
+	}
+
+	seen := map[string]int{}
+	for _, s := range got {
+		seen[s.Name]++
+	}
+	for _, name := range []string{
+		"system.network.dropped", "system.network.errors",
+		"system.network.io", "system.network.packets",
+	} {
+		if seen[name] == 0 {
+			t.Errorf("%s got no series at all — a whole metric family vanished, "+
+				"which renders its panel as though nothing collects it", name)
+		}
+	}
+	// Proportional, not merely non-zero: with four equal families and a cap of
+	// 100, each should get about a quarter.
+	for name, n := range seen {
+		if n < 20 || n > 30 {
+			t.Errorf("%s got %d of 100 series; want roughly an equal share of the cap", name, n)
+		}
+	}
+}
+
+// Under the cap nothing is touched and nothing is reported as dropped.
+func TestCapSeries_UnderTheCapIsUnchanged(t *testing.T) {
+	all := []Series{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	got, dropped, err := capSeries(all, 10)
+	if err != nil {
+		t.Fatalf("capSeries: %v", err)
+	}
+	if len(got) != 3 || dropped != 0 {
+		t.Errorf("got %d series and %d dropped, want 3 and 0", len(got), dropped)
+	}
+}
+
+// A family with fewer series than its share must not stop the others being
+// filled — the rounds simply skip it.
+func TestCapSeries_UnevenFamiliesStillFillTheCap(t *testing.T) {
+	all := []Series{{Name: "solo"}}
+	for i := 0; i < 50; i++ {
+		all = append(all, Series{Name: "many"})
+	}
+	got, dropped, err := capSeries(all, 10)
+	if err != nil {
+		t.Fatalf("capSeries: %v", err)
+	}
+	if len(got) != 10 {
+		t.Errorf("returned %d series, want the cap of 10 filled", len(got))
+	}
+	if dropped != uint64(len(all)-10) {
+		t.Errorf("dropped = %d, want %d", dropped, len(all)-10)
+	}
+	var solo int
+	for _, s := range got {
+		if s.Name == "solo" {
+			solo++
+		}
+	}
+	if solo != 1 {
+		t.Errorf("the single-series family appears %d times, want exactly once", solo)
+	}
+}

@@ -23,7 +23,9 @@ import (
 // collection was added, differing in exactly the new Containers block. Sixth
 // when container logs learned to stream from the Engine API, differing in
 // exactly Containers.Logs.Source. Seventh when the process collector was added,
-// differing in exactly the new Processes block. Each regeneration was diffed
+// differing in exactly the new Processes block. Eighth when network interface
+// filtering was added, differing in exactly Metrics.Network — empty, because
+// the shipped config ships the filter commented out. Each regeneration was diffed
 // against the previous fixture and confirmed to change nothing else, so the
 // equivalence the fixture originally proved still holds for every field that
 // predates it.

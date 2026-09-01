@@ -67,9 +67,14 @@ type Snapshot struct {
 	RetainSec       int               `json:"retain_sec"`
 	Counts          map[string]uint64 `json:"counts"`
 	Series          []Series          `json:"series"`
-	Logs            []LogLine         `json:"logs"`
-	Spans           []Span            `json:"spans"`
-	Host            map[string]string `json:"host,omitempty"`
+	// SeriesDropped counts series the cap refused. The agent's own dashboard
+	// has reported this since it gained a cap, and the frontend already reads
+	// it — the backend simply never set it, so a truncated view looked
+	// complete.
+	SeriesDropped uint64            `json:"series_dropped"`
+	Logs          []LogLine         `json:"logs"`
+	Spans         []Span            `json:"spans"`
+	Host          map[string]string `json:"host,omitempty"`
 	// Source marks where this came from, so the UI can say so rather than
 	// implying a database read is a live agent. The agent never sets it.
 	Source string `json:"source,omitempty"`
@@ -89,6 +94,13 @@ const (
 	snapshotContract  = "1"
 	maxSeriesPerHost  = 400
 	minSnapshotWindow = time.Minute
+	// maxSeriesScanned bounds what is assembled before the cap is applied.
+	// Selecting fairly across metric names requires seeing them all, so this is
+	// deliberately far above maxSeriesPerHost — it is a guard against a
+	// pathological host, not the cap itself. At the point limit it costs about
+	// 5,000 x 240 points, which is large but bounded and never leaves this
+	// process.
+	maxSeriesScanned = 5000
 )
 
 // Snapshot assembles one host's series, logs and spans.
@@ -136,7 +148,7 @@ func (c *Client) Snapshot(ctx context.Context, hostID string, window time.Durati
 		snap.AgentID = hostID
 	}
 
-	if snap.Series, err = c.hostSeries(ctx, hostID, window); err != nil {
+	if snap.Series, snap.SeriesDropped, err = c.hostSeries(ctx, hostID, window); err != nil {
 		return nil, err
 	}
 	if snap.Logs, err = c.hostLogs(ctx, hostID, window); err != nil {
@@ -162,7 +174,7 @@ func (c *Client) Snapshot(ctx context.Context, hostID string, window time.Durati
 // Grouped by name AND label set, because that is what a series is:
 // system.disk.io for two devices is two lines, and summing them into one would
 // hide the device that is saturated behind the one that is idle.
-func (c *Client) hostSeries(ctx context.Context, hostID string, window time.Duration) ([]Series, error) {
+func (c *Client) hostSeries(ctx context.Context, hostID string, window time.Duration) ([]Series, uint64, error) {
 	step := window / maxSeriesPoints
 	if step < time.Second {
 		step = time.Second
@@ -205,12 +217,12 @@ ORDER BY name, label_values, t`
 		"step":   strconv.Itoa(int(step.Seconds())),
 	}
 	if err := c.Query(ctx, q, params, &rows); err != nil {
-		return nil, fmt.Errorf("series for %s: %w", hostID, err)
+		return nil, 0, fmt.Errorf("series for %s: %w", hostID, err)
 	}
 
 	// Rows arrive ordered by series then time, so points accumulate onto
 	// whichever series is current rather than needing a second pass.
-	out := make([]Series, 0, 32)
+	all := make([]Series, 0, 32)
 	index := map[string]int{}
 	for _, r := range rows {
 		labels := map[string]string{}
@@ -222,19 +234,75 @@ ORDER BY name, label_values, t`
 		key := r.Name + "\x00" + joinLabels(r.LabelKeys, r.LabelValues)
 		i, ok := index[key]
 		if !ok {
-			if len(out) >= maxSeriesPerHost {
+			if len(all) >= maxSeriesScanned {
 				continue
 			}
-			out = append(out, Series{
+			all = append(all, Series{
 				Name: r.Name, Labels: labels, Cumulative: r.Cumulative == 1,
 				Points: make([]Point, 0, maxSeriesPoints),
 			})
-			i = len(out) - 1
+			i = len(all) - 1
 			index[key] = i
 		}
-		out[i].Points = append(out[i].Points, Point{T: r.T, V: r.V})
+		all[i].Points = append(all[i].Points, Point{T: r.T, V: r.V})
 	}
-	return out, nil
+	return capSeries(all, maxSeriesPerHost)
+}
+
+// capSeries reduces a host's series to at most max, taking from every metric
+// name in turn.
+//
+// The naive cap — keep the first max as they arrive — is what this replaces,
+// and it failed in a way that looked like a collection bug. Rows arrive ordered
+// by name, so the cap fell wherever the alphabet put it: on one real host,
+// system.network.dropped and system.network.errors were admitted and
+// system.network.io and system.network.packets were refused entirely, because
+// "d" and "e" sort before "i" and "p". Two whole metric families vanished, the
+// dashboard rendered their panels as "not wired", and four thousand points sat
+// in the database that nothing would ever ask for again.
+//
+// Round-robin makes the loss proportional instead of alphabetical. Every metric
+// name keeps representation, so a panel degrades to fewer devices rather than
+// going dark — and the count of what was refused is returned, because a view
+// that is quietly partial is the failure this whole function exists to avoid.
+func capSeries(all []Series, max int) ([]Series, uint64, error) {
+	if len(all) <= max {
+		return all, 0, nil
+	}
+
+	// Grouped by name, preserving the order names were first seen so the
+	// output is deterministic for a given query result.
+	order := make([]string, 0, 16)
+	byName := make(map[string][]Series, 16)
+	for _, s := range all {
+		if _, seen := byName[s.Name]; !seen {
+			order = append(order, s.Name)
+		}
+		byName[s.Name] = append(byName[s.Name], s)
+	}
+
+	out := make([]Series, 0, max)
+	for round := 0; len(out) < max; round++ {
+		progressed := false
+		for _, name := range order {
+			group := byName[name]
+			if round >= len(group) {
+				continue
+			}
+			progressed = true
+			out = append(out, group[round])
+			if len(out) >= max {
+				break
+			}
+		}
+		// Every group is exhausted. Cannot happen while len(all) > max, but a
+		// loop whose termination depends on arithmetic elsewhere is a loop that
+		// hangs the query the day that arithmetic changes.
+		if !progressed {
+			break
+		}
+	}
+	return out, uint64(len(all) - len(out)), nil
 }
 
 func joinLabels(keys, values []string) string {

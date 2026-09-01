@@ -50,6 +50,30 @@ metrics:
   enabled: true
   collect: ["cpu", "memory"]
 
+  # Which network interfaces to measure. Both empty means all of them, which is
+  # what Datadog, Dynatrace and the OpenTelemetry collector all do — nothing is
+  # dropped unless you say to drop it.
+  #
+  # Worth setting on a container host. Every running container adds a veth pair,
+  # and each device produces a series in four families (io, packets, errors,
+  # dropped) in each direction. Twenty containers is upwards of three hundred
+  # series describing interfaces with names like vethb3f21a9 that map to nothing
+  # an operator can read — and they are a worse copy of data already collected:
+  # container.network.io.usage.* carries the same bytes with the container's
+  # actual name on it.
+  #
+  # Do not set this blind. On a router, a firewall or a NAT box, br-* IS the
+  # traffic worth watching.
+  #
+  # match_type is required when interfaces are listed — "strict" for exact
+  # names, "regexp" for patterns. There is no default, because a pattern
+  # compared as a literal name matches nothing and the filter would look
+  # configured while doing nothing at all.
+  # network:
+  #   exclude:
+  #     interfaces: ["^veth", "^br-", "^docker"]
+  #     match_type: regexp
+
 # The systemd journal — the operating system's own logs (sshd, the kernel, unit
 # failures, authentication). These are not files, so the paths above cannot
 # reach them: journald keeps its own compressed binary store.

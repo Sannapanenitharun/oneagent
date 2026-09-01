@@ -116,7 +116,24 @@ func New(cfg *config.Config) (*Daemon, error) {
 		// Required for a backend's host-inventory view
 		// > Hosts page to recognize this host at all (confirmed against
 		// the OTel hostmetrics receiver spec — see infra_hostmetrics.go).
-		collectors = append(collectors, collector.NewInfraHostMetricsCollector(d.agentID, cfg.Interval))
+		// Compiled once, here, so a bad regex is a startup error naming the
+		// pattern rather than a filter that silently matches nothing for the
+		// life of the process.
+		ifaces, err := collector.NewInterfaceFilter(
+			collector.InterfaceMatch{
+				Interfaces: cfg.Metrics.Network.Include.Interfaces,
+				MatchType:  cfg.Metrics.Network.Include.MatchType,
+			},
+			collector.InterfaceMatch{
+				Interfaces: cfg.Metrics.Network.Exclude.Interfaces,
+				MatchType:  cfg.Metrics.Network.Exclude.MatchType,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("config: %w", err)
+		}
+		log.Printf("host metrics: measuring %s", ifaces.Describe())
+		collectors = append(collectors, collector.NewInfraHostMetricsCollector(d.agentID, cfg.Interval, ifaces))
 	}
 	// Every file-tailing collector shares one offset registry. Two registries
 	// pointed at the same path would overwrite each other's offsets on every

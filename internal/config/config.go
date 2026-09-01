@@ -125,6 +125,36 @@ type MetricsConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// Which host metrics to sample: cpu, memory, disk, network
 	Collect []string `yaml:"collect"`
+	// Network selects which interfaces host network metrics come from.
+	Network NetworkMetricsConfig `yaml:"network"`
+}
+
+// NetworkMetricsConfig selects the interfaces host network metrics are
+// collected from.
+//
+// Shaped after the OpenTelemetry hostmetrics receiver — include, exclude,
+// match_type — because this agent already emits system.network.* under those
+// semantic conventions, and an operator who knows one spelling of this idea
+// should not have to learn a second.
+//
+// Both empty means every interface, which is what Datadog, Dynatrace and the
+// OTel collector all do. Nothing is dropped unless an operator says to drop it:
+// the veth pairs that are pure noise on an application host are the only
+// interfaces that matter on a router.
+type NetworkMetricsConfig struct {
+	Include InterfaceMatchConfig `yaml:"include"`
+	Exclude InterfaceMatchConfig `yaml:"exclude"`
+}
+
+// InterfaceMatchConfig names interfaces, and how to compare the names.
+type InterfaceMatchConfig struct {
+	Interfaces []string `yaml:"interfaces"`
+	// MatchType is "strict" or "regexp", and is required whenever interfaces
+	// are listed. There is deliberately no default, because the wrong one fails
+	// silently: a pattern compared as a literal name matches nothing, so the
+	// filter would look configured while collecting everything it was written
+	// to drop.
+	MatchType string `yaml:"match_type"`
 }
 
 type LogsConfig struct {

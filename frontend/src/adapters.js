@@ -589,6 +589,134 @@ export function deriveLogs(snap) {
 }
 
 // ---------------------------------------------------------------------------
+// containers
+// ---------------------------------------------------------------------------
+
+// Every container metric the agent emits carries container.id, so that is the
+// grouping key rather than the name. A name is what an operator recognises and
+// is therefore what gets displayed, but two containers can carry the same name
+// across a restart while the id cannot — grouping by name would merge the
+// container that just died with the one that replaced it and average their
+// usage into a number describing neither.
+const CONTAINER_KEY = "container.id";
+
+// The metrics a container row is built from. Kept as a table rather than
+// repeated lookups so that the set is visible in one place: adding a column
+// means adding a line here, and a metric the agent stops emitting shows up as
+// an absent field rather than a silent zero.
+const CONTAINER_METRICS = {
+  cpu: "container.cpu.utilization",
+  mem: "container.memory.usage.total",
+  memLimit: "container.memory.usage.limit",
+  memPct: "container.memory.percent",
+  pids: "container.pids.count",
+};
+
+// deriveContainers reduces a snapshot to one row per container.
+//
+// Returns [] when the host runs none, which is a different thing from the
+// agent not collecting them — the view distinguishes those, because "no
+// containers" and "containers.enabled is false" have completely different
+// fixes and look identical in an empty table.
+export function deriveContainers(snap) {
+  if (!snap?.series?.length) return [];
+
+  const rows = new Map();
+  const row = (labels) => {
+    const id = labels?.[CONTAINER_KEY];
+    if (!id) return null;
+    let r = rows.get(id);
+    if (!r) {
+      r = {
+        id,
+        // The agent falls back to the short id when the Docker socket is not
+        // readable, so a name is always present — it is just sometimes the id
+        // again, which the view says out loud rather than showing a hex string
+        // as though it were a name.
+        name: labels["container.name"] || id,
+        image: labels["container.image.name"] || "",
+        runtime: labels["container.runtime"] || "unknown",
+        cpu: NaN,
+        mem: NaN,
+        memLimit: NaN,
+        memPct: NaN,
+        pids: NaN,
+        rx: 0,
+        tx: 0,
+        blkRead: 0,
+        blkWrite: 0,
+        cpuPoints: [],
+        memPoints: [],
+      };
+      rows.set(id, r);
+    }
+    return r;
+  };
+
+  for (const [field, metric] of Object.entries(CONTAINER_METRICS)) {
+    for (const s of pick(snap, metric)) {
+      const r = row(s.labels);
+      if (!r) continue;
+      const pts = prepare(s);
+      if (!pts.length) continue;
+      r[field] = latest(pts);
+      if (field === "cpu") r.cpuPoints = pts;
+      if (field === "mem") r.memPoints = pts;
+    }
+  }
+
+  // Network and block IO are cumulative counters, so what is wanted is the
+  // rate rather than the total-since-the-container-started. prepare()
+  // differentiates them; a counter reset drops that interval rather than
+  // drawing a negative spike.
+  for (const [metric, field] of [
+    ["container.network.io.usage.rx_bytes", "rx"],
+    ["container.network.io.usage.tx_bytes", "tx"],
+  ]) {
+    for (const s of pick(snap, metric)) {
+      const r = row(s.labels);
+      if (r) r[field] = latest(prepare(s));
+    }
+  }
+  for (const s of pick(snap, "container.blockio.io_service_bytes_recursive")) {
+    const r = row(s.labels);
+    if (!r) continue;
+    // One metric name, two directions, distinguished by a label — the same
+    // shape the OTel container conventions use.
+    const field = s.labels?.operation === "write" ? "blkWrite" : "blkRead";
+    r[field] = latest(prepare(s));
+  }
+
+  // Busiest first. CPU decides, because that is the question the table is
+  // opened to answer; memory breaks ties so the order is stable for the many
+  // containers sitting at zero percent rather than shuffling every poll.
+  return [...rows.values()].sort((a, b) => {
+    const ac = Number.isFinite(a.cpu) ? a.cpu : -1;
+    const bc = Number.isFinite(b.cpu) ? b.cpu : -1;
+    if (bc !== ac) return bc - ac;
+    const am = Number.isFinite(a.mem) ? a.mem : -1;
+    const bm = Number.isFinite(b.mem) ? b.mem : -1;
+    if (bm !== am) return bm - am;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+// containerLogCounts counts log lines per container, so the table can say
+// which containers are actually saying anything.
+//
+// Counted from the same snapshot the table is built from, so the number is
+// consistent with the window shown rather than being a lifetime total the page
+// has no way to verify.
+export function containerLogCounts(logs) {
+  const out = {};
+  for (const l of logs || []) {
+    const name = l.labels?.["container.name"];
+    if (name) out[name] = (out[name] || 0) + 1;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // infrastructure (this agent's own host)
 // ---------------------------------------------------------------------------
 

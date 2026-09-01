@@ -6,7 +6,17 @@
     "Collect": [
       "cpu",
       "memory"
-    ]
+    ],
+    "Network": {
+      "Include": {
+        "Interfaces": null,
+        "MatchType": ""
+      },
+      "Exclude": {
+        "Interfaces": null,
+        "MatchType": ""
+      }
+    }
   },
   "Logs": {
     "Enabled": true,
