@@ -35,6 +35,7 @@ func main() {
 		chUser     = flag.String("user", envOr("AGENTI_CLICKHOUSE_USER", "default"), "ClickHouse user")
 		batchRows  = flag.Int("batch-rows", envIntOr("AGENTI_BATCH_ROWS", 10000), "rows buffered before a flush")
 		batchWait  = flag.Duration("batch-interval", 2*time.Second, "maximum time rows wait before a flush")
+		maxSeries  = flag.Int("max-series", envIntOr("AGENTI_MAX_SERIES", 0), "distinct series one host's snapshot may carry (0 uses the default of 400)")
 		showVer    = flag.Bool("version", false, "print the build version and exit")
 	)
 	flag.Parse()
@@ -56,6 +57,8 @@ func main() {
 		Database: *chDatabase,
 		User:     *chUser,
 		Password: chPassword,
+
+		MaxSeriesPerHost: *maxSeries,
 	})
 	if err != nil {
 		log.Fatalf("clickhouse: %v", err)
@@ -75,6 +78,7 @@ func main() {
 		log.Fatalf("clickhouse: applying schema: %v", err)
 	}
 	log.Printf("clickhouse: connected to %s, schema up to date", *chEndpoint)
+	log.Printf("api: snapshots carry at most %d series per host", db.MaxSeriesPerHost())
 
 	writer := ingest.NewWriter(db, *batchRows, *batchWait)
 	handler := ingest.NewHandler(writer, ingest.Options{APIKeys: apiKeys})

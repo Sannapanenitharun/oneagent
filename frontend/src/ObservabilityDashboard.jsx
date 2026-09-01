@@ -516,10 +516,11 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
             <>
               {d.seriesDropped} series refused — this host reports more distinct series than one
               snapshot carries, so this view is incomplete. Every metric keeps a share, but each
-              shows fewer devices and containers than exist. The cap is on the query and is not
-              configurable; the fix is to collect less at the agent, starting with{" "}
+              shows fewer devices and containers than exist. Collect less at the agent —{" "}
               <span className="font-mono text-[var(--warn)]">metrics.network.exclude</span> for
-              veth and bridge interfaces.
+              veth and bridge interfaces is usually the whole difference — or, if the host really
+              does have this much to report, raise{" "}
+              <span className="font-mono text-[var(--warn)]">--max-series</span> on the server.
             </>
           ) : (
             <>

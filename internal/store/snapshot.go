@@ -92,11 +92,16 @@ const (
 	maxSnapshotSpans  = 400
 	maxSeriesPoints   = 240
 	snapshotContract  = "1"
-	maxSeriesPerHost  = 400
 	minSnapshotWindow = time.Minute
+	// defaultMaxSeriesPerHost is the starting cap, overridable through
+	// Config.MaxSeriesPerHost. Four hundred series at the point limit is about
+	// a megabyte of JSON, which is as much as a browser should be asked to
+	// parse on a poll interval — but that is a judgement about the reader, not
+	// a fact about the host, so it is a default and not a law.
+	defaultMaxSeriesPerHost = 400
 	// maxSeriesScanned bounds what is assembled before the cap is applied.
 	// Selecting fairly across metric names requires seeing them all, so this is
-	// deliberately far above maxSeriesPerHost — it is a guard against a
+	// deliberately far above the per-host cap — it is a guard against a
 	// pathological host, not the cap itself. At the point limit it costs about
 	// 5,000 x 240 points, which is large but bounded and never leaves this
 	// process.
@@ -246,7 +251,7 @@ ORDER BY name, label_values, t`
 		}
 		all[i].Points = append(all[i].Points, Point{T: r.T, V: r.V})
 	}
-	return capSeries(all, maxSeriesPerHost)
+	return capSeries(all, c.maxSeriesPerHost)
 }
 
 // capSeries reduces a host's series to at most max, taking from every metric

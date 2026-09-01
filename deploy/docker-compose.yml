@@ -69,6 +69,13 @@ services:
       # server says so loudly at startup rather than accepting the world
       # quietly.
       AGENTI_API_KEYS: ${AGENTI_API_KEYS:-}
+      # How many distinct series one host's snapshot may carry. Unset takes the
+      # default of 400, which is about a megabyte of JSON — as much as a
+      # browser should parse on a poll interval. Raise it for hosts that
+      # genuinely report more (twenty containers is over two hundred series
+      # before the host's own are counted) and accept the larger payload; the
+      # cheaper fix is usually to collect less at the agent.
+      AGENTI_MAX_SERIES: ${AGENTI_MAX_SERIES:-}
     ports:
       # This one IS meant to be reachable — it is where the agents send.
       # The published port is overridable because 4318 is OTLP's default and

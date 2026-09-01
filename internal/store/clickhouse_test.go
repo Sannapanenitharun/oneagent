@@ -216,3 +216,32 @@ func TestQuoteIdent_EscapesBackticks(t *testing.T) {
 		t.Errorf("quoteIdent = %s, want an escaped backtick", got)
 	}
 }
+
+// The cap on a snapshot's series is a default, not a law: a host with twenty
+// containers legitimately exceeds it, and the operator who knows that needs a
+// way to say so.
+func TestNew_MaxSeriesPerHost(t *testing.T) {
+	cases := []struct {
+		name string
+		set  int
+		want int
+	}{
+		{"unset takes the default", 0, defaultMaxSeriesPerHost},
+		{"negative takes the default", -1, defaultMaxSeriesPerHost},
+		{"a chosen value is kept", 1200, 1200},
+		// Nothing beyond maxSeriesScanned is ever assembled, so a larger cap
+		// would promise series the query cannot produce.
+		{"above what is scanned is clamped", maxSeriesScanned + 1, maxSeriesScanned},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := New(Config{Endpoint: "http://127.0.0.1:8123", MaxSeriesPerHost: tc.set})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if got := c.MaxSeriesPerHost(); got != tc.want {
+				t.Errorf("MaxSeriesPerHost() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

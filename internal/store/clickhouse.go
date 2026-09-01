@@ -30,6 +30,8 @@ type Client struct {
 	user     string
 	password string
 	http     *http.Client
+
+	maxSeriesPerHost int
 }
 
 // Config describes where the database is.
@@ -45,6 +47,17 @@ type Config struct {
 	// queries are the slow ones, and a query that has not answered in this
 	// long is one the dashboard has already given up waiting for.
 	Timeout time.Duration
+	// MaxSeriesPerHost caps how many distinct series one snapshot carries.
+	//
+	// Configurable because the default is a guess about payload size, not a
+	// property of the data, and a host can legitimately exceed it: twenty
+	// containers reporting eleven metric families each is over two hundred
+	// series before the host's own are counted. When that happens the
+	// dashboard shows a truncated view, and an operator who knows their hosts
+	// are large should be able to say so rather than being told the limit is
+	// the limit. Zero selects defaultMaxSeriesPerHost; values above
+	// maxSeriesScanned are clamped, because nothing beyond that is assembled.
+	MaxSeriesPerHost int
 }
 
 const (
@@ -65,11 +78,18 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeout
 	}
+	if cfg.MaxSeriesPerHost <= 0 {
+		cfg.MaxSeriesPerHost = defaultMaxSeriesPerHost
+	}
+	if cfg.MaxSeriesPerHost > maxSeriesScanned {
+		cfg.MaxSeriesPerHost = maxSeriesScanned
+	}
 	return &Client{
-		endpoint: strings.TrimRight(cfg.Endpoint, "/"),
-		database: cfg.Database,
-		user:     cfg.User,
-		password: cfg.Password,
+		endpoint:         strings.TrimRight(cfg.Endpoint, "/"),
+		database:         cfg.Database,
+		user:             cfg.User,
+		password:         cfg.Password,
+		maxSeriesPerHost: cfg.MaxSeriesPerHost,
 		http: &http.Client{
 			Timeout: cfg.Timeout,
 			Transport: &http.Transport{
@@ -84,6 +104,12 @@ func New(cfg Config) (*Client, error) {
 		},
 	}, nil
 }
+
+// MaxSeriesPerHost reports the effective cap, after defaulting and clamping.
+// The server logs it at startup: a truncated dashboard and a correctly small
+// host look identical, so the number that decides between them should not be
+// something you have to read the source to learn.
+func (c *Client) MaxSeriesPerHost() int { return c.maxSeriesPerHost }
 
 // Ping reports whether the server is reachable and answering.
 //

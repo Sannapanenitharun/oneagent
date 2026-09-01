@@ -128,11 +128,23 @@ Everything has a working default except the API keys.
 | `AGENTI_CLICKHOUSE_PASSWORD` | — | environment only, never a flag: flags are visible in `ps` |
 | `AGENTI_API_KEYS` | — | `label:key,label:key`. **Unset disables authentication** |
 | `AGENTI_BATCH_ROWS` | `10000` | rows buffered before a flush |
+| `AGENTI_MAX_SERIES` | `400` | distinct series one host's snapshot carries; capped at 5000 |
 | `AGENTI_PORT` | `4318` | published port only — compose reads it; the container always listens on 4318 |
 
 Leaving `AGENTI_API_KEYS` unset is right for a laptop and wrong for anything
 with a route to it. The server logs a warning at startup in that case rather
 than accepting the world quietly.
+
+`AGENTI_MAX_SERIES` decides when the dashboard shows a truncated view. The
+default is a judgement about the browser — 400 series at the point limit is
+roughly a megabyte of JSON per poll — not about the host, and a container host
+can exceed it honestly: twenty containers reporting eleven metric families each
+is over two hundred series before the host's own network and disk devices are
+counted. When the cap is reached the snapshot keeps a share of every metric
+name rather than the first N alphabetically, reports the shortfall as
+`series_dropped`, and the dashboard says so. Raising this accepts a larger
+payload; narrowing what the agent collects (`metrics.network.exclude`) is
+usually the cheaper fix, because most of the excess is one series per veth.
 
 ## Seeing it in the dashboard
 
