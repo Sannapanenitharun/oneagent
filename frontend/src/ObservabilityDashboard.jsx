@@ -504,10 +504,31 @@ function OverviewView({ snap, d, openService, openHost, openLogs }) {
         />
       </div>
 
+      {/* Two different caps produce this number, and they have different
+          fixes. An agent-sourced snapshot was truncated by the agent's own
+          in-memory store, which is configurable. A backend-sourced one was
+          truncated by the per-host limit on a snapshot query, which is not —
+          so naming dashboard.max_series there sends the operator to a knob
+          that cannot affect what they are looking at. */}
       {d.seriesDropped > 0 && (
         <div className="mb-4 border border-[var(--warn)] border-l-2 rounded px-3 py-2 text-[12px] text-[var(--ink-2)] bg-[color-mix(in srgb, var(--warn) 4%, transparent)]">
-          {d.seriesDropped} series refused — the agent's in-memory cap was reached, so this view is incomplete.
-          Raise <span className="font-mono text-[var(--warn)]">dashboard.max_series</span> or narrow what is collected.
+          {snap?.source === "backend" ? (
+            <>
+              {d.seriesDropped} series refused — this host reports more distinct series than one
+              snapshot carries, so this view is incomplete. Every metric keeps a share, but each
+              shows fewer devices and containers than exist. The cap is on the query and is not
+              configurable; the fix is to collect less at the agent, starting with{" "}
+              <span className="font-mono text-[var(--warn)]">metrics.network.exclude</span> for
+              veth and bridge interfaces.
+            </>
+          ) : (
+            <>
+              {d.seriesDropped} series refused — the agent's in-memory cap was reached, so this
+              view is incomplete. Raise{" "}
+              <span className="font-mono text-[var(--warn)]">dashboard.max_series</span> or narrow
+              what is collected.
+            </>
+          )}
         </div>
       )}
 
