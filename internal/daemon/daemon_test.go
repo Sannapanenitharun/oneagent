@@ -437,3 +437,52 @@ func TestMergeDeclaredAttributes_NilIsANoOp(t *testing.T) {
 		t.Errorf("got %v, want the detected set untouched", got)
 	}
 }
+
+// Both settings are read once at startup, so a reload that changed them
+// silently would leave every signal wearing the old identity while the config
+// on disk said otherwise.
+func TestRestartRequired_CoversAttributionSettings(t *testing.T) {
+	base := func() *config.Config {
+		return &config.Config{
+			Containers:         config.ContainersConfig{AppLabel: "com.agent-i.app"},
+			ResourceAttributes: map[string]string{"env": "prod"},
+		}
+	}
+
+	if got := restartRequired(base(), base()); len(got) != 0 {
+		t.Errorf("identical configs reported %v as needing a restart", got)
+	}
+
+	changedLabel := base()
+	changedLabel.Containers.AppLabel = "com.example.app"
+	if !listsSetting(restartRequired(base(), changedLabel), "containers.app_label") {
+		t.Error("a changed app_label was not reported — it would look applied and do nothing")
+	}
+
+	changedAttrs := base()
+	changedAttrs.ResourceAttributes = map[string]string{"env": "staging"}
+	if !listsSetting(restartRequired(base(), changedAttrs), "resource_attributes") {
+		t.Error("changed resource_attributes were not reported")
+	}
+
+	addedAttr := base()
+	addedAttr.ResourceAttributes = map[string]string{"env": "prod", "team": "platform"}
+	if !listsSetting(restartRequired(base(), addedAttr), "resource_attributes") {
+		t.Error("an added resource attribute was not reported")
+	}
+
+	removedAll := base()
+	removedAll.ResourceAttributes = nil
+	if !listsSetting(restartRequired(base(), removedAll), "resource_attributes") {
+		t.Error("removing every resource attribute was not reported")
+	}
+}
+
+func listsSetting(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}

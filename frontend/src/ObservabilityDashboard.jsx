@@ -8,7 +8,7 @@ import {
   Cpu, MemoryStick, Gauge, Search, Bell, ChevronRight,
   LayoutDashboard, ScrollText, Waypoints, HardDrive,
   Network, PlugZap, Pause, Play, Sun, Moon, Monitor,
-  ChevronUp, ChevronDown, X, Braces, Settings, Box,
+  ChevronUp, ChevronDown, X, Braces, Settings, Box, Layers,
 } from "lucide-react";
 
 import { useSnapshot, useHostHealth, useAllSnapshots } from "./api";
@@ -20,6 +20,7 @@ import {
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
   fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow, fmtAge,
   hostStatus, statusRank, deriveContainers, containerLogCounts, fmtBytes,
+  deriveApps, unlabelledContainers, appLogCounts,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -1157,6 +1158,100 @@ function TopologyView({ d, selected, setSelected }) {
 // Tabs on a host, not in the sidebar: these are the three signals *for this
 // host*, and the point of putting them here is to pivot from "this host looks
 // bad" to "what was it logging" without losing which host you were on.
+// AppsView rolls the container table up to the application that owns each one.
+//
+// It is the answer to a question the per-container table cannot give: five APIs
+// on one instance are five workloads with five costs, and until the agent
+// learned to read an application name off a container label every one of them
+// arrived under the machine's identity. Sums rather than averages, because an
+// application's cost is the cost of all its replicas.
+//
+// Unlabelled containers are counted and named, never bucketed. A row that
+// merged everything without a label would look like an application and be a
+// filing error.
+function AppsView({ apps, unlabelled, logs, onShowLogs }) {
+  const counts = useMemo(() => appLogCounts(logs), [logs]);
+
+  if (!apps.length) {
+    return (
+      <NotWired
+        title="Applications"
+        why={
+          unlabelled > 0
+            ? `${unlabelled} container${unlabelled === 1 ? " is" : "s are"} running, but none carries an application label, so every one of them reports under this host's identity. Set containers.app_label in the agent config and label the containers with it.`
+            : "No labelled containers. Applications are grouped by the service.name the agent reads from a container label — set containers.app_label and label the containers with it."
+        }
+        needs="containers.app_label"
+      />
+    );
+  }
+
+  const num = (v, fmt) => (Number.isFinite(v) ? fmt(v) : <span className="text-[var(--ink-4)]">—</span>);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <table className="w-full text-[12px]">
+        <thead>
+          <tr className="text-left text-[10px] uppercase tracking-wider text-[var(--ink-4)]">
+            <th className="font-medium py-1.5 pr-3">Application</th>
+            <th className="font-medium py-1.5 pr-3">Containers</th>
+            <th className="font-medium py-1.5 pr-3 text-right">CPU</th>
+            <th className="font-medium py-1.5 pr-3 text-right">Memory</th>
+            <th className="font-medium py-1.5 pr-3 text-right">PIDs</th>
+            <th className="font-medium py-1.5 pr-3 text-right">Net in/s</th>
+            <th className="font-medium py-1.5 pr-3 text-right">Net out/s</th>
+            <th className="font-medium py-1.5 text-right">Logs</th>
+          </tr>
+        </thead>
+        <tbody>
+          {apps.map((a) => (
+            <tr key={a.app} className="border-t border-[var(--hairline)]">
+              <td className="py-1.5 pr-3 font-medium text-[var(--ink-1)]">{a.app}</td>
+              <td className="py-1.5 pr-3 text-[var(--ink-3)]">
+                {a.containers}
+                {a.images.length > 0 && (
+                  <span className="ml-1.5 text-[10px] text-[var(--ink-4)] font-mono">
+                    {a.images.length === 1 ? a.images[0] : `${a.images.length} images`}
+                  </span>
+                )}
+              </td>
+              <td className="py-1.5 pr-3 text-right tabular-nums">{num(a.cpu, (v) => `${v.toFixed(1)}%`)}</td>
+              <td className="py-1.5 pr-3 text-right tabular-nums">{num(a.mem, fmtBytes)}</td>
+              <td className="py-1.5 pr-3 text-right tabular-nums">{num(a.pids, (v) => v.toFixed(0))}</td>
+              <td className="py-1.5 pr-3 text-right tabular-nums">{num(a.rx, fmtBytes)}</td>
+              <td className="py-1.5 pr-3 text-right tabular-nums">{num(a.tx, fmtBytes)}</td>
+              <td className="py-1.5 text-right tabular-nums">
+                {counts[a.app] ? (
+                  <button
+                    type="button"
+                    className="underline decoration-dotted underline-offset-2 hover:text-[var(--accent)]"
+                    onClick={() => onShowLogs(a.app)}
+                  >
+                    {counts[a.app]}
+                  </button>
+                ) : (
+                  <span className="text-[var(--ink-4)]">0</span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {/* Said out loud, because a table showing three applications on a host
+          running twenty-one containers is not wrong — it is partial, and the
+          difference is invisible without this line. */}
+      {unlabelled > 0 && (
+        <div className="text-[11px] text-[var(--ink-4)] leading-relaxed px-0.5">
+          {unlabelled} container{unlabelled === 1 ? "" : "s"} carr{unlabelled === 1 ? "ies" : "y"} no
+          application label and {unlabelled === 1 ? "is" : "are"} not counted above. {unlabelled === 1 ? "It reports" : "They report"}{" "}
+          under this host's identity.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ContainersView is the table for one host's containers.
 //
 // Columns are the five facts that decide whether a container needs attention,
@@ -1343,7 +1438,10 @@ function InfrastructureView({ snap, d }) {
   // Which container the log tab is narrowed to, or null for everything. Held
   // here rather than inside LogsView because it is set from the containers
   // tab, and a filter that only its own view can set could not be crossed to.
-  const [logFilter, setLogFilter] = useState(null);
+  // One scope, carrying which dimension it narrows by. Two independent filter
+  // states would eventually both be set, and a log list quietly ANDed by a
+  // container AND an application is a filter nobody asked for.
+  const [logFilter, setLogFilter] = useState(null); // { by: "container" | "app", value }
   const panels = useMemo(() => hostMetricPanels(snap), [snap]);
 
   if (!d.infra.length) {
@@ -1419,6 +1517,9 @@ function InfrastructureView({ snap, d }) {
             // Present only when there are containers. A permanently empty tab
             // on every bare-metal host is a worse answer than no tab: it
             // invites a click that explains nothing.
+            ...(d.apps.length
+              ? [{ id: "apps", label: "Applications", icon: Layers, count: d.apps.length }]
+              : []),
             ...(d.containers.length
               ? [{ id: "containers", label: "Containers", icon: Box, count: d.containers.length }]
               : []),
@@ -1451,6 +1552,17 @@ function InfrastructureView({ snap, d }) {
           per dashboard, "this host's logs" and "all logs" are the same set, so
           these tabs are a pivot rather than a filter — they become a real
           narrowing only once a backend puts several hosts behind one view. */}
+      {tab === "apps" && (
+        <AppsView
+          apps={d.apps}
+          unlabelled={d.unlabelledContainers}
+          logs={d.logs}
+          onShowLogs={(app) => {
+            setLogFilter({ by: "app", value: app });
+            setTab("logs");
+          }}
+        />
+      )}
       {tab === "containers" && (
         <ContainersView
           containers={d.containers}
@@ -1460,15 +1572,23 @@ function InfrastructureView({ snap, d }) {
           // what keeps one log view in the app: the alternative is a second,
           // slightly different log list that drifts from the first.
           onShowLogs={(name) => {
-            setLogFilter(name);
+            setLogFilter({ by: "container", value: name });
             setTab("logs");
           }}
         />
       )}
       {tab === "logs" && (
         <LogsView
-          logs={logFilter ? d.logs.filter((l) => l.labels?.["container.name"] === logFilter) : d.logs}
-          scopeLabel={logFilter}
+          logs={
+            logFilter
+              ? d.logs.filter((l) =>
+                  logFilter.by === "app"
+                    ? (l.labels?.["service.name"] || l.labels?.service || l.svc) === logFilter.value
+                    : l.labels?.["container.name"] === logFilter.value
+                )
+              : d.logs
+          }
+          scopeLabel={logFilter?.value ?? null}
           onClearScope={() => setLogFilter(null)}
         />
       )}
@@ -2263,6 +2383,8 @@ export default function ObservabilityDashboard() {
       logs: deriveLogs(snapshot),
       infra: deriveInfra(snapshot),
       containers: deriveContainers(snapshot),
+      apps: deriveApps(snapshot),
+      unlabelledContainers: unlabelledContainers(snapshot),
       traffic: deriveTraffic(snapshot),
       allSeries: deriveAllSeries(snapshot),
     };

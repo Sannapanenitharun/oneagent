@@ -341,3 +341,90 @@ func TestBatch_EmptyInputsAreSafe(t *testing.T) {
 		t.Fatal("a nil request produced rows")
 	}
 }
+
+func resourceWith(kv ...string) *otlpwire.Resource {
+	r := &otlpwire.Resource{}
+	for i := 0; i < len(kv); i += 2 {
+		r.Attributes = append(r.Attributes, &otlpwire.KeyValue{
+			Key: kv[i], Value: &otlpwire.AnyValue{Kind: otlpwire.ValueString, Str: kv[i+1]},
+		})
+	}
+	return r
+}
+
+// One export now carries a resource per application, because the agent labels a
+// container's telemetry with the app it runs. They describe one machine and
+// differ only in service.name, so the inventory row must describe the machine
+// rather than whichever application sorted first.
+func TestMetrics_HostRowDescribesTheMachineNotAWorkload(t *testing.T) {
+	req := &otlpwire.ExportMetricsServiceRequest{
+		ResourceMetrics: []*otlpwire.ResourceMetrics{
+			// A container's resource arrives first, as it routinely will.
+			{Resource: resourceWith("host.id", "i-0abc", "host.name", "teleport",
+				"os.name", "Ubuntu", "service.name", "checkout")},
+			// The host's own resource: service.name here IS the host.
+			{Resource: resourceWith("host.id", "i-0abc", "host.name", "teleport",
+				"os.name", "Ubuntu", "service.name", "teleport")},
+		},
+	}
+	b := Metrics(req, time.Now())
+
+	if len(b.Hosts) != 1 {
+		t.Fatalf("got %d host rows, want one per machine", len(b.Hosts))
+	}
+	attrs, _ := b.Hosts[0]["attributes"].(map[string]string)
+	if got := attrs["service.name"]; got != "teleport" {
+		t.Errorf("host inventory service.name = %q, want the host's own identity — "+
+			"an application's name here makes the fleet row describe a workload", got)
+	}
+	if attrs["os.name"] != "Ubuntu" {
+		t.Errorf("os.name = %q, want the machine description preserved", attrs["os.name"])
+	}
+	if b.Hosts[0]["host_id"] != "i-0abc" {
+		t.Errorf("host_id = %v, want the instance id", b.Hosts[0]["host_id"])
+	}
+}
+
+// Ordering must not decide the answer: the same two resources reversed produce
+// the same row.
+func TestMetrics_HostRowIsIndependentOfResourceOrder(t *testing.T) {
+	host := resourceWith("host.id", "i-0abc", "host.name", "teleport", "os.name", "Ubuntu", "service.name", "teleport")
+	app := resourceWith("host.id", "i-0abc", "host.name", "teleport", "os.name", "Ubuntu", "service.name", "checkout")
+
+	for _, order := range [][]*otlpwire.Resource{{app, host}, {host, app}} {
+		req := &otlpwire.ExportMetricsServiceRequest{}
+		for _, r := range order {
+			req.ResourceMetrics = append(req.ResourceMetrics, &otlpwire.ResourceMetrics{Resource: r})
+		}
+		b := Metrics(req, time.Now())
+		if len(b.Hosts) != 1 {
+			t.Fatalf("got %d host rows, want 1", len(b.Hosts))
+		}
+		attrs, _ := b.Hosts[0]["attributes"].(map[string]string)
+		if attrs["service.name"] != "teleport" {
+			t.Errorf("service.name = %q regardless of order, want %q", attrs["service.name"], "teleport")
+		}
+	}
+}
+
+// A sender that reports neither host.id nor host.name is identified BY its
+// service name. Stripping it there would leave the machine with nothing
+// describing it.
+func TestMetrics_ServiceNameSurvivesWhenItIsTheIdentity(t *testing.T) {
+	req := &otlpwire.ExportMetricsServiceRequest{
+		ResourceMetrics: []*otlpwire.ResourceMetrics{
+			{Resource: resourceWith("service.name", "standalone-app")},
+		},
+	}
+	b := Metrics(req, time.Now())
+	if len(b.Hosts) != 1 {
+		t.Fatalf("got %d host rows, want 1", len(b.Hosts))
+	}
+	attrs, _ := b.Hosts[0]["attributes"].(map[string]string)
+	if attrs["service.name"] != "standalone-app" {
+		t.Errorf("service.name = %q, want it kept when it is the host's only identity", attrs["service.name"])
+	}
+	if b.Hosts[0]["host_id"] != "standalone-app" {
+		t.Errorf("host_id = %v, want the service-name fallback", b.Hosts[0]["host_id"])
+	}
+}

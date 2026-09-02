@@ -98,8 +98,37 @@ func (v resourceView) hostRow(now time.Time) Row {
 		"agent_id":   v.agentID,
 		"last_seen":  ts,
 		"first_seen": ts,
-		"attributes": v.attrs,
+		"attributes": v.hostAttrs(),
 	}
+}
+
+// hostAttrs is the resource's attributes with a workload's identity removed.
+//
+// This table describes a machine. One export now carries several resources for
+// the same host — one per application, since the agent labels a container's
+// telemetry with the application it runs — and they differ only in
+// service.name. Left in, the machine's inventory row would describe whichever
+// application happened to be first in the batch, and would flap between them
+// as batches reordered, because rows of equal attribute count collapse to the
+// most recently written.
+//
+// service.name is kept when it IS the host's identity rather than a workload's:
+// hostID falls back to it for senders that report neither host.id nor
+// host.name, and stripping it there would leave a machine whose only name is
+// its id with nothing describing it.
+func (v resourceView) hostAttrs() map[string]string {
+	svc := v.attrs[attrServiceName]
+	if svc == "" || svc == v.hostID || svc == v.agentID {
+		return v.attrs
+	}
+	out := make(map[string]string, len(v.attrs))
+	for k, val := range v.attrs {
+		if k == attrServiceName {
+			continue
+		}
+		out[k] = val
+	}
+	return out
 }
 
 // Metrics converts an OTLP metric export.
@@ -108,7 +137,7 @@ func Metrics(req *otlpwire.ExportMetricsServiceRequest, now time.Time) Batch {
 	if req == nil {
 		return b
 	}
-	seen := map[string]bool{}
+	seen := map[string]int{}
 
 	for _, rm := range req.ResourceMetrics {
 		if rm == nil {
@@ -175,7 +204,7 @@ func Logs(req *otlpwire.ExportLogsServiceRequest, now time.Time) Batch {
 	if req == nil {
 		return b
 	}
-	seen := map[string]bool{}
+	seen := map[string]int{}
 
 	for _, rl := range req.ResourceLogs {
 		if rl == nil {
@@ -219,7 +248,7 @@ func Spans(req *otlpwire.ExportTraceServiceRequest, now time.Time) Batch {
 	if req == nil {
 		return b
 	}
-	seen := map[string]bool{}
+	seen := map[string]int{}
 
 	for _, rs := range req.ResourceSpans {
 		if rs == nil {
@@ -265,14 +294,38 @@ func Spans(req *otlpwire.ExportTraceServiceRequest, now time.Time) Batch {
 
 // --- helpers ---
 
-func addHost(b *Batch, res resourceView, now time.Time, seen map[string]bool) {
-	if res.hostID == "" || seen[res.hostID] {
+// addHost records one inventory row per host in a batch, keeping the fullest
+// description offered.
+//
+// It used to keep the first and discard the rest, which was fine while an
+// export carried one resource per host. It no longer does: an agent labelling
+// containers by application emits a resource per application, and the machine's
+// own resource — the one that still carries service.name because that name IS
+// the host — is not reliably first. Preferring the richer row makes the choice
+// deterministic rather than dependent on batch ordering, and matches how the
+// query side breaks ties between rows of different completeness.
+func addHost(b *Batch, res resourceView, now time.Time, seen map[string]int) {
+	if res.hostID == "" {
 		return
 	}
-	seen[res.hostID] = true
-	if row := res.hostRow(now); row != nil {
-		b.Hosts = append(b.Hosts, row)
+	row := res.hostRow(now)
+	if row == nil {
+		return
 	}
+	at, already := seen[res.hostID]
+	if !already {
+		seen[res.hostID] = len(b.Hosts)
+		b.Hosts = append(b.Hosts, row)
+		return
+	}
+	if attrCount(row) > attrCount(b.Hosts[at]) {
+		b.Hosts[at] = row
+	}
+}
+
+func attrCount(r Row) int {
+	attrs, _ := r["attributes"].(map[string]string)
+	return len(attrs)
 }
 
 // mergeAttrs combines resource and point attributes.

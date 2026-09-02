@@ -636,6 +636,10 @@ export function deriveContainers(snap) {
         name: labels["container.name"] || id,
         image: labels["container.image.name"] || "",
         runtime: labels["container.runtime"] || "unknown",
+        // The application this container runs, when the operator has labelled
+        // it. Empty otherwise, which the Applications view reports as a count
+        // rather than folding into a row that would look like an app.
+        app: labels["service.name"] || "",
         cpu: NaN,
         mem: NaN,
         memLimit: NaN,
@@ -712,6 +716,96 @@ export function containerLogCounts(logs) {
   for (const l of logs || []) {
     const name = l.labels?.["container.name"];
     if (name) out[name] = (out[name] || 0) + 1;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// applications
+// ---------------------------------------------------------------------------
+
+const APP_KEY = "service.name";
+
+// addReading sums a reading into a running total that may not exist yet.
+const addReading = (total, v) =>
+  Number.isFinite(v) ? (Number.isFinite(total) ? total + v : v) : total;
+
+// deriveApps rolls a snapshot up by application rather than by container.
+//
+// The dimension exists because a host is not a unit of work. Five APIs on one
+// instance answer five different questions and cost five different amounts, and
+// until the agent learned to read an application name off a container label
+// every one of them arrived wearing the machine's identity — which is why this
+// view could not be built before and why every panel in it is a sum rather than
+// a reading.
+//
+// Containers are summed, not averaged: two replicas of one service use the CPU
+// of both, and an operator asking what an application costs wants the total.
+// Percent-of-limit is deliberately NOT summed — adding two percentages produces
+// a number with no meaning — so it is omitted rather than invented.
+export function deriveApps(snap) {
+  const containers = deriveContainers(snap);
+  if (!containers.length) return [];
+
+  const rows = new Map();
+  for (const c of containers) {
+    // Containers the operator has not labelled carry no application, and are
+    // deliberately left out rather than bucketed into "unknown": a row that
+    // mixes every unlabelled container together looks like an application and
+    // is not one. The view reports the count separately instead.
+    const app = c.app;
+    if (!app) continue;
+    let r = rows.get(app);
+    if (!r) {
+      r = { app, containers: 0, cpu: NaN, mem: NaN, pids: NaN, rx: 0, tx: 0, images: new Set() };
+      rows.set(app, r);
+    }
+    r.containers += 1;
+    // NaN until something real is added, so "no container reported memory"
+    // stays distinguishable from "every container reported zero". Starting at
+    // 0 would render an absent reading as 0 B, which is the same mistake as
+    // dropping a genuine zero — just in the other direction.
+    r.cpu = addReading(r.cpu, c.cpu);
+    r.mem = addReading(r.mem, c.mem);
+    r.pids = addReading(r.pids, c.pids);
+    r.rx += c.rx || 0;
+    r.tx += c.tx || 0;
+    if (c.image) r.images.add(c.image);
+  }
+
+  // Busiest first, with unreadable values sorting last rather than arbitrarily
+  // — NaN comparisons are always false, so they must be mapped out before they
+  // reach the comparator.
+  const rank = (v) => (Number.isFinite(v) ? v : -1);
+  return [...rows.values()]
+    .map((r) => ({ ...r, images: [...r.images] }))
+    .sort(
+      (a, b) =>
+        rank(b.cpu) - rank(a.cpu) ||
+        rank(b.mem) - rank(a.mem) ||
+        a.app.localeCompare(b.app)
+    );
+}
+
+// unlabelledContainers counts what deriveApps had to leave out, so the view can
+// say "8 of 21 containers are unlabelled" rather than quietly showing a
+// partial picture — the same reason the snapshot reports series_dropped.
+export function unlabelledContainers(snap) {
+  const containers = deriveContainers(snap);
+  return containers.filter((c) => !c.app).length;
+}
+
+// appLogCounts counts log lines per application.
+//
+// Three places, because the two transports fill different ones: a
+// backend-sourced record carries the resolved name as a `service` label and in
+// `svc`, while the agent's own dashboard passes the raw `service.name`
+// attribute straight through. Checked most-specific first.
+export function appLogCounts(logs) {
+  const out = {};
+  for (const l of logs || []) {
+    const app = l.labels?.[APP_KEY] || l.labels?.service || l.svc;
+    if (app) out[app] = (out[app] || 0) + 1;
   }
   return out;
 }

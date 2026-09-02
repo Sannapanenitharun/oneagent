@@ -791,8 +791,31 @@ func restartRequired(old, new *config.Config) []string {
 	add("exporter", old.Exporter.Type != new.Exporter.Type ||
 		old.Exporter.Endpoint != new.Exporter.Endpoint ||
 		old.Exporter.Path != new.Exporter.Path)
+	// Both are read once, into structures built at startup: the label into the
+	// three container collectors' options, the attributes into the resource the
+	// exporter stamps on every payload. Neither is consulted again, so a change
+	// that went unreported would look applied while every signal kept the old
+	// identity — and attribution silently reporting the wrong app is worse than
+	// attribution that has not started yet.
+	//
+	// (The rest of containers.* has the same startup-only lifetime and is not
+	// listed here; that predates this and is worth a separate pass.)
+	add("containers.app_label", old.Containers.AppLabel != new.Containers.AppLabel)
+	add("resource_attributes", !equalAttrs(old.ResourceAttributes, new.ResourceAttributes))
 
 	return changed
+}
+
+func equalAttrs(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func equalStrings(a, b []string) bool {
