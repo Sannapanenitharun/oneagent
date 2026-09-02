@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -141,6 +142,31 @@ func check(path string) int {
 		fmt.Printf("  collectors none enabled — the agent will refuse to start\n")
 	} else {
 		fmt.Printf("  collectors %s\n", strings.Join(enabled, " "))
+	}
+
+	// Attribution, when it is configured. An app label that names a key no
+	// container carries is the silent failure this reports: telemetry keeps
+	// flowing, every container keeps reporting under the host's identity, and
+	// nothing looks wrong. The collector says how many containers actually
+	// resolved once it is running; this says whether it will try at all.
+	if cfg.Containers.Enabled {
+		if cfg.Containers.AppLabel != "" {
+			fmt.Printf("  app label  %s → service.name\n", cfg.Containers.AppLabel)
+		} else {
+			fmt.Printf("  app label  unset — every container reports as the host\n")
+		}
+	}
+	if len(cfg.ResourceAttributes) > 0 {
+		keys := make([]string, 0, len(cfg.ResourceAttributes))
+		for k := range cfg.ResourceAttributes {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, k+"="+cfg.ResourceAttributes[k])
+		}
+		fmt.Printf("  attributes %s\n", strings.Join(parts, " "))
 	}
 
 	// Printed last and unconditionally, because this is the line that would

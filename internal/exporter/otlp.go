@@ -583,10 +583,32 @@ func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 	// each metric name once per point in every payload; OTLP's model is one
 	// metric carrying many points, and consumers are entitled to expect that
 	// shape. Insertion order is preserved so payloads stay diffable.
-	order := make([]string, 0, 16)
-	byName := make(map[string]*otlpMetric, 16)
+	//
+	// Those metrics are then grouped again, by originating service, so a
+	// container labelled as an application reports under that application's
+	// resource rather than under the host's — the same grouping sendTraces has
+	// always done, for the same reason. Without it the app name arrives only as
+	// a point attribute while the resource still says "host", and the two halves
+	// of one signal disagree about who produced it.
+	type metricGroup struct {
+		order  []string
+		byName map[string]*otlpMetric
+	}
+	serviceOrder := make([]string, 0, 4)
+	groups := make(map[string]*metricGroup, 4)
+	groupFor := func(sn string) *metricGroup {
+		g, ok := groups[sn]
+		if !ok {
+			g = &metricGroup{byName: make(map[string]*otlpMetric, 16)}
+			groups[sn] = g
+			serviceOrder = append(serviceOrder, sn)
+		}
+		return g
+	}
 
 	for _, e := range envs {
+		g := groupFor(o.serviceNameFor(e))
+		byName := g.byName
 		if e.Kind == collector.KindHistogram {
 			m, ok := byName[e.Source]
 			if !ok {
@@ -595,7 +617,7 @@ func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 					ExponentialHistogram: &otlpExponentialHistogram{AggregationTemporality: 1}, // DELTA
 				}
 				byName[e.Source] = m
-				order = append(order, e.Source)
+				g.order = append(g.order, e.Source)
 			}
 			if m.ExponentialHistogram == nil {
 				// A name used for both a scalar and a distribution would produce
@@ -625,7 +647,7 @@ func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 				m.Gauge = &otlpGauge{}
 			}
 			byName[e.Source] = m
-			order = append(order, e.Source)
+			g.order = append(g.order, e.Source)
 		}
 
 		dp := otlpNumberDataPoint{
@@ -641,15 +663,20 @@ func (o *otlpHTTPExporter) sendMetrics(envs []collector.Envelope) error {
 		}
 	}
 
-	points := make([]otlpMetric, 0, len(order))
-	for _, name := range order {
-		points = append(points, *byName[name])
+	resourceMetrics := make([]otlpResourceMetrics, 0, len(serviceOrder))
+	for _, sn := range serviceOrder {
+		g := groups[sn]
+		points := make([]otlpMetric, 0, len(g.order))
+		for _, name := range g.order {
+			points = append(points, *g.byName[name])
+		}
+		resourceMetrics = append(resourceMetrics, otlpResourceMetrics{
+			Resource:     o.resourceFor(sn),
+			ScopeMetrics: []otlpScopeMetrics{{Scope: otlpScope{Name: "agent-i"}, Metrics: points}},
+		})
 	}
 
-	req := otlpMetricsRequest{ResourceMetrics: []otlpResourceMetrics{{
-		Resource:     o.resourceFor(o.hostName()),
-		ScopeMetrics: []otlpScopeMetrics{{Scope: otlpScope{Name: "agent-i"}, Metrics: points}},
-	}}}
+	req := otlpMetricsRequest{ResourceMetrics: resourceMetrics}
 	return o.postJSON("/v1/metrics", req, len(envs))
 }
 
@@ -699,9 +726,23 @@ func (o *otlpHTTPExporter) sendTraces(envs []collector.Envelope) error {
 	return o.postJSON("/v1/traces", req, len(envs))
 }
 
+// sendLogs groups records by originating service, the same way sendTraces
+// groups spans.
+//
+// It has to, and for a sharper reason than the metrics path: the backend fills
+// the logs table's `service` column from the RESOURCE, not from a record
+// attribute. Leaving every record under one shared resource meant a container
+// labelled as an application still landed in the database under the host's
+// identity, with the real name buried in an attributes map that nothing groups
+// by. The app name was present and unusable.
 func (o *otlpHTTPExporter) sendLogs(envs []collector.Envelope) error {
-	records := make([]otlpLogRecord, 0, len(envs))
+	byService := make(map[string][]otlpLogRecord, 4)
+	order := make([]string, 0, 4)
 	for _, e := range envs {
+		sn := o.serviceNameFor(e)
+		if _, seen := byService[sn]; !seen {
+			order = append(order, sn)
+		}
 		body := e.Message
 		if body == "" && e.Kind == collector.KindAPICall {
 			// api_call envelopes carry structured fields in Labels/Value
@@ -710,16 +751,20 @@ func (o *otlpHTTPExporter) sendLogs(envs []collector.Envelope) error {
 			// view, with the structured data available as attributes.
 			body = fmt.Sprintf("%s %s -> %s (%.1fms)", e.Labels["method"], e.Labels["path"], e.Labels["status"], e.Value)
 		}
-		records = append(records, otlpLogRecord{
+		byService[sn] = append(byService[sn], otlpLogRecord{
 			TimeUnixNano: strconv.FormatInt(e.Timestamp.UnixNano(), 10),
 			Body:         otlpAnyValue{StringValue: &body},
 			Attributes:   envelopeAttrs(e),
 		})
 	}
-	req := otlpLogsRequest{ResourceLogs: []otlpResourceLogs{{
-		Resource:  o.resourceFor(o.hostName()),
-		ScopeLogs: []otlpScopeLogs{{Scope: otlpScope{Name: "agent-i"}, LogRecords: records}},
-	}}}
+	resourceLogs := make([]otlpResourceLogs, 0, len(order))
+	for _, sn := range order {
+		resourceLogs = append(resourceLogs, otlpResourceLogs{
+			Resource:  o.resourceFor(sn),
+			ScopeLogs: []otlpScopeLogs{{Scope: otlpScope{Name: "agent-i"}, LogRecords: byService[sn]}},
+		})
+	}
+	req := otlpLogsRequest{ResourceLogs: resourceLogs}
 	return o.postJSON("/v1/logs", req, len(envs))
 }
 

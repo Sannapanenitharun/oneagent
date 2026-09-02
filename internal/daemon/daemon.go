@@ -199,11 +199,13 @@ func New(cfg *config.Config) (*Daemon, error) {
 			DockerEndpoint: cfg.Containers.DockerEndpoint,
 			ExcludeImages:  cfg.Containers.ExcludeImages,
 			ExcludeNames:   cfg.Containers.ExcludeNames,
+			AppLabel:       cfg.Containers.AppLabel,
 		}))
 		if containerLogs {
 			logOpts := collector.ContainerLogOptions{
 				Root:         cfg.Containers.Logs.Root,
 				ExcludeNames: cfg.Containers.ExcludeNames,
+				AppLabel:     cfg.Containers.AppLabel,
 			}
 			// Which reader can actually work depends on how the agent was
 			// installed, not on how it was configured, so the choice is
@@ -420,6 +422,32 @@ func resolveAgentID(configured string, hostAttrs map[string]string) string {
 //
 // The instance id, type and region are logged because they are what an operator
 // checks when a host shows up unlabelled. The account id deliberately is not.
+// mergeDeclaredAttributes folds the operator's resource_attributes into the
+// detected set.
+//
+// Detected wins. A declared key that collides with something the host reported
+// about itself is dropped and named in the log, because the overlap that
+// matters is host.id and cloud.* — the join key between an instance and every
+// signal it has ever sent — and a config copied from another host would
+// silently split one machine's history across two identities. env and team,
+// the keys this exists for, are never detected and so always apply.
+func mergeDeclaredAttributes(attrs, declared map[string]string) map[string]string {
+	for k, v := range declared {
+		if k == "" || v == "" {
+			continue
+		}
+		if existing, taken := attrs[k]; taken {
+			if existing != v {
+				log.Printf("config: resource_attributes[%q] = %q ignored — the host reported %q, "+
+					"and a detected value wins over a declared one", k, v, existing)
+			}
+			continue
+		}
+		attrs[k] = v
+	}
+	return attrs
+}
+
 func detectHostAttributes(cfg *config.Config) map[string]string {
 	// OS description first, and unconditionally: it needs no network, works
 	// off EC2, and is the part that distinguishes hosts from each other on any
@@ -432,7 +460,7 @@ func detectHostAttributes(cfg *config.Config) map[string]string {
 	}
 
 	if !cfg.EC2Metadata.DetectionEnabled() {
-		return attrs
+		return mergeDeclaredAttributes(attrs, cfg.ResourceAttributes)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.EC2Metadata.Timeout)
 	defer cancel()
@@ -440,7 +468,7 @@ func detectHostAttributes(cfg *config.Config) map[string]string {
 	md, err := ec2meta.NewDetector(cfg.EC2Metadata.Timeout).Detect(ctx)
 	if err != nil {
 		log.Printf("ec2 metadata: no instance identity available (%v) — continuing without EC2 attributes", err)
-		return attrs
+		return mergeDeclaredAttributes(attrs, cfg.ResourceAttributes)
 	}
 	log.Printf("ec2 metadata: instance %s (%s) in %s", md.InstanceID, md.InstanceType, md.Region)
 	// Cloud identity wins on any key they share. IMDS describes the instance
@@ -456,7 +484,7 @@ func detectHostAttributes(cfg *config.Config) map[string]string {
 		log.Printf("ec2 metadata: no Name tag visible — enable instance metadata tags to label this host by name "+
 			"(aws ec2 modify-instance-metadata-options --instance-id %s --instance-metadata-tags enabled)", md.InstanceID)
 	}
-	return attrs
+	return mergeDeclaredAttributes(attrs, cfg.ResourceAttributes)
 }
 
 // resolveExporterHeaders merges headers_env (env var references) into

@@ -31,6 +31,9 @@ type DockerLogCollector struct {
 	mgr     *tailManager
 	docker  *dockerClient
 	exclude []string
+	// appLabel is read-only after construction, so the per-container callers
+	// need no synchronisation.
+	appLabel string
 
 	// State below belongs to the tail manager's goroutine. Both hooks it runs
 	// — handle and onTick — are called from there, which is what lets the
@@ -54,6 +57,10 @@ type ContainerLogOptions struct {
 	Root string
 	// ExcludeNames drops containers whose name contains any of these.
 	ExcludeNames []string
+	// AppLabel names the Docker label whose value becomes service.name, so a
+	// container's logs and its metrics agree on which application produced
+	// them. Empty disables the mapping.
+	AppLabel string
 }
 
 // DefaultDockerLogRoot is where the json-file driver stores logs on a stock
@@ -156,6 +163,7 @@ func NewDockerLogCollector(agentID string, opts ContainerLogOptions, tail Tailin
 		root:       root,
 		docker:     newDockerClient(dockerEndpoint),
 		exclude:    opts.ExcludeNames,
+		appLabel:   opts.AppLabel,
 		meta:       map[string]dockerContainer{},
 		partial:    map[string]string{},
 		discarding: map[string]bool{},
@@ -333,7 +341,7 @@ func (c *DockerLogCollector) handle(ln tailLine) {
 }
 
 func (c *DockerLogCollector) emit(ln tailLine, ct dockerContainer, rec dockerLogLine, message string) {
-	labels := containerLabels(ct)
+	labels := containerLabels(ct, c.appLabel)
 	if rec.Stream != "" {
 		labels["stream"] = rec.Stream
 	}

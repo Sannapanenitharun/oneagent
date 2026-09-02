@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ContainerCollector emits per-container resource metrics on a Docker host.
@@ -59,6 +60,10 @@ type ContainerOptions struct {
 	// should not have to spell out to exclude a component.
 	ExcludeImages []string
 	ExcludeNames  []string
+	// AppLabel names the Docker label whose value identifies the application
+	// running in a container. Empty disables the mapping entirely, which is
+	// the default and the previous behaviour.
+	AppLabel string
 }
 
 // cpuTick is the previous CPU reading for one container, kept so utilisation
@@ -179,6 +184,7 @@ func (c *ContainerCollector) sample(ctx context.Context, out chan<- Envelope) {
 	// being collected — and that reason does not depend on the namespace it was
 	// started in.
 	c.selfID = resolveSelfContainerID(c.selfID, containers)
+	c.reportAppMapping(containers)
 	seen := make(map[string]bool, len(containers))
 
 	for _, ct := range containers {
@@ -285,7 +291,7 @@ func (c *ContainerCollector) skip(ct dockerContainer) bool {
 }
 
 func (c *ContainerCollector) emit(ctx context.Context, out chan<- Envelope, now time.Time, ct dockerContainer, dir string, s cgroupStats) {
-	base := containerLabels(ct)
+	base := containerLabels(ct, c.opts.AppLabel)
 
 	// Container counters start when the container starts, not when the host
 	// boots. The exporter reads this internal label to fill OTLP's required
@@ -374,15 +380,71 @@ func (c *ContainerCollector) emit(ctx context.Context, out chan<- Envelope, now 
 	}
 }
 
-// containerLabels builds the identifying attributes carried by every metric
-// from one container.
+// maxAppNameBytes bounds a value read from a container label before it becomes
+// service.name.
+//
+// service is a LowCardinality column in the logs table and a series label on
+// every container metric, so a label templated with something per-request would
+// be expensive in one place and permanent in the other. Sixty-four bytes is
+// longer than any application name and shorter than the identifiers that get
+// pasted into labels by accident.
+const maxAppNameBytes = 64
+
+// appNameFrom reads the application identity out of a container's own labels.
+//
+// Deliberately a pure function with no memory of what it has seen. The obvious
+// alternative — count distinct values and refuse past a cap — needs state, and
+// this is called from three collectors, one of which runs a goroutine per
+// container. Shared mutable state there would need a lock, which this package
+// does not have and should not gain for a validation. A per-collector cap would
+// not be a cap on anything meaningful, since the three would drift.
+//
+// The bound that actually holds is structural rather than counted: every
+// container metric already carries container.id, so grouping those same series
+// by application cannot create a series that did not already exist. What is
+// left to guard against is one pathological value, and length plus a character
+// check does that without remembering anything.
+//
+// A rejected value yields "", and the container falls back to the host's
+// identity exactly as an unlabelled one does. The collector says how many
+// containers resolved at startup, which is where a mapping that matches nothing
+// becomes visible.
+func appNameFrom(ct dockerContainer, key string) string {
+	if key == "" || ct.Labels == nil {
+		return ""
+	}
+	v := strings.TrimSpace(ct.Labels[key])
+	if v == "" || len(v) > maxAppNameBytes {
+		return ""
+	}
+	for _, r := range v {
+		// Control characters and internal whitespace: neither belongs in a
+		// service name, and both survive into a database column and a
+		// dashboard filter if they are let through.
+		if r < 0x20 || r == 0x7f || unicode.IsSpace(r) {
+			return ""
+		}
+	}
+	return v
+}
+
+// containerLabels builds the identifying attributes carried by every metric and
+// every log line from one container.
 //
 // container.id is the short form. The full 64-character id is unique but
 // unreadable, and it would be the highest-cardinality label in the whole
 // dataset — every restart of every container creating a permanent new series.
 // Twelve characters is what docker itself displays and is unique on any real
 // host.
-func containerLabels(ct dockerContainer) map[string]string {
+//
+// appLabel is the Docker label key that names the application; when a container
+// carries it, the value becomes service.name. That single assignment is what
+// makes container telemetry attributable: the exporter already preserves a
+// per-envelope service.name and groups resources by it — it was written so that
+// spans from an instrumented app would not be re-labelled with the agent's own
+// identity — but nothing the agent generates itself has ever set the label, so
+// every container on a host has reported under one service until now.
+func containerLabels(ct dockerContainer, appLabel string) map[string]string {
 	runtime := ct.Runtime
 	if runtime == "" {
 		// Discovered from a cgroup name that named no runtime. Reported as
@@ -400,6 +462,9 @@ func containerLabels(ct dockerContainer) map[string]string {
 	}
 	if ct.Image != "" {
 		labels["container.image.name"] = ct.Image
+	}
+	if app := appNameFrom(ct, appLabel); app != "" {
+		labels["service.name"] = app
 	}
 	return labels
 }
@@ -691,4 +756,48 @@ func parseSelfCgroup(r io.Reader) string {
 		}
 	}
 	return ""
+}
+
+// reportAppMapping states once how many containers the app label resolved.
+//
+// Configuring a label key that no container carries is a silent failure of
+// exactly the kind this codebase keeps running into: telemetry continues, every
+// container keeps reporting under the host's identity, and the only symptom is
+// a cost report where one application accounts for everything. A count is
+// enough to catch it — "0 of 21" and "19 of 21" need different fixes, and both
+// are obvious the moment the number is written down.
+//
+// warnOnce keys on the resolved count, so a genuine change — a deployment that
+// labels the remaining containers — is reported again, while a steady state
+// stays quiet.
+func (c *ContainerCollector) reportAppMapping(containers []dockerContainer) {
+	if c.opts.AppLabel == "" {
+		return
+	}
+	resolved, total := 0, 0
+	for _, ct := range containers {
+		if c.skip(ct) {
+			continue
+		}
+		total++
+		if appNameFrom(ct, c.opts.AppLabel) != "" {
+			resolved++
+		}
+	}
+	if total == 0 {
+		return
+	}
+	key := "applabel:" + strconv.Itoa(resolved) + "/" + strconv.Itoa(total)
+	switch {
+	case resolved == 0:
+		c.warnOnce(key, "containers: label %q matched none of %d containers — their metrics and logs "+
+			"will report under this host's identity, not per application. Set it with "+
+			"`docker run --label %s=<app>` or a compose `labels:` block.",
+			c.opts.AppLabel, total, c.opts.AppLabel)
+	case resolved < total:
+		c.warnOnce(key, "containers: label %q resolved %d of %d containers; the remaining %d report "+
+			"under this host's identity", c.opts.AppLabel, resolved, total, total-resolved)
+	default:
+		c.warnOnce(key, "containers: label %q resolved all %d containers", c.opts.AppLabel, total)
+	}
 }

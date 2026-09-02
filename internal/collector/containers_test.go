@@ -96,11 +96,11 @@ func TestContainerIDFromCgroupName_LongestPrefixWins(t *testing.T) {
 // wrong on the rest, and the label exists precisely so an operator can tell the
 // runtimes apart.
 func TestContainerLabels_RuntimeIsNeverGuessed(t *testing.T) {
-	if got := containerLabels(dockerContainer{ID: testContainerID})["container.runtime"]; got != "unknown" {
+	if got := containerLabels(dockerContainer{ID: testContainerID}, "")["container.runtime"]; got != "unknown" {
 		t.Errorf("container.runtime = %q, want unknown for a container with no runtime evidence", got)
 	}
 	for _, rt := range []string{"docker", "containerd", "cri-o", "podman"} {
-		got := containerLabels(dockerContainer{ID: testContainerID, Runtime: rt})["container.runtime"]
+		got := containerLabels(dockerContainer{ID: testContainerID, Runtime: rt}, "")["container.runtime"]
 		if got != rt {
 			t.Errorf("container.runtime = %q, want %q", got, rt)
 		}
@@ -575,5 +575,91 @@ func TestContainerCollector_PrunesPerContainerWarnings(t *testing.T) {
 	}
 	if !c.warned["docker-list"] {
 		t.Error("a process-wide warning was pruned; it would then be logged again every interval")
+	}
+}
+
+// The change that makes container telemetry attributable: a Docker label the
+// operator sets becomes service.name, which the exporter already preserves and
+// groups resources by.
+func TestContainerLabels_AppLabelBecomesServiceName(t *testing.T) {
+	ct := dockerContainer{
+		ID:      "197a675287226f8c",
+		Names:   []string{"/checkout-api"},
+		Image:   "ghcr.io/acme/checkout:1.4",
+		Runtime: "docker",
+		Labels:  map[string]string{"com.agent-i.app": "checkout"},
+	}
+	got := containerLabels(ct, "com.agent-i.app")
+	if got["service.name"] != "checkout" {
+		t.Errorf("service.name = %q, want %q", got["service.name"], "checkout")
+	}
+	// The existing identity must survive alongside it — the app name groups
+	// containers, it does not replace knowing which container this is.
+	if got["container.name"] != "checkout-api" {
+		t.Errorf("container.name = %q, want it preserved", got["container.name"])
+	}
+	if got["container.id"] != "197a67528722" {
+		t.Errorf("container.id = %q, want the short form preserved", got["container.id"])
+	}
+}
+
+// Unconfigured, and configured-but-absent, must both behave exactly as before:
+// no service.name, so the exporter falls back to the host's identity.
+func TestContainerLabels_NoAppLabelIsUnchanged(t *testing.T) {
+	ct := dockerContainer{ID: "abc123def456", Names: []string{"/redis"}, Image: "redis:7"}
+	for _, key := range []string{"", "com.agent-i.app"} {
+		got := containerLabels(ct, key)
+		if _, ok := got["service.name"]; ok {
+			t.Errorf("appLabel=%q set service.name on a container that carries no such label", key)
+		}
+	}
+}
+
+func TestAppNameFrom_RejectsUnusableValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"empty", ""},
+		{"whitespace only", "   "},
+		// service is a LowCardinality column and a permanent series label; a
+		// value this long is an identifier that was pasted in by accident.
+		{"over the length bound", strings.Repeat("a", maxAppNameBytes+1)},
+		// Both of these survive into a database column and a dashboard filter
+		// if they are let through.
+		{"internal whitespace", "checkout api"},
+		{"control character", "check\nout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ct := dockerContainer{ID: "abc123def456", Labels: map[string]string{"app": tc.value}}
+			if got := appNameFrom(ct, "app"); got != "" {
+				t.Errorf("appNameFrom = %q, want it rejected so the container falls back to the host identity", got)
+			}
+		})
+	}
+}
+
+func TestAppNameFrom_TrimsAndAcceptsRealNames(t *testing.T) {
+	for _, name := range []string{"checkout", " checkout ", "auth-api", "reports_v2", "api.orders"} {
+		ct := dockerContainer{ID: "abc123def456", Labels: map[string]string{"app": name}}
+		if got := appNameFrom(ct, "app"); got != strings.TrimSpace(name) {
+			t.Errorf("appNameFrom(%q) = %q, want %q", name, got, strings.TrimSpace(name))
+		}
+	}
+	// Exactly at the bound is accepted; one over is not. Tested here because an
+	// off-by-one silently drops a legitimate name.
+	atBound := strings.Repeat("a", maxAppNameBytes)
+	ct := dockerContainer{ID: "abc123def456", Labels: map[string]string{"app": atBound}}
+	if got := appNameFrom(ct, "app"); got != atBound {
+		t.Errorf("a value of exactly maxAppNameBytes was rejected")
+	}
+}
+
+// A container with no Labels map at all — the shape returned by cgroup-only
+// discovery, where the daemon was never reachable.
+func TestAppNameFrom_NilLabelsIsSafe(t *testing.T) {
+	if got := appNameFrom(dockerContainer{ID: "abc123def456"}, "app"); got != "" {
+		t.Errorf("appNameFrom on a container with no labels = %q, want empty", got)
 	}
 }

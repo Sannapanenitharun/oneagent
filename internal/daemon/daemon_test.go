@@ -386,3 +386,54 @@ func TestAgentID_ExposesTheResolvedName(t *testing.T) {
 		t.Fatal("an empty configured id must not surface as an empty reported id")
 	}
 }
+
+// Declared attributes fill in what the host cannot know about itself.
+func TestMergeDeclaredAttributes_AddsWhatIsNotDetected(t *testing.T) {
+	attrs := map[string]string{"host.id": "i-0abc", "os.name": "Ubuntu"}
+	got := mergeDeclaredAttributes(attrs, map[string]string{
+		"env": "prod", "team": "platform", "owner": "payments",
+	})
+	for k, want := range map[string]string{
+		"env": "prod", "team": "platform", "owner": "payments",
+		"host.id": "i-0abc", "os.name": "Ubuntu",
+	} {
+		if got[k] != want {
+			t.Errorf("attrs[%q] = %q, want %q", k, got[k], want)
+		}
+	}
+}
+
+// The rule that protects host identity: a config copied from another machine
+// must not be able to relabel this one, because host.id is the join key
+// between an instance and every signal it has ever sent.
+func TestMergeDeclaredAttributes_DetectedWins(t *testing.T) {
+	attrs := map[string]string{"host.id": "i-0real", "cloud.region": "us-east-1"}
+	got := mergeDeclaredAttributes(attrs, map[string]string{
+		"host.id": "i-0stale", "cloud.region": "eu-west-2", "env": "prod",
+	})
+	if got["host.id"] != "i-0real" {
+		t.Errorf("host.id = %q, want the detected value to win", got["host.id"])
+	}
+	if got["cloud.region"] != "us-east-1" {
+		t.Errorf("cloud.region = %q, want the detected value to win", got["cloud.region"])
+	}
+	if got["env"] != "prod" {
+		t.Errorf("env = %q — a non-conflicting key must still be applied", got["env"])
+	}
+}
+
+func TestMergeDeclaredAttributes_SkipsEmpties(t *testing.T) {
+	got := mergeDeclaredAttributes(map[string]string{}, map[string]string{"": "x", "team": ""})
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty keys and empty values both ignored", got)
+	}
+}
+
+// Nothing declared must leave the detected set exactly as it was.
+func TestMergeDeclaredAttributes_NilIsANoOp(t *testing.T) {
+	attrs := map[string]string{"host.id": "i-0abc"}
+	got := mergeDeclaredAttributes(attrs, nil)
+	if len(got) != 1 || got["host.id"] != "i-0abc" {
+		t.Errorf("got %v, want the detected set untouched", got)
+	}
+}

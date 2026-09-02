@@ -33,6 +33,21 @@ type Config struct {
 	Aggregation AggregationConfig `yaml:"aggregation"`
 	Dashboard   DashboardConfig   `yaml:"dashboard"`
 	EC2Metadata EC2MetadataConfig `yaml:"ec2_metadata"`
+
+	// ResourceAttributes are operator-declared attributes attached to every
+	// signal this agent emits — env, team, owner, cost centre.
+	//
+	// They exist because the attributes the agent can discover describe a
+	// machine, and the questions people ask of telemetry are about
+	// organisations: which environment is this, whose is it, what does it cost.
+	// Nothing on the host knows that, so it has to be stated.
+	//
+	// Detected attributes win on a conflict, and the daemon logs the key it
+	// ignored. host.id and the cloud.* set are the join key between an
+	// instance and its telemetry; a declaration that quietly contradicts a
+	// measurement about identity splits a host's history in two, and is far
+	// more likely to be a stale copied config than a deliberate override.
+	ResourceAttributes map[string]string `yaml:"resource_attributes"`
 }
 
 // EC2MetadataConfig controls the Instance Metadata Service probe that labels
@@ -273,6 +288,19 @@ type ContainersConfig struct {
 	// always excluded and does not need listing.
 	ExcludeImages []string `yaml:"exclude_images"`
 	ExcludeNames  []string `yaml:"exclude_names"`
+
+	// AppLabel names the Docker label whose value identifies the application a
+	// container runs, and becomes that container's service.name on both its
+	// metrics and its logs.
+	//
+	// Without it every container on a host reports under the host's own
+	// identity, which is correct for a machine and useless for attributing
+	// anything to an application. The label is read from the container's own
+	// metadata, so the mapping lives beside the thing it describes rather than
+	// in a list here that drifts the moment something is redeployed.
+	//
+	// Empty disables the mapping, which is the default.
+	AppLabel string `yaml:"app_label"`
 
 	Logs ContainerLogsConfig `yaml:"logs"`
 }

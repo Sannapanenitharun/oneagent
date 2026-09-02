@@ -572,3 +572,181 @@ func jsonNumberString(n int64) string {
 	// just avoids importing strconv into the test file for one helper.
 	return string(b)
 }
+
+// resourceServiceNames maps each resource's service.name to the attribute set
+// it carried, so a test can assert on grouping without walking the shape twice.
+func resourceServiceName(t *testing.T, res otlpResource) string {
+	t.Helper()
+	for _, a := range res.Attributes {
+		if a.Key == "service.name" && a.Value.StringValue != nil {
+			return *a.Value.StringValue
+		}
+	}
+	return ""
+}
+
+// Metrics from a container labelled as an application must report under that
+// application's resource, not the host's.
+//
+// Spans have grouped by service since the certi-backend bug; metrics and logs
+// did not, so a container's app name arrived as a point attribute while the
+// resource still said "host". For logs that was worse than cosmetic: the
+// backend fills the logs table's service column from the RESOURCE, so the name
+// was present in an attributes map and invisible to everything that groups.
+func TestOTLPHTTPExporter_MetricsGroupByOriginService(t *testing.T) {
+	var got otlpMetricsRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		decodeGzipJSON(t, r, &got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exp, err := newOTLPHTTPExporter(config.ExporterConfig{
+		Endpoint: server.URL, BatchSize: 3, FlushInterval: time.Hour, MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("newOTLPHTTPExporter: %v", err)
+	}
+	defer exp.Close()
+
+	ts := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	for _, e := range []collector.Envelope{
+		{Kind: collector.KindMetric, AgentID: "host-001", Source: "container.cpu.utilization", Timestamp: ts, Value: 12,
+			Labels: map[string]string{"container.name": "checkout-1", "service.name": "checkout"}},
+		{Kind: collector.KindMetric, AgentID: "host-001", Source: "container.cpu.utilization", Timestamp: ts, Value: 8,
+			Labels: map[string]string{"container.name": "auth-1", "service.name": "auth-api"}},
+		// No service.name: an agent-generated host metric, which must stay
+		// under the host's own identity.
+		{Kind: collector.KindMetric, AgentID: "host-001", Source: "host.cpu.used_pct", Timestamp: ts, Value: 40},
+	} {
+		if err := exp.Export(e); err != nil {
+			t.Fatalf("Export: %v", err)
+		}
+	}
+
+	if len(got.ResourceMetrics) != 3 {
+		t.Fatalf("got %d resourceMetrics, want one per distinct service", len(got.ResourceMetrics))
+	}
+	seen := map[string][]string{}
+	for _, rm := range got.ResourceMetrics {
+		sn := resourceServiceName(t, rm.Resource)
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				seen[sn] = append(seen[sn], m.Name)
+			}
+		}
+	}
+	for _, want := range []struct{ service, metric string }{
+		{"checkout", "container.cpu.utilization"},
+		{"auth-api", "container.cpu.utilization"},
+		{"host-001", "host.cpu.used_pct"},
+	} {
+		names, ok := seen[want.service]
+		if !ok {
+			t.Errorf("no resource for service %q; got %v", want.service, seen)
+			continue
+		}
+		if len(names) != 1 || names[0] != want.metric {
+			t.Errorf("service %q carried %v, want just %q", want.service, names, want.metric)
+		}
+	}
+}
+
+// The grouping must not lose histograms. They take a separate branch through
+// the builder, and an early version of the per-service grouping appended their
+// names to a discarded copy of the ordering slice — so every histogram was
+// built, stored, and then silently omitted from the payload.
+func TestOTLPHTTPExporter_GroupingKeepsHistograms(t *testing.T) {
+	var got otlpMetricsRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		decodeGzipJSON(t, r, &got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exp, err := newOTLPHTTPExporter(config.ExporterConfig{
+		Endpoint: server.URL, BatchSize: 2, FlushInterval: time.Hour, MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("newOTLPHTTPExporter: %v", err)
+	}
+	defer exp.Close()
+
+	ts := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	hist := collector.HistogramPoint{Count: 3, Sum: 30, Min: 5, Max: 20, Scale: 1, BucketCounts: []uint64{1, 2}}
+	for _, svc := range []string{"checkout", "auth-api"} {
+		if err := exp.Export(collector.Envelope{
+			Kind: collector.KindHistogram, AgentID: "host-001", Source: "http.server.duration", Timestamp: ts,
+			Labels:  map[string]string{"service.name": svc},
+			Payload: map[string]any{collector.HistogramPointKey: hist},
+		}); err != nil {
+			t.Fatalf("Export: %v", err)
+		}
+	}
+
+	if len(got.ResourceMetrics) != 2 {
+		t.Fatalf("got %d resourceMetrics, want 2", len(got.ResourceMetrics))
+	}
+	for _, rm := range got.ResourceMetrics {
+		sn := resourceServiceName(t, rm.Resource)
+		found := false
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name == "http.server.duration" && m.ExponentialHistogram != nil &&
+					len(m.ExponentialHistogram.DataPoints) == 1 {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Errorf("service %q lost its histogram — built and then omitted from the payload", sn)
+		}
+	}
+}
+
+// Logs are the case that actually broke attribution, because the backend reads
+// the service column from the resource rather than from a record attribute.
+func TestOTLPHTTPExporter_LogsGroupByOriginService(t *testing.T) {
+	var got otlpLogsRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		decodeGzipJSON(t, r, &got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exp, err := newOTLPHTTPExporter(config.ExporterConfig{
+		Endpoint: server.URL, BatchSize: 3, FlushInterval: time.Hour, MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("newOTLPHTTPExporter: %v", err)
+	}
+	defer exp.Close()
+
+	ts := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	for _, e := range []collector.Envelope{
+		{Kind: collector.KindLog, AgentID: "host-001", Source: "container/checkout-1", Timestamp: ts,
+			Message: "checkout ok", Labels: map[string]string{"service.name": "checkout"}},
+		{Kind: collector.KindLog, AgentID: "host-001", Source: "container/checkout-1", Timestamp: ts,
+			Message: "checkout ok again", Labels: map[string]string{"service.name": "checkout"}},
+		{Kind: collector.KindLog, AgentID: "host-001", Source: "/var/log/syslog", Timestamp: ts,
+			Message: "a host log"},
+	} {
+		if err := exp.Export(e); err != nil {
+			t.Fatalf("Export: %v", err)
+		}
+	}
+
+	counts := map[string]int{}
+	for _, rl := range got.ResourceLogs {
+		sn := resourceServiceName(t, rl.Resource)
+		for _, sl := range rl.ScopeLogs {
+			counts[sn] += len(sl.LogRecords)
+		}
+	}
+	if counts["checkout"] != 2 {
+		t.Errorf("checkout resource carried %d records, want 2 — got %v", counts["checkout"], counts)
+	}
+	if counts["host-001"] != 1 {
+		t.Errorf("host resource carried %d records, want the one unlabelled log — got %v", counts["host-001"], counts)
+	}
+}

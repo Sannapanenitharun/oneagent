@@ -54,6 +54,10 @@ type DockerLogStreamCollector struct {
 	// its own state.
 	readers map[string]context.CancelFunc
 	wg      sync.WaitGroup
+	// appLabel is set once in the constructor and never written again, so the
+	// per-container follower goroutines can read it without synchronisation —
+	// the same reason the exclude list needs none.
+	appLabel string
 	// listWarned belongs to the manager goroutine. Per-container warnings are
 	// deliberately NOT held here: they are local to the follower that produces
 	// them, because a map shared between the manager and every follower would
@@ -80,6 +84,7 @@ func NewDockerLogStreamCollector(agentID string, opts ContainerLogOptions, tail 
 		agentID:  agentID,
 		docker:   newDockerClient(dockerEndpoint),
 		exclude:  opts.ExcludeNames,
+		appLabel: opts.AppLabel,
 		registry: tail.Registry,
 		maxLine:  tail.MaxLineBytes,
 		refresh:  dockerStreamRefresh,
@@ -348,7 +353,7 @@ func (c *DockerLogStreamCollector) resumeFrom(ct dockerContainer) time.Time {
 func dockerCursorID(id string) string { return "docker:" + id }
 
 func (c *DockerLogStreamCollector) emit(send func(Envelope), ct dockerContainer, l dockerStreamLine) {
-	labels := containerLabels(ct)
+	labels := containerLabels(ct, c.appLabel)
 	if l.Stream != "" {
 		labels["stream"] = l.Stream
 	}

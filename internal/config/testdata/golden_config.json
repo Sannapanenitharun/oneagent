@@ -45,6 +45,7 @@
     "Interval": 15000000000,
     "ExcludeImages": null,
     "ExcludeNames": null,
+    "AppLabel": "",
     "Logs": {
       "Enabled": true,
       "Root": "/var/lib/docker/containers",
@@ -134,5 +135,6 @@
   "EC2Metadata": {
     "Enabled": true,
     "Timeout": 1000000000
-  }
+  },
+  "ResourceAttributes": null
 }

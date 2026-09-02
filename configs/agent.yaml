@@ -42,6 +42,22 @@ interval: 15s
 # specify and which is what links the telemetry to the instance. Elsewhere
 # host.id stays /etc/machine-id. A host already being monitored will therefore
 # appear under a new identity the first time it reports with this enabled.
+# Attributes attached to every signal this agent emits.
+#
+# The agent can discover what a machine is — its id, instance type, region, OS.
+# It cannot discover what the machine is FOR. Environment, owning team and cost
+# centre are facts about your organisation, so they have to be declared.
+#
+# Detected values win on a conflict and the ignored key is logged: host.id and
+# the cloud.* set are the join key between an instance and its telemetry, and a
+# config copied from another host silently splitting one machine's history in
+# two is a far likelier explanation than a deliberate override.
+#
+# resource_attributes:
+#   env: "prod"
+#   team: "platform"
+#   owner: "payments@example.com"
+
 ec2_metadata:
   enabled: true
   timeout: 1s        # bounds the probe; a non-AWS host may blackhole the address
@@ -146,6 +162,31 @@ processes:
 
 containers:
   enabled: false
+  # The Docker label whose value names the application a container runs. Its
+  # value becomes that container's service.name, on its metrics AND its logs.
+  #
+  # This is what makes container telemetry attributable to an app rather than
+  # to a machine. Without it every container on this host reports under the
+  # host's own identity, which is correct for a machine and useless for
+  # answering "what does this application cost" or "which of these five APIs
+  # is slow".
+  #
+  # Set the label on the container, not here — a mapping kept beside the thing
+  # it describes cannot drift the way a list in this file would:
+  #
+  #   docker run --label com.agent-i.app=checkout ...
+  #   # or, in compose:
+  #   services:
+  #     checkout:
+  #       labels:
+  #         com.agent-i.app: checkout
+  #
+  # Values are trimmed, capped at 64 bytes, and rejected if they contain
+  # whitespace or control characters; a rejected or missing label falls back to
+  # the host identity. The collector logs how many containers resolved, so a
+  # key that matches nothing is visible rather than silent.
+  #
+  # app_label: "com.agent-i.app"
   # Engine API socket. Mount it read-only — the agent only ever issues GETs.
   docker_endpoint: "/var/run/docker.sock"
   # Defaults to the top-level interval. Worth raising on a host running
