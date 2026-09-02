@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, Fragment } from "react";
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -20,7 +20,7 @@ import {
   deriveLogs, deriveInfra, deriveTraffic, deriveAllSeries, globalStats,
   fmtRps, hostMetricPanels, fmtMetric, MAX_SERIES_PER_PANEL, flattenFields, hostRow, fmtAge,
   hostStatus, statusRank, deriveContainers, containerLogCounts, fmtBytes,
-  deriveApps, unlabelledContainers, appLogCounts,
+  deriveApps, unlabelledContainers, appLogCounts, deriveExceptions,
 } from "./adapters";
 
 const statusColor = { healthy: "var(--good)", degraded: "var(--warn)", down: "var(--crit)" };
@@ -1158,6 +1158,89 @@ function TopologyView({ d, selected, setSelected }) {
 // Tabs on a host, not in the sidebar: these are the three signals *for this
 // host*, and the point of putting them here is to pivot from "this host looks
 // bad" to "what was it logging" without losing which host you were on.
+// ExceptionsView lists what applications are throwing, grouped by type.
+//
+// Grouped rather than listed: one row per occurrence is a log, and there is
+// already a view for logs. The question here is "what is failing and how
+// often", which is a short list — and the stack trace of one representative
+// occurrence, which is why each row expands rather than linking away.
+function ExceptionsView({ groups, hasSpans }) {
+  const [open, setOpen] = useState(null);
+
+  if (!groups.length) {
+    return (
+      <NotWired
+        title="Exceptions"
+        why={
+          hasSpans
+            ? "Spans are arriving, but none carries an exception event. That is the healthy state — OTel records a thrown error as a span event named \"exception\", and applications that are not failing do not send one."
+            : "No spans received, so there is nothing to read exceptions from. Exceptions arrive on spans, from an application instrumented with an OTel SDK — the agent receives them, it cannot generate them."
+        }
+        needs={hasSpans ? "an application to throw something" : "an instrumented application"}
+      />
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <table className="w-full text-[12px]">
+        <thead>
+          <tr className="text-left text-[10px] uppercase tracking-wider text-[var(--ink-4)]">
+            <th className="font-medium py-1.5 pr-3">Type</th>
+            <th className="font-medium py-1.5 pr-3">Service</th>
+            <th className="font-medium py-1.5 pr-3 text-right">Count</th>
+            <th className="font-medium py-1.5 pr-3">Latest message</th>
+            <th className="font-medium py-1.5 w-8" />
+          </tr>
+        </thead>
+        <tbody>
+          {groups.map((g) => {
+            const isOpen = open === g.key;
+            return (
+              <Fragment key={g.key}>
+                <tr
+                  className="border-t border-[var(--hairline)] cursor-pointer hover:bg-[var(--surface-2)]"
+                  onClick={() => setOpen(isOpen ? null : g.key)}
+                >
+                  <td className="py-1.5 pr-3 font-mono text-[var(--bad)]">{g.type}</td>
+                  <td className="py-1.5 pr-3 text-[var(--ink-3)]">{g.service || "—"}</td>
+                  <td className="py-1.5 pr-3 text-right tabular-nums">{g.count}</td>
+                  <td className="py-1.5 pr-3 text-[var(--ink-3)] truncate max-w-md">
+                    {g.message || <span className="text-[var(--ink-4)]">no message</span>}
+                  </td>
+                  <td className="py-1.5 text-[var(--ink-4)]">{isOpen ? "−" : "+"}</td>
+                </tr>
+                {isOpen && (
+                  <tr className="border-t border-[var(--hairline)]">
+                    <td colSpan={5} className="py-2 pr-3">
+                      <div className="text-[10px] uppercase tracking-wider text-[var(--ink-4)] mb-1">
+                        latest occurrence · {g.spanName || "unknown span"}
+                        {g.traceId && <span className="ml-2 font-mono normal-case">trace {g.traceId}</span>}
+                      </div>
+                      {g.stacktrace ? (
+                        <pre className="text-[11px] font-mono leading-relaxed whitespace-pre-wrap overflow-x-auto text-[var(--ink-2)] bg-[var(--surface-2)] rounded p-2">
+                          {g.stacktrace}
+                        </pre>
+                      ) : (
+                        // Said explicitly: plenty of SDKs record a type and a
+                        // message and no trace, and a blank panel would read as
+                        // a rendering fault rather than as what was sent.
+                        <div className="text-[11px] text-[var(--ink-4)]">
+                          No stack trace was recorded with this exception.
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // AppsView rolls the container table up to the application that owns each one.
 //
 // It is the answer to a question the per-container table cannot give: five APIs
@@ -2379,6 +2462,7 @@ export default function ObservabilityDashboard() {
     return {
       ...g,
       traces: deriveTraces(snapshot),
+      exceptions: deriveExceptions(snapshot),
       edges: deriveEdges(snapshot),
       logs: deriveLogs(snapshot),
       infra: deriveInfra(snapshot),
@@ -2625,11 +2709,7 @@ export default function ObservabilityDashboard() {
               why="Auto-detected problems with a probable root cause need a correlation engine that watches signals over time, groups related anomalies, and ranks causes. The agent collects and forwards; it does not analyse. This is the largest of the unbuilt pieces."
               needs="a correlation/root-cause service" />
           )}
-          {view === "exceptions" && (
-            <NotWired title="Exceptions"
-              why="Exception grouping needs span events (exception.type, exception.stacktrace) extracted from incoming spans and aggregated by type. The receiver currently keeps span attributes but does not read span events, which is where OTel puts exceptions."
-              needs="span-event extraction in the OTLP receiver" />
-          )}
+          {view === "exceptions" && <ExceptionsView groups={d.exceptions} hasSpans={(snapshot?.spans?.length || 0) > 0} />}
           {view === "monitors" && (
             <NotWired title="Monitors"
               why="Monitors are rule definitions plus evaluation state — thresholds, for-duration, notification routing. None of that exists in the agent, and it is the kind of thing that belongs in the backend that outlives any single host anyway."

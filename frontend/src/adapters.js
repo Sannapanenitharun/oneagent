@@ -721,6 +721,60 @@ export function containerLogCounts(logs) {
 }
 
 // ---------------------------------------------------------------------------
+// exceptions
+// ---------------------------------------------------------------------------
+
+// deriveExceptions groups thrown errors by type.
+//
+// By type and not by span, because the question is "what is failing" and the
+// answer is a short list, whereas one row per occurrence is a log and there is
+// already a view for those. Each group keeps one example — the most recent —
+// so a stack trace is one click away without the table carrying thousands.
+export function deriveExceptions(snap) {
+  const spans = snap?.spans || [];
+  const groups = new Map();
+
+  for (const sp of spans) {
+    const exc = sp.exception;
+    if (!exc?.type) continue;
+    const service = sp.service || "";
+    // Split by service as well as by type: the same NullPointerException in
+    // two services is two problems with two owners, and merging them produces
+    // a count nobody can act on.
+    const key = `${service} ${exc.type}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = {
+        key,
+        type: exc.type,
+        service,
+        count: 0,
+        lastSeen: 0,
+        message: "",
+        stacktrace: "",
+        traceId: "",
+        spanName: "",
+      };
+      groups.set(key, g);
+    }
+    // A span that recorded several exceptions counts as several: the extras
+    // were set aside for display, not discarded from the arithmetic.
+    g.count += exc.count && exc.count > 1 ? exc.count : 1;
+    if ((sp.t || 0) >= g.lastSeen) {
+      g.lastSeen = sp.t || 0;
+      g.message = exc.message || "";
+      g.stacktrace = exc.stacktrace || "";
+      g.traceId = sp.trace_id || "";
+      g.spanName = sp.name || "";
+    }
+  }
+
+  return [...groups.values()].sort(
+    (a, b) => b.count - a.count || b.lastSeen - a.lastSeen || a.type.localeCompare(b.type)
+  );
+}
+
+// ---------------------------------------------------------------------------
 // applications
 // ---------------------------------------------------------------------------
 

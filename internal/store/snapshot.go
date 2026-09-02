@@ -56,6 +56,28 @@ type Span struct {
 	Status   string            `json:"status,omitempty"`
 	Kind     string            `json:"kind,omitempty"`
 	Peer     map[string]string `json:"peer,omitempty"`
+	// Exception is what the application threw, when it recorded one.
+	//
+	// Carried as its own field rather than left in the attribute map because
+	// it is the only part of a span the UI groups BY rather than displays: a
+	// list of exceptions is a list of types with counts, and a type buried in
+	// a map every consumer has to know to look in is one nobody looks in.
+	Exception *SpanException `json:"exception,omitempty"`
+}
+
+// SpanException is a thrown error, as OTel's conventions record it.
+//
+// Stacktrace is frequently absent — plenty of SDKs record a type and a message
+// and nothing else — so a consumer must not treat its absence as an absence of
+// the exception.
+type SpanException struct {
+	Type       string `json:"type"`
+	Message    string `json:"message,omitempty"`
+	Stacktrace string `json:"stacktrace,omitempty"`
+	// Count is set only when one span recorded more than one exception, in
+	// which case Type and Message describe the first — usually the cause,
+	// with the rest being wrappers that re-threw it.
+	Count int `json:"count,omitempty"`
 }
 
 // Snapshot is one host's telemetry over a window.
@@ -514,9 +536,36 @@ LIMIT {limit:UInt32}`
 		if peer := peerAttrs(r.Attributes); len(peer) > 0 {
 			s.Peer = peer
 		}
+		s.Exception = spanException(r.Attributes)
 		out = append(out, s)
 	}
 	return out, nil
+}
+
+// spanException reads a thrown error out of a span's attributes.
+//
+// The agent normalises OTel's exception EVENT into these attributes before
+// export, because a span row holds one attribute map and no event list. That
+// flattening is why this lives here rather than in a span-events table, and
+// why exception.type is the key it hinges on: a record with no type cannot be
+// grouped, and an ungroupable exception is one the view cannot show.
+func spanException(attrs map[string]string) *SpanException {
+	if len(attrs) == 0 {
+		return nil
+	}
+	typ := attrs["exception.type"]
+	if typ == "" {
+		return nil
+	}
+	e := &SpanException{
+		Type:       typ,
+		Message:    attrs["exception.message"],
+		Stacktrace: attrs["exception.stacktrace"],
+	}
+	if n, err := strconv.Atoi(attrs["exception.count"]); err == nil && n > 1 {
+		e.Count = n
+	}
+	return e
 }
 
 // peerAttrs picks out the attributes naming what an outbound span was talking

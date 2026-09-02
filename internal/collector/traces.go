@@ -66,15 +66,25 @@ type otlpScope struct {
 }
 
 type otlpSpan struct {
-	TraceID           string         `json:"traceId"`
-	SpanID            string         `json:"spanId"`
-	ParentSpanID      string         `json:"parentSpanId,omitempty"`
-	Name              string         `json:"name"`
-	Kind              int            `json:"kind,omitempty"`
-	StartTimeUnixNano string         `json:"startTimeUnixNano"`
-	EndTimeUnixNano   string         `json:"endTimeUnixNano"`
-	Attributes        []otlpKeyValue `json:"attributes,omitempty"`
-	Status            *otlpStatus    `json:"status,omitempty"`
+	TraceID           string          `json:"traceId"`
+	SpanID            string          `json:"spanId"`
+	ParentSpanID      string          `json:"parentSpanId,omitempty"`
+	Name              string          `json:"name"`
+	Kind              int             `json:"kind,omitempty"`
+	StartTimeUnixNano string          `json:"startTimeUnixNano"`
+	EndTimeUnixNano   string          `json:"endTimeUnixNano"`
+	Attributes        []otlpKeyValue  `json:"attributes,omitempty"`
+	Events            []otlpSpanEvent `json:"events,omitempty"`
+	Status            *otlpStatus     `json:"status,omitempty"`
+}
+
+// otlpSpanEvent is a timestamped annotation on a span. Read for exceptions:
+// OTel puts a thrown error in an event named "exception" rather than in the
+// span's own attributes, so a receiver that reads only attributes sees a
+// failed span with no detail about what failed.
+type otlpSpanEvent struct {
+	Name       string         `json:"name"`
+	Attributes []otlpKeyValue `json:"attributes,omitempty"`
 }
 
 type otlpStatus struct {
@@ -456,6 +466,97 @@ func copyPeerAttributes(labels map[string]string, attrs map[string]any) {
 	}
 }
 
+// Exception attributes, as OTel's semantic conventions name them.
+const (
+	eventNameException = "exception"
+	attrExcType        = "exception.type"
+	attrExcMessage     = "exception.message"
+	attrExcStack       = "exception.stacktrace"
+)
+
+// maxStacktraceBytes bounds a stack trace copied onto a span.
+//
+// A trace is unbounded input from an application: a deep recursion or a
+// framework that formats every frame of a large stack produces values in the
+// megabytes, and this one rides in a label map that is re-exported, batched,
+// gzipped and finally stored in a ClickHouse Map. The exporter caps a whole
+// batch by encoded bytes, so an uncapped trace does not lose data — it makes
+// one span fill an entire request on its own, repeatedly.
+//
+// Truncated rather than dropped, and marked: the first frames are the ones
+// that identify a fault, so a shortened trace is still worth having in a way
+// that no trace is not.
+const maxStacktraceBytes = 4096
+
+// applyExceptionEvent copies the first exception event's fields onto a span's
+// labels.
+//
+// The FIRST, deliberately. A span that records several usually records a cause
+// and then the wrappers that re-threw it, and the innermost one is what an
+// operator is grouping by. The count is kept when there is more than one, so
+// the fact that detail was set aside is visible rather than implied.
+//
+// Only exception events are read. Arbitrary span events are a list per span
+// and would need a table of their own to store faithfully; flattening them
+// into labels would silently keep one and discard the rest, which is the
+// failure this function exists to end rather than repeat.
+//
+// One consequence worth naming: an exception arrives as an event and leaves,
+// on re-export, as span attributes. That is what the storage model can hold —
+// the spans table has one attributes map per span and no event list — and it
+// is what makes the data groupable without a migration. It also means a
+// third-party OTLP backend downstream of this agent receives the exception as
+// attributes rather than as the event the application sent, which is a real
+// change in shape and the reason it is written down here.
+func applyExceptionEvent(labels map[string]string, events []spanEventView) {
+	seen := 0
+	var first spanEventView
+	for _, ev := range events {
+		if ev.Name != eventNameException {
+			continue
+		}
+		if seen == 0 {
+			first = ev
+		}
+		seen++
+	}
+	if seen == 0 {
+		return
+	}
+	for k, v := range first.Attributes {
+		if v == "" {
+			continue
+		}
+		switch k {
+		case attrExcType, attrExcMessage:
+			labels[k] = v
+		case attrExcStack:
+			if len(v) > maxStacktraceBytes {
+				v = v[:maxStacktraceBytes] + " ... truncated"
+			}
+			labels[k] = v
+		}
+	}
+	// A span can carry an exception event with no type — some SDKs record only
+	// a message. Grouping needs a key, and "unknown" is a better bucket than a
+	// row that vanishes from the view entirely.
+	if _, ok := labels[attrExcType]; !ok {
+		if _, hasMsg := labels[attrExcMessage]; hasMsg {
+			labels[attrExcType] = "unknown"
+		}
+	}
+	if seen > 1 {
+		labels["exception.count"] = strconv.Itoa(seen)
+	}
+}
+
+// spanEventView is the shape applyExceptionEvent needs, so the JSON and
+// protobuf paths can share it rather than growing two copies of the rules.
+type spanEventView struct {
+	Name       string
+	Attributes map[string]string
+}
+
 func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *otlpwire.Span) Envelope {
 	durationMs := float64(sp.EndTimeUnixNano-sp.StartTimeUnixNano) / 1e6
 
@@ -497,6 +598,21 @@ func spanToEnvelopeProto(agentID, serviceName, scopeName string, sp *otlpwire.Sp
 		labels["span.kind"] = k
 	}
 	copyPeerAttributes(labels, attrs)
+
+	events := make([]spanEventView, 0, len(sp.Events))
+	for _, ev := range sp.Events {
+		if ev == nil {
+			continue
+		}
+		ea := make(map[string]string, len(ev.Attributes))
+		for _, a := range ev.Attributes {
+			if a != nil {
+				ea[a.Key] = a.Value.String()
+			}
+		}
+		events = append(events, spanEventView{Name: ev.Name, Attributes: ea})
+	}
+	applyExceptionEvent(labels, events)
 
 	return Envelope{
 		Kind:      KindTrace,
@@ -545,6 +661,16 @@ func spanToEnvelopeJSON(agentID, serviceName, scopeName string, sp otlpSpan) Env
 		labels["span.kind"] = k
 	}
 	copyPeerAttributes(labels, attrs)
+
+	events := make([]spanEventView, 0, len(sp.Events))
+	for _, ev := range sp.Events {
+		ea := make(map[string]string, len(ev.Attributes))
+		for _, a := range ev.Attributes {
+			ea[a.Key] = a.Value.toString()
+		}
+		events = append(events, spanEventView{Name: ev.Name, Attributes: ea})
+	}
+	applyExceptionEvent(labels, events)
 
 	return Envelope{
 		Kind:      KindTrace,

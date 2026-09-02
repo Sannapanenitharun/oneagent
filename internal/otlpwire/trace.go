@@ -90,6 +90,20 @@ type Span struct {
 	EndTimeUnixNano   uint64
 	Attributes        []*KeyValue
 	Status            *Status
+	// Events are the span's timestamped annotations. Decoded for one reason:
+	// OTel records a thrown exception as an event named "exception" carrying
+	// exception.type, exception.message and exception.stacktrace, so a span
+	// with no events has no error detail beyond a status code. Reading the
+	// attributes and not the events meant every stack trace an application
+	// reported was parsed off the wire and discarded.
+	Events []*SpanEvent
+}
+
+// SpanEvent is one annotation on a span.
+type SpanEvent struct {
+	TimeUnixNano uint64
+	Name         string
+	Attributes   []*KeyValue
 }
 
 type ScopeSpans struct {
@@ -287,6 +301,53 @@ func decodeScope(r *reader) (*InstrumentationScope, error) {
 	return out, nil
 }
 
+// decodeSpanEvent reads one Span.Event.
+//
+// time_unix_nano is fixed64 rather than varint, which is the one field here
+// that would silently produce nonsense if guessed: a varint read of a fixed64
+// consumes the wrong number of bytes and desynchronises everything after it.
+func decodeSpanEvent(r *reader) (*SpanEvent, error) {
+	out := &SpanEvent{}
+	for !r.done() {
+		field, wire, err := r.tag()
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case field == 1 && wire == wireFixed64: // fixed64 time_unix_nano
+			v, err := r.fixed64()
+			if err != nil {
+				return nil, err
+			}
+			out.TimeUnixNano = v
+		case wire == wireBytes:
+			raw, err := r.bytes()
+			if err != nil {
+				return nil, err
+			}
+			switch field {
+			case 2: // string name
+				out.Name = string(raw)
+			case 3: // repeated KeyValue attributes
+				sub, err := r.sub(raw)
+				if err != nil {
+					return nil, err
+				}
+				kv, err := decodeKeyValue(sub)
+				if err != nil {
+					return nil, err
+				}
+				out.Attributes = append(out.Attributes, kv)
+			}
+		default:
+			if err := r.skip(wire); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
 func decodeSpan(r *reader) (*Span, error) {
 	out := &Span{}
 	for !r.done() {
@@ -319,6 +380,16 @@ func decodeSpan(r *reader) (*Span, error) {
 					return nil, err
 				}
 				out.Attributes = append(out.Attributes, kv)
+			case 11: // repeated Event events
+				sub, err := r.sub(raw)
+				if err != nil {
+					return nil, err
+				}
+				ev, err := decodeSpanEvent(sub)
+				if err != nil {
+					return nil, err
+				}
+				out.Events = append(out.Events, ev)
 			case 15: // Status status
 				sub, err := r.sub(raw)
 				if err != nil {
